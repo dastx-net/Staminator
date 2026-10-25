@@ -64,8 +64,22 @@ impl Session {
         self.expected.iter().collect()
     }
 
+    /// Append more expected input while the session can still accept typing.
+    /// A stopped session is immutable so its completion metrics remain stable.
+    pub fn append_expected(&mut self, text: &str) -> bool {
+        if text.is_empty() || !matches!(self.state, SessionState::Ready | SessionState::Running) {
+            return false;
+        }
+        self.expected.extend(text.chars());
+        true
+    }
+
     pub fn next_expected(&self) -> Option<char> {
         self.expected.get(self.position).copied()
+    }
+
+    pub fn remaining_chars(&self) -> usize {
+        self.expected.len() - self.position
     }
 
     /// Compare a character with the expected character. Wrong input increments
@@ -260,5 +274,31 @@ mod tests {
         session.type_char('x', 1_000);
         // One character in 40 seconds is 1.5 CPM, which CalcSpeed returns as 2.
         assert_eq!(session.stats_at(41_000).cpm, 2);
+    }
+
+    #[test]
+    fn appending_expected_input_before_completion_keeps_session_running() {
+        let mut session = Session::new("ab");
+        assert_eq!(session.type_char('a', 100), Keystroke::Correct);
+        assert!(session.append_expected("cd"));
+
+        assert_eq!(session.snapshot(100).state, SessionState::Running);
+        assert_eq!(session.remaining_chars(), 3);
+        assert_eq!(session.next_expected(), Some('b'));
+        assert_eq!(session.type_char('b', 200), Keystroke::Correct);
+        assert_eq!(session.type_char('c', 300), Keystroke::Correct);
+        assert_eq!(session.snapshot(300).position, 3);
+        assert_eq!(session.remaining_chars(), 1);
+        assert_eq!(session.next_expected(), Some('d'));
+        assert_eq!(session.type_char('d', 400), Keystroke::Correct);
+
+        assert_eq!(session.snapshot(400).state, SessionState::Stopped);
+        assert_eq!(session.snapshot(400).position, 4);
+        assert_eq!(session.remaining_chars(), 0);
+        let stats = session.stats();
+        assert_eq!(stats.correct, 4);
+        assert_eq!(stats.errors, 0);
+        assert_eq!(stats.elapsed_ms, 300);
+        assert_eq!(stats.cpm, 800);
     }
 }

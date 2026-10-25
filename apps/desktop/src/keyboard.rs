@@ -193,6 +193,15 @@ pub fn draw_keyboard(ui: &mut Ui, layout: KeyboardLayout, active: Option<char>) 
         ],
     };
 
+    let shift_key = active.and_then(|ch| {
+        let (finger, shifted) = rows.iter().enumerate().find_map(|(r, row)| {
+            row.iter().enumerate().find_map(|(k, &(top, bottom, _))| {
+                key_matches_character(ch, top, bottom)
+                    .then(|| (finger_for_key(r, k), requires_shift(ch, top, bottom)))
+            })
+        })?;
+        shifted.then(|| finger.map(opposite_shift_key)).flatten()
+    });
     for (row_index, row) in rows.iter().enumerate() {
         let total_units: f32 = row.iter().map(|(_, _, w)| *w).sum();
         let row_gaps = gap * (row.len().saturating_sub(1) as f32);
@@ -210,13 +219,8 @@ pub fn draw_keyboard(ui: &mut Ui, layout: KeyboardLayout, active: Option<char>) 
                 Pos2::new(x, y0 + row_index as f32 * step_y),
                 Vec2::new(w, key_h),
             );
-            let is_active = active.is_some_and(|ch| {
-                let target = ch.to_lowercase().next().unwrap_or(ch);
-                top.chars()
-                    .chain(bottom.chars())
-                    .any(|c| c.to_lowercase().next() == Some(target))
-                    || (ch == ' ' && bottom == " ")
-            });
+            let is_active = active.is_some_and(|ch| key_matches_character(ch, top, bottom))
+                || shift_key == Some((row_index, key_index));
             let finger = finger_for_key(row_index, key_index);
             let zone_color = finger.map(|i| finger_colors[i]);
             let face = if is_active {
@@ -316,6 +320,28 @@ pub fn draw_keyboard(ui: &mut Ui, layout: KeyboardLayout, active: Option<char>) 
     }
 }
 
+fn key_matches_character(ch: char, top: &str, bottom: &str) -> bool {
+    let target = ch.to_lowercase().next().unwrap_or(ch);
+    top.chars()
+        .chain(bottom.chars())
+        .any(|c| c.to_lowercase().next() == Some(target))
+        || (ch == ' ' && bottom == " ")
+}
+
+fn requires_shift(ch: char, top: &str, bottom: &str) -> bool {
+    if ch == 'ё' || ch.is_ascii_lowercase() || ('а'..='я').contains(&ch) {
+        return false;
+    }
+    if ch.is_ascii_uppercase() || ('А'..='Я').contains(&ch) {
+        return true;
+    }
+    top.chars().any(|label| label == ch) && !bottom.chars().any(|label| label == ch)
+}
+
+fn opposite_shift_key(finger: usize) -> (usize, usize) {
+    if finger < 4 { (3, 11) } else { (3, 0) }
+}
+
 /// Indexes follow physical QWERTY key positions; Russian legends use the same hardware.
 fn finger_for_key(row: usize, key: usize) -> Option<usize> {
     match row {
@@ -386,7 +412,7 @@ fn finger_for_key(row: usize, key: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::finger_for_key;
+    use super::{finger_for_key, opposite_shift_key, requires_shift};
 
     #[test]
     fn assigns_both_shifts_and_control_keys() {
@@ -401,5 +427,25 @@ mod tests {
         assert_eq!(finger_for_key(4, 4), Some(9)); // right Alt
         assert_eq!(finger_for_key(4, 7), Some(7)); // right Ctrl
         assert_eq!(finger_for_key(4, 3), Some(9)); // Space thumb
+    }
+
+    #[test]
+    fn detects_shifted_english_and_russian_characters() {
+        assert!(requires_shift('A', "A", ""));
+        assert!(!requires_shift('a', "A", ""));
+        assert!(requires_shift('!', "!", "1"));
+        assert!(!requires_shift('1', "!", "1"));
+        assert!(requires_shift('Я', "Я", ""));
+        assert!(!requires_shift('я', "Я", ""));
+        assert!(requires_shift('Ё', "Ё", "`"));
+        assert!(!requires_shift('ё', "Ё", "`"));
+    }
+
+    #[test]
+    fn selects_shift_on_the_opposite_hand() {
+        assert_eq!(opposite_shift_key(0), (3, 11));
+        assert_eq!(opposite_shift_key(3), (3, 11));
+        assert_eq!(opposite_shift_key(4), (3, 0));
+        assert_eq!(opposite_shift_key(7), (3, 0));
     }
 }
