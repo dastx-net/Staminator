@@ -5,5 +5,7 @@ edition = "2024"
 
 [dependencies]
 eframe = "0.37.0"
+egui = "0.37.0"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 staminator-core = { path = "../../crates/core" }
 stamina-data = { path = "../../crates/stamina-data" }

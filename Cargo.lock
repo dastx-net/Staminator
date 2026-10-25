@@ -1577,6 +1577,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -3041,6 +3043,8 @@ name = "staminator-desktop"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "egui",
+ "image",
  "stamina-data",
  "staminator-core",
 ]
