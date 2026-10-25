@@ -6,3 +6,6 @@ src/stamina_setup/** -text
 *.md text eol=lf
 .gitignore text eol=lf
 .gitattributes text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+Cargo.lock text eol=lf

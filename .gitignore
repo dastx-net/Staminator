@@ -22,3 +22,6 @@ src/stamina_setup/
 .idea/
 *.user
 *.suo
+
+# Rust build output
+target/
