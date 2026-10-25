@@ -40,6 +40,8 @@ pub fn draw_keyboard(ui: &mut Ui, layout: KeyboardLayout, active: Option<char>) 
         Color32::from_rgb(128, 139, 190), // right middle
         Color32::from_rgb(165, 128, 184), // right ring
         Color32::from_rgb(190, 119, 157), // right pinky
+        Color32::from_rgb(137, 181, 181), // left thumb
+        Color32::from_rgb(207, 186, 126), // right thumb
     ];
 
     let rows: [&[(&str, &str, f32)]; 5] = match layout {
@@ -296,6 +298,8 @@ pub fn draw_keyboard(ui: &mut Ui, layout: KeyboardLayout, active: Option<char>) 
         ("П сред.", 5),
         ("П без.", 6),
         ("П миз.", 7),
+        ("Л больш.", 8),
+        ("П больш.", 9),
     ];
     let item_w = (width - 2.0 * pad_x) / legend.len() as f32;
     for (i, (label, color_index)) in legend.into_iter().enumerate() {
@@ -318,7 +322,7 @@ fn finger_for_key(row: usize, key: usize) -> Option<usize> {
         // Number row: `, 1-5 / 6-0, -, =. Function keys are excluded.
         0 => match key {
             0..=1 => Some(0),
-            10..=12 => Some(7),
+            10..=13 => Some(7),
             2 => Some(1),
             9 => Some(6),
             3 => Some(2),
@@ -327,10 +331,11 @@ fn finger_for_key(row: usize, key: usize) -> Option<usize> {
             6..=7 => Some(4),
             _ => None,
         },
-        // Ignore Tab and the final backslash key.
+        // Tab and backslash use the left/right pinky respectively.
         1 => match key {
+            0 => Some(0),
             1 => Some(0),
-            11 | 12 => Some(7),
+            11..=13 => Some(7),
             2 => Some(1),
             3 => Some(2),
             4..=5 => Some(3),
@@ -341,8 +346,9 @@ fn finger_for_key(row: usize, key: usize) -> Option<usize> {
             _ => None,
         },
         2 => match key {
+            0 => Some(0),
             1 => Some(0),
-            11 | 12 => Some(7),
+            11..=12 => Some(7),
             2 => Some(1),
             3 => Some(2),
             4..=5 => Some(3),
@@ -353,8 +359,10 @@ fn finger_for_key(row: usize, key: usize) -> Option<usize> {
             _ => None,
         },
         3 => match key {
+            0 => Some(0),
+            11 => Some(7),
             1 => Some(0),
-            10 | 11 => Some(7),
+            10 => Some(7),
             2 => Some(1),
             3 => Some(2),
             4..=5 => Some(3),
@@ -363,6 +371,35 @@ fn finger_for_key(row: usize, key: usize) -> Option<usize> {
             9 => Some(6),
             _ => None,
         },
+        // Ctrl/Menu use the nearby pinky, Alt/Win use the nearby thumb;
+        // Space uses the right thumb (either thumb is also acceptable in practice).
+        4 => match key {
+            0 => Some(0),
+            1..=2 => Some(8),
+            3..=5 => Some(9),
+            6..=7 => Some(7),
+            _ => None,
+        },
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::finger_for_key;
+
+    #[test]
+    fn assigns_both_shifts_and_control_keys() {
+        assert_eq!(finger_for_key(3, 0), Some(0));
+        assert_eq!(finger_for_key(3, 11), Some(7));
+        assert_eq!(finger_for_key(0, 13), Some(7)); // Backspace
+        assert_eq!(finger_for_key(1, 0), Some(0)); // Tab
+        assert_eq!(finger_for_key(2, 0), Some(0)); // Caps Lock
+        assert_eq!(finger_for_key(2, 12), Some(7)); // Enter
+        assert_eq!(finger_for_key(4, 0), Some(0)); // left Ctrl
+        assert_eq!(finger_for_key(4, 2), Some(8)); // left Alt
+        assert_eq!(finger_for_key(4, 4), Some(9)); // right Alt
+        assert_eq!(finger_for_key(4, 7), Some(7)); // right Ctrl
+        assert_eq!(finger_for_key(4, 3), Some(9)); // Space thumb
     }
 }
