@@ -1,0 +1,8 @@
+# Preserve original bytes and line endings in the legacy source tree.
+src/stamina/** -text
+src/stamina_setup/** -text
+
+# New project documentation uses UTF-8 and normalized line endings.
+*.md text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf

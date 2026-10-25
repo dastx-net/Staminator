@@ -1,0 +1,24 @@
+# Legacy IDE state and build output
+src/stamina/*.aps
+src/stamina/*.clw
+src/stamina/*.ncb
+src/stamina/*.opt
+src/stamina/*.plg
+src/stamina/Debug/
+src/stamina/Release/
+src/stamina/Stamina_/
+src/stamina/**/*.obj
+src/stamina/**/*.pch
+src/stamina/**/*.pdb
+
+# Local runtime data if placed next to the original project
+src/stamina/Users/
+
+# Local installed copy: personal profile, third-party audio, binaries and assets
+src/stamina_setup/
+
+# Common local editor files
+.vs/
+.idea/
+*.user
+*.suo
