@@ -89,9 +89,16 @@ impl Session {
     }
 
     pub fn pause(&mut self, now_ms: u64) {
-        if self.state == SessionState::Running {
-            self.accumulate(now_ms);
-            self.state = SessionState::Paused;
+        match self.state {
+            SessionState::Running => {
+                self.accumulate(now_ms);
+                self.state = SessionState::Paused;
+            }
+            SessionState::Ready => {
+                // A pause before the first key has no elapsed run time to save.
+                self.state = SessionState::Paused;
+            }
+            _ => {}
         }
     }
 
@@ -213,6 +220,22 @@ mod tests {
         assert_eq!(stats.errors, 1);
         assert_eq!(stats.cpm, 80);
         assert!((stats.error_percent - 100.0 / 3.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn pause_before_first_input_ignores_typing_until_resumed() {
+        let mut session = Session::new("ab");
+        session.pause(100);
+        assert_eq!(session.snapshot(500).state, SessionState::Paused);
+        assert_eq!(session.snapshot(500).elapsed_ms, 0);
+        assert_eq!(session.type_char('a', 500), Keystroke::Ignored);
+        assert_eq!(session.snapshot(500).position, 0);
+        assert_eq!(session.snapshot(500).elapsed_ms, 0);
+
+        session.resume(1_000);
+        assert_eq!(session.snapshot(1_000).state, SessionState::Ready);
+        assert_eq!(session.type_char('a', 2_000), Keystroke::Correct);
+        assert_eq!(session.snapshot(2_250).elapsed_ms, 250);
     }
 
     #[test]

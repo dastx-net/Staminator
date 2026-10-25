@@ -1,8 +1,10 @@
 mod keyboard;
+mod sound;
 mod training_view;
 
 use eframe::egui;
-use staminator_core::{Session, SessionState};
+use sound::SoundEvent;
+use staminator_core::{Keystroke, Session, SessionState};
 use std::{fs, path::PathBuf, time::Instant};
 
 fn keyboard_setting_path() -> Option<PathBuf> {
@@ -76,10 +78,12 @@ struct StaminatorApp {
     last_result: Option<staminator_core::SessionStats>,
     background: Option<egui::TextureHandle>,
     show_keyboard: bool,
+    escape_pending: bool,
 }
 
 impl StaminatorApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        training_view::install_text_font(&cc.egui_ctx);
         let data_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../src/stamina_setup/Data");
         let lessons = stamina_data::read_lessons(data_dir.join("lessons.ru")).ok();
@@ -151,6 +155,7 @@ impl StaminatorApp {
             last_result: None,
             background,
             show_keyboard,
+            escape_pending: false,
         }
     }
 
@@ -179,6 +184,8 @@ impl StaminatorApp {
     fn start(&mut self) {
         self.session = Some(Session::new(self.exercise().to_owned()));
         self.last_result = None;
+        self.escape_pending = false;
+        sound::play(SoundEvent::Start);
     }
 
     fn stop(&mut self) {
@@ -186,14 +193,22 @@ impl StaminatorApp {
         if let Some(session) = &mut self.session {
             self.last_result = Some(session.stop(now));
         }
+        self.escape_pending = false;
     }
 
     fn toggle_pause(&mut self) {
         let now = self.now_ms();
         if let Some(session) = &mut self.session {
             match session.snapshot(now).state {
-                SessionState::Running => session.pause(now),
-                SessionState::Paused => session.resume(now),
+                SessionState::Ready | SessionState::Running => {
+                    session.pause(now);
+                    sound::play(SoundEvent::Pause);
+                }
+                SessionState::Paused => {
+                    session.resume(now);
+                    self.escape_pending = false;
+                    sound::play(SoundEvent::Start);
+                }
                 _ => {}
             }
         }
@@ -201,13 +216,57 @@ impl StaminatorApp {
 
     fn handle_input(&mut self, ctx: &egui::Context) {
         let now = self.now_ms();
+        let mut consume_space_text = false;
         for event in ctx.input(|input| input.events.clone()) {
             match event {
                 egui::Event::Key {
                     key: egui::Key::Escape,
                     pressed: true,
+                    repeat: false,
                     ..
-                } => self.stop(),
+                } => {
+                    let state = self.session.as_ref().map(|s| s.snapshot(now).state);
+                    match state {
+                        Some(SessionState::Ready | SessionState::Running) => {
+                            self.session.as_mut().unwrap().pause(now);
+                            self.escape_pending = true;
+                            sound::play(SoundEvent::Pause);
+                        }
+                        Some(SessionState::Paused) if self.escape_pending => self.stop(),
+                        Some(SessionState::Paused) => self.escape_pending = true,
+                        _ => {}
+                    }
+                }
+                egui::Event::Key {
+                    key: egui::Key::C,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                    ..
+                } if modifiers.ctrl => self.stop(),
+                // egui-winit converts Ctrl+C into Copy before emitting a Key event.
+                egui::Event::Copy => self.stop(),
+                egui::Event::Key {
+                    key: egui::Key::Space,
+                    pressed: true,
+                    repeat: false,
+                    ..
+                } => {
+                    let state = self.session.as_ref().map(|s| s.snapshot(now).state);
+                    match state {
+                        None | Some(SessionState::Stopped) => {
+                            self.start();
+                            consume_space_text = true;
+                        }
+                        Some(SessionState::Paused) => {
+                            self.session.as_mut().unwrap().resume(now);
+                            self.escape_pending = false;
+                            sound::play(SoundEvent::Start);
+                            consume_space_text = true;
+                        }
+                        _ => {}
+                    }
+                }
                 egui::Event::Key {
                     key: egui::Key::F9,
                     pressed: true,
@@ -215,8 +274,14 @@ impl StaminatorApp {
                 } => self.toggle_pause(),
                 egui::Event::Text(text) => {
                     for ch in text.chars() {
+                        if ch == ' ' && consume_space_text {
+                            consume_space_text = false;
+                            continue;
+                        }
                         if let Some(session) = &mut self.session {
-                            let _ = session.type_char(ch, now);
+                            if session.type_char(ch, now) == Keystroke::Incorrect {
+                                sound::play(SoundEvent::Error);
+                            }
                         }
                     }
                 }
@@ -247,7 +312,14 @@ impl eframe::App for StaminatorApp {
         });
         let position = snapshot.as_ref().map_or(0, |s| s.position);
         let elapsed = snapshot.as_ref().map_or(0, |s| s.elapsed_ms);
-        let next_char = self.exercise().chars().nth(position);
+        let next_char = if snapshot
+            .as_ref()
+            .is_some_and(|s| matches!(s.state, SessionState::Ready | SessionState::Running))
+        {
+            self.exercise().chars().nth(position)
+        } else {
+            None
+        };
         let stats = self
             .session
             .as_ref()
@@ -331,8 +403,10 @@ impl eframe::App for StaminatorApp {
                     } else {
                         "Набор"
                     }
+                } else if snapshot.is_some() {
+                    "Завершено"
                 } else {
-                    "Готово"
+                    "Ожидание"
                 });
                 ui.separator();
                 if let Some(stats) = &stats {
@@ -360,10 +434,25 @@ impl eframe::App for StaminatorApp {
                 training_view::draw_training(
                     ui,
                     self.background.as_ref(),
-                    self.exercise(),
+                    if snapshot.as_ref().is_some_and(|s| {
+                        matches!(s.state, SessionState::Ready | SessionState::Running)
+                    }) {
+                        self.exercise()
+                    } else {
+                        ""
+                    },
                     position,
                     elapsed,
                     "Пользователь",
+                    match snapshot.as_ref().map(|s| s.state) {
+                        Some(SessionState::Paused) if self.escape_pending => {
+                            Some("Пауза · пробел — продолжить · Esc / Ctrl+C — завершить")
+                        }
+                        Some(SessionState::Paused) => Some("Пауза · пробел — продолжить"),
+                        Some(SessionState::Stopped) => Some("Урок завершён · пробел — заново"),
+                        None => Some("Пробел — начать урок"),
+                        _ => None,
+                    },
                 );
             });
 

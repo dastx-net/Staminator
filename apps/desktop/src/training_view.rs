@@ -1,4 +1,31 @@
-use egui::{Align2, Color32, FontId, Rect, TextureHandle, Ui, Vec2};
+use egui::{
+    Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, Rect, TextureHandle, Ui, Vec2,
+};
+use std::{fs, path::PathBuf, sync::Arc};
+
+const TEXT_FONT: &str = "Stamina Text";
+
+pub fn install_text_font(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    let mut family = fonts
+        .families
+        .get(&FontFamily::Monospace)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(windir) = std::env::var_os("WINDIR") {
+        let path = PathBuf::from(windir).join("Fonts").join("cour.ttf");
+        if let Ok(bytes) = fs::read(path) {
+            fonts
+                .font_data
+                .insert("Courier New".into(), Arc::new(FontData::from_owned(bytes)));
+            family.insert(0, "Courier New".into());
+        }
+    }
+    fonts
+        .families
+        .insert(FontFamily::Name(TEXT_FONT.into()), family);
+    ctx.set_fonts(fonts);
+}
 
 /// Draws the focused typing view across the full available egui panel.
 pub fn draw_training(
@@ -8,6 +35,7 @@ pub fn draw_training(
     position: usize,
     elapsed_ms: u64,
     profile_name: &str,
+    prompt: Option<&str>,
 ) {
     let rect = ui.max_rect();
     let painter = ui.painter().with_clip_rect(rect);
@@ -54,7 +82,7 @@ pub fn draw_training(
 
     let chars: Vec<char> = text.chars().collect();
     let font_size = (band_height * 0.55).clamp(28.0, 58.0);
-    let font = FontId::monospace(font_size);
+    let font = FontId::new(font_size, FontFamily::Name(TEXT_FONT.into()));
     // Measure the chosen font so the painted glyphs and fixed cursor position
     // stay aligned when the window or system font changes.
     let advance = ui
@@ -89,16 +117,27 @@ pub fn draw_training(
         x += advance;
     }
 
-    let caret_x = current_x;
-    let caret_top = band.center().y - font_size * 0.48;
-    let caret_bottom = band.center().y + font_size * 0.48;
-    text_painter.line_segment(
-        [
-            egui::pos2(caret_x, caret_top),
-            egui::pos2(caret_x, caret_bottom),
-        ],
-        (2.0, Color32::from_rgb(24, 28, 31)),
-    );
+    if !chars.is_empty() {
+        let caret_x = current_x;
+        let caret_top = band.center().y - font_size * 0.48;
+        let caret_bottom = band.center().y + font_size * 0.48;
+        text_painter.line_segment(
+            [
+                egui::pos2(caret_x, caret_top),
+                egui::pos2(caret_x, caret_bottom),
+            ],
+            (2.0, Color32::from_rgb(24, 28, 31)),
+        );
+    }
+    if let Some(prompt) = prompt {
+        text_painter.text(
+            band.center(),
+            Align2::CENTER_CENTER,
+            prompt,
+            FontId::proportional(24.0),
+            Color32::from_rgb(62, 72, 80),
+        );
+    }
 
     let elapsed = elapsed_ms / 1000;
     painter.text(

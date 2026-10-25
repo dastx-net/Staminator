@@ -9,15 +9,15 @@ pub enum KeyboardLayout {
 /// Paints a non-interactive, scaled keyboard illustration.
 pub fn draw_keyboard(ui: &mut Ui, layout: KeyboardLayout, active: Option<char>) {
     let width = ui.available_width().max(1.0);
-    let height = (width * 0.356).min(ui.available_height()).max(1.0);
+    let height = (width * 0.405).min(ui.available_height()).max(1.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
     let painter = ui.painter_at(rect);
 
     let pad_x = width * 0.018;
     let pad_y = height * 0.055;
     let gap = width * 0.007;
-    let unit = (width - 2.0 * pad_x - 14.0 * gap) / 15.0;
-    let key_h = (height - 2.0 * pad_y - 4.0 * gap) / 5.0;
+    let legend_h = (height * 0.12).clamp(12.0, 22.0);
+    let key_h = (height - 2.0 * pad_y - 4.0 * gap - legend_h) / 5.0;
     let step_y = key_h + gap;
     let x0 = rect.left() + pad_x;
     let y0 = rect.top() + pad_y;
@@ -31,39 +31,16 @@ pub fn draw_keyboard(ui: &mut Ui, layout: KeyboardLayout, active: Option<char>) 
         StrokeKind::Inside,
     );
 
-    // Soft finger zones echo the original trainer's colored guide lines.
-    let zones = [
-        (0.0, 2.0, Color32::from_rgb(99, 120, 137)),
-        (2.0, 2.0, Color32::from_rgb(89, 133, 119)),
-        (4.0, 2.0, Color32::from_rgb(133, 139, 91)),
-        (6.0, 3.0, Color32::from_rgb(126, 119, 91)),
-        (9.0, 2.0, Color32::from_rgb(133, 139, 91)),
-        (11.0, 2.0, Color32::from_rgb(89, 133, 119)),
-        (13.0, 2.0, Color32::from_rgb(99, 120, 137)),
+    let finger_colors = [
+        Color32::from_rgb(190, 119, 125), // left pinky
+        Color32::from_rgb(198, 145, 102), // left ring
+        Color32::from_rgb(178, 169, 103), // left middle
+        Color32::from_rgb(111, 164, 139), // left index
+        Color32::from_rgb(102, 154, 177), // right index
+        Color32::from_rgb(128, 139, 190), // right middle
+        Color32::from_rgb(165, 128, 184), // right ring
+        Color32::from_rgb(190, 119, 157), // right pinky
     ];
-    for (start, count, color) in zones {
-        let r = Rect::from_min_max(
-            Pos2::new(x0 + start * (unit + gap), y0),
-            Pos2::new(
-                x0 + (start + count) * unit + (start + count - 1.0) * gap,
-                y0 + 4.0 * key_h + 3.0 * gap,
-            ),
-        );
-        painter.rect_filled(
-            r,
-            CornerRadius::same(5),
-            Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 18),
-        );
-        painter.rect_stroke(
-            r,
-            CornerRadius::same(5),
-            Stroke::new(
-                0.7,
-                Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 85),
-            ),
-            StrokeKind::Inside,
-        );
-    }
 
     let rows: [&[(&str, &str, f32)]; 5] = match layout {
         KeyboardLayout::English => [
@@ -225,7 +202,7 @@ pub fn draw_keyboard(ui: &mut Ui, layout: KeyboardLayout, active: Option<char>) 
         };
         let row_unit = (width - 2.0 * pad_x - row_gaps) / (total_units + offset_units);
         let mut x = x0 + offset_units * row_unit;
-        for &(top, bottom, key_units) in *row {
+        for (key_index, &(top, bottom, key_units)) in row.iter().enumerate() {
             let w = row_unit * key_units;
             let key_rect = Rect::from_min_size(
                 Pos2::new(x, y0 + row_index as f32 * step_y),
@@ -238,15 +215,23 @@ pub fn draw_keyboard(ui: &mut Ui, layout: KeyboardLayout, active: Option<char>) 
                     .any(|c| c.to_lowercase().next() == Some(target))
                     || (ch == ' ' && bottom == " ")
             });
+            let finger = finger_for_key(row_index, key_index);
+            let zone_color = finger.map(|i| finger_colors[i]);
             let face = if is_active {
                 Color32::from_rgb(205, 112, 43)
             } else {
-                Color32::from_rgb(64, 72, 81)
+                zone_color.map_or(Color32::from_rgb(64, 72, 81), |c| {
+                    Color32::from_rgb(
+                        (64 + c.r() as u16 / 4) as u8,
+                        (72 + c.g() as u16 / 4) as u8,
+                        (81 + c.b() as u16 / 4) as u8,
+                    )
+                })
             };
             let border = if is_active {
                 Color32::from_rgb(255, 173, 92)
             } else {
-                Color32::from_rgb(111, 124, 136)
+                zone_color.unwrap_or(Color32::from_rgb(111, 124, 136))
             };
             painter.rect_filled(
                 key_rect.translate(Vec2::new(0.0, 1.5)),
@@ -260,6 +245,15 @@ pub fn draw_keyboard(ui: &mut Ui, layout: KeyboardLayout, active: Option<char>) 
                 Stroke::new(if is_active { 1.8 } else { 1.0 }, border),
                 StrokeKind::Inside,
             );
+            if !is_active {
+                if let Some(color) = zone_color {
+                    let marker = Rect::from_min_max(
+                        Pos2::new(key_rect.left() + 2.0, key_rect.bottom() - 4.0),
+                        Pos2::new(key_rect.right() - 2.0, key_rect.bottom() - 1.0),
+                    );
+                    painter.rect_filled(marker, CornerRadius::same(1), color);
+                }
+            }
             let main_font = FontId::proportional((key_h * 0.45).clamp(10.0, 28.0));
             if !top.is_empty() && !bottom.is_empty() && top.chars().count() == 1 {
                 painter.text(
@@ -290,5 +284,85 @@ pub fn draw_keyboard(ui: &mut Ui, layout: KeyboardLayout, active: Option<char>) 
             }
             x += w + gap;
         }
+    }
+
+    let legend_y = y0 + 5.0 * key_h + 4.0 * gap + 1.0;
+    let legend = [
+        ("Л миз.", 0),
+        ("Л без.", 1),
+        ("Л сред.", 2),
+        ("Л указ.", 3),
+        ("П указ.", 4),
+        ("П сред.", 5),
+        ("П без.", 6),
+        ("П миз.", 7),
+    ];
+    let item_w = (width - 2.0 * pad_x) / legend.len() as f32;
+    for (i, (label, color_index)) in legend.into_iter().enumerate() {
+        let left = x0 + i as f32 * item_w;
+        let swatch = Rect::from_min_size(Pos2::new(left, legend_y + 3.0), Vec2::new(7.0, 7.0));
+        painter.rect_filled(swatch, CornerRadius::same(2), finger_colors[color_index]);
+        painter.text(
+            Pos2::new(left + 10.0, legend_y + 6.5),
+            Align2::LEFT_CENTER,
+            label,
+            FontId::proportional((height * 0.055).clamp(8.0, 11.0)),
+            Color32::from_rgb(201, 208, 214),
+        );
+    }
+}
+
+/// Indexes follow physical QWERTY key positions; Russian legends use the same hardware.
+fn finger_for_key(row: usize, key: usize) -> Option<usize> {
+    match row {
+        // Number row: `, 1-5 / 6-0, -, =. Function keys are excluded.
+        0 => match key {
+            0..=1 => Some(0),
+            10..=12 => Some(7),
+            2 => Some(1),
+            9 => Some(6),
+            3 => Some(2),
+            8 => Some(5),
+            4..=5 => Some(3),
+            6..=7 => Some(4),
+            _ => None,
+        },
+        // Ignore Tab and the final backslash key.
+        1 => match key {
+            1 => Some(0),
+            11 | 12 => Some(7),
+            2 => Some(1),
+            3 => Some(2),
+            4..=5 => Some(3),
+            6..=7 => Some(4),
+            8 => Some(5),
+            9 => Some(6),
+            10 => Some(7),
+            _ => None,
+        },
+        2 => match key {
+            1 => Some(0),
+            11 | 12 => Some(7),
+            2 => Some(1),
+            3 => Some(2),
+            4..=5 => Some(3),
+            6..=7 => Some(4),
+            8 => Some(5),
+            9 => Some(6),
+            10 => Some(7),
+            _ => None,
+        },
+        3 => match key {
+            1 => Some(0),
+            10 | 11 => Some(7),
+            2 => Some(1),
+            3 => Some(2),
+            4..=5 => Some(3),
+            6..=7 => Some(4),
+            8 => Some(5),
+            9 => Some(6),
+            _ => None,
+        },
+        _ => None,
     }
 }
