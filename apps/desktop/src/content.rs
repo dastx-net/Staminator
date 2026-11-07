@@ -21,6 +21,7 @@ pub struct ContentCatalog {
     english_lesson_ids: Vec<String>,
     lesson_roots: Vec<PathBuf>,
     lesson_diagnostics: String,
+    user_phrase_root: Option<PathBuf>,
     english_lessons: Vec<Exercise>,
     russian_phrases: Vec<Exercise>,
     english_phrases: Vec<Exercise>,
@@ -48,7 +49,11 @@ impl ContentCatalog {
             .or_else(|| std::env::var_os("XDG_DATA_HOME").map(PathBuf::from))
             .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/share")))
             .map(|p| p.join("Staminator/lessons"));
-        Self::load_with_roots(&data_dir, builtin, user_root)
+        let phrase_root = user_data_dir().map(|p| p.join("Staminator/phrases"));
+        let mut catalog = Self::load_with_roots(&data_dir, builtin, user_root);
+        catalog.user_phrase_root = phrase_root;
+        catalog.refresh_user_phrases();
+        catalog
     }
 
     fn load_with_roots(
@@ -58,7 +63,8 @@ impl ContentCatalog {
     ) -> Self {
         let mut catalog = Self::load_from(data_dir);
         catalog.lesson_roots = vec![builtin];
-        if let Some(root) = user_root {
+        catalog.user_phrase_root = user_root.as_ref().map(|p| p.join("phrases"));
+        if let Some(root) = user_root.clone() {
             catalog.lesson_roots.push(root);
         }
         catalog.refresh_lessons();
@@ -105,6 +111,7 @@ impl ContentCatalog {
                 .collect(),
             lesson_roots: Vec::new(),
             lesson_diagnostics: String::new(),
+            user_phrase_root: None,
             russian_lessons,
             english_lessons,
             russian_phrases,
@@ -124,6 +131,7 @@ impl ContentCatalog {
             english_lesson_ids: vec!["en.1".into(), "en.2".into()],
             lesson_roots: Vec::new(),
             lesson_diagnostics: String::new(),
+            user_phrase_root: None,
             russian_lessons: vec![
                 Exercise {
                     name: "RU home row".into(),
@@ -179,6 +187,7 @@ impl ContentCatalog {
             english_lesson_ids: Vec::new(),
             lesson_roots: Vec::new(),
             lesson_diagnostics: String::new(),
+            user_phrase_root: None,
             russian_lessons: Vec::new(),
             english_lessons: Vec::new(),
             russian_phrases: Vec::new(),
@@ -195,6 +204,12 @@ impl ContentCatalog {
     pub(crate) fn set_lesson_roots(&mut self, roots: Vec<PathBuf>) {
         self.lesson_roots = roots;
         self.refresh_lessons();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_phrase_root(&mut self, root: PathBuf) {
+        self.user_phrase_root = Some(root);
+        self.refresh_user_phrases();
     }
 
     pub fn refresh_lessons(&mut self) {
@@ -261,6 +276,10 @@ impl ContentCatalog {
         self.lesson_roots.get(1).map(PathBuf::as_path)
     }
 
+    pub fn lesson_roots(&self) -> &[PathBuf] {
+        &self.lesson_roots
+    }
+
     pub fn lessons(&self, language: ContentLanguage) -> &[Exercise] {
         match language {
             ContentLanguage::Russian => &self.russian_lessons,
@@ -272,6 +291,119 @@ impl ContentCatalog {
         match language {
             ContentLanguage::Russian => &self.russian_phrases,
             ContentLanguage::English => &self.english_phrases,
+        }
+    }
+
+    /// Persist one UTF-8 phrase batch and publish it atomically. Returns the
+    /// number of phrases written. Empty or multiline entries reject the batch.
+    pub fn add_user_phrases(
+        &mut self,
+        language: ContentLanguage,
+        phrases: &[String],
+    ) -> std::io::Result<usize> {
+        if phrases.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "phrase batch must not be empty",
+            ));
+        }
+        let normalized: Vec<_> = phrases.iter().map(|phrase| phrase.trim()).collect();
+        if normalized
+            .iter()
+            .any(|phrase| phrase.is_empty() || phrase.contains(['\r', '\n']))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "phrase batch contains an empty or multiline phrase",
+            ));
+        }
+        let root = self.user_phrase_root.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "user data directory unavailable",
+            )
+        })?;
+        let language_dir = root.join(match language {
+            ContentLanguage::Russian => "ru",
+            ContentLanguage::English => "en",
+        });
+        std::fs::create_dir_all(&language_dir)?;
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_BATCH: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let id = NEXT_BATCH.fetch_add(1, Ordering::Relaxed);
+            let stem = format!("{}-{id:016}", std::process::id());
+            let target_path = language_dir.join(format!("batch-{stem}.txt"));
+            let temporary_path = language_dir.join(format!(".batch-{stem}.tmp"));
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary_path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            };
+            let result = (|| {
+                for phrase in &normalized {
+                    writeln!(file, "{phrase}")?;
+                }
+                file.sync_all()?;
+                std::fs::hard_link(&temporary_path, &target_path)
+            })();
+            drop(file);
+            let _ = std::fs::remove_file(&temporary_path);
+            match result {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        let target = match language {
+            ContentLanguage::Russian => &mut self.russian_phrases,
+            ContentLanguage::English => &mut self.english_phrases,
+        };
+        target.extend(normalized.iter().map(|phrase| Exercise {
+            name: (*phrase).to_owned(),
+            text: phrase_segment(phrase),
+        }));
+        Ok(normalized.len())
+    }
+
+    fn refresh_user_phrases(&mut self) {
+        let Some(root) = &self.user_phrase_root else {
+            return;
+        };
+        for (language, target) in [
+            ("ru", &mut self.russian_phrases),
+            ("en", &mut self.english_phrases),
+        ] {
+            let dir = root.join(language);
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            let mut paths: Vec<_> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.extension().is_some_and(|e| e == "txt")
+                        && p.file_name()
+                            .is_some_and(|n| n.to_string_lossy().starts_with("batch-"))
+                })
+                .collect();
+            paths.sort();
+            for path in paths {
+                let Ok(text) = std::fs::read_to_string(path) else {
+                    continue;
+                };
+                for line in text.lines().filter(|line| !line.trim().is_empty()) {
+                    target.push(Exercise {
+                        name: line.to_owned(),
+                        text: phrase_segment(line),
+                    });
+                }
+            }
         }
     }
 
@@ -398,6 +530,13 @@ fn phrase_segment(line: &str) -> String {
     format!("{} ", trimmed[..end].trim_end())
 }
 
+fn user_data_dir() -> Option<PathBuf> {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_DATA_HOME").map(PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/share")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -435,6 +574,96 @@ mod tests {
         assert_eq!(catalog.lessons(ContentLanguage::English)[0].text, "hello");
         assert_eq!(catalog.user_lesson_path(), Some(user.as_path()));
         assert_eq!(fs::read_to_string(user_file).unwrap(), content);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn phrase_loader_skips_invalid_utf8_without_hiding_valid_batches() {
+        let root = temp_file("phrase-invalid-utf8");
+        let language = root.join("ru");
+        fs::create_dir_all(&language).unwrap();
+        fs::write(language.join("batch-bad.txt"), [0xff]).unwrap();
+        fs::write(language.join("batch-good.txt"), "Привет!\n").unwrap();
+        let mut catalog = ContentCatalog::fixture_empty();
+        catalog.set_phrase_root(root.clone());
+        assert_eq!(catalog.phrases(ContentLanguage::Russian).len(), 1);
+        assert_eq!(
+            catalog.phrases(ContentLanguage::Russian)[0].text,
+            "Привет! "
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn user_phrases_are_saved_as_utf8_and_loaded_into_catalog() {
+        let root = temp_file("user-phrases");
+        let mut catalog = ContentCatalog::fixture();
+        catalog.user_phrase_root = Some(root.join("phrases"));
+        let language_dir = root.join("phrases/ru");
+        fs::create_dir_all(&language_dir).unwrap();
+        let stale_batch = language_dir.join(format!("batch-{}-{:016}.txt", std::process::id(), 0));
+        let stale_temp = language_dir.join(format!(".batch-{}-{:016}.tmp", std::process::id(), 0));
+        fs::write(&stale_batch, "keep me\n").unwrap();
+        fs::write(&stale_temp, "stale temp\n").unwrap();
+        assert!(
+            catalog
+                .add_user_phrases(ContentLanguage::Russian, &[])
+                .is_err()
+        );
+        assert!(
+            catalog
+                .add_user_phrases(
+                    ContentLanguage::Russian,
+                    &["ok".into(), "two\nlines".into()]
+                )
+                .is_err()
+        );
+        assert!(catalog.phrases(ContentLanguage::Russian).len() == 2);
+        let added = catalog
+            .add_user_phrases(
+                ContentLanguage::Russian,
+                &["Привет, мир!".into(), "Пока!".into()],
+            )
+            .unwrap();
+        assert_eq!(added, 2);
+        assert_eq!(
+            catalog
+                .phrases(ContentLanguage::Russian)
+                .last()
+                .unwrap()
+                .text,
+            "Пока! "
+        );
+        let mut reopened = ContentCatalog::fixture();
+        reopened.user_phrase_root = Some(root.join("phrases"));
+        reopened.refresh_user_phrases();
+        assert_eq!(
+            reopened
+                .phrases(ContentLanguage::Russian)
+                .last()
+                .unwrap()
+                .name,
+            "Пока!"
+        );
+        let batch_files: Vec<_> = fs::read_dir(root.join("phrases/ru"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("batch-"))
+            })
+            .collect();
+        assert_eq!(batch_files.len(), 2);
+        assert_eq!(fs::read_to_string(&stale_batch).unwrap(), "keep me\n");
+        assert_eq!(fs::read_to_string(&stale_temp).unwrap(), "stale temp\n");
+        let published = batch_files
+            .iter()
+            .find(|path| **path != stale_batch)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(published).unwrap(),
+            "Привет, мир!\nПока!\n"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

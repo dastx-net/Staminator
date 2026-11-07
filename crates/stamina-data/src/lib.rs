@@ -1,4 +1,4 @@
-//! Read-only parsers for Stamina's legacy lesson and phrase files.
+//! Parsers for Stamina's legacy data and safe user lesson storage.
 
 #![forbid(unsafe_code)]
 
@@ -189,7 +189,7 @@ pub fn read_layouts(path: impl AsRef<Path>) -> Result<Vec<Layout>, DataError> {
 }
 
 /// A version 1 JSON lesson stored as one UTF-8 file.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JsonLesson {
     pub version: u32,
@@ -275,7 +275,10 @@ pub fn load_lesson_catalog(roots: &[impl AsRef<Path>]) -> LessonCatalog {
             for item in copies {
                 diagnostics.push(CatalogDiagnostic {
                     path: item.path,
-                    message: format!("повторяется ID урока; конфликтующие пути: {paths}"),
+                    message: format!(
+                        "повторяется ID урока {} ; конфликтующие пути: {paths}",
+                        item.lesson.id
+                    ),
                 });
             }
         } else if let Some(item) = copies.pop() {
@@ -356,6 +359,12 @@ fn read_json_lesson(path: &Path) -> Result<JsonLesson, String> {
         std::str::from_utf8(&bytes).map_err(|error| format!("файл не в UTF-8: {error}"))?;
     let lesson: JsonLesson =
         serde_json::from_str(source).map_err(|error| format!("ошибка JSON: {error}"))?;
+    validate_json_lesson(&lesson)?;
+    Ok(lesson)
+}
+
+/// Apply the same schema checks used by catalog loading and lesson writes.
+pub fn validate_json_lesson(lesson: &JsonLesson) -> Result<(), String> {
     if lesson.version != 1 {
         return Err(format!("неподдерживаемая версия урока {}", lesson.version));
     }
@@ -371,7 +380,215 @@ fn read_json_lesson(path: &Path) -> Result<JsonLesson, String> {
     if !valid_language_tag_subset(&lesson.language) {
         return Err("язык должен соответствовать поддерживаемому синтаксису BCP 47: 2–8 латинских букв, затем необязательные части из 1–8 букв или цифр".into());
     }
-    Ok(lesson)
+    Ok(())
+}
+
+/// Save a new lesson as `<id>.json` beneath the user directory. IDs are restricted
+/// to portable filename characters, and IDs present in any supplied catalog root
+/// are rejected. The write is staged beside the destination then renamed into place.
+pub fn create_user_lesson(
+    user_root: impl AsRef<Path>,
+    catalog_roots: &[impl AsRef<Path>],
+    lesson: &JsonLesson,
+) -> Result<PathBuf, LessonWriteError> {
+    validate_json_lesson(lesson).map_err(LessonWriteError::Invalid)?;
+    if lesson.id.is_empty()
+        || !lesson
+            .id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(LessonWriteError::Invalid(
+            "ID должен содержать только латинские буквы, цифры, дефис или подчёркивание".into(),
+        ));
+    }
+    let root = user_root.as_ref();
+    fs::create_dir_all(root).map_err(|source| LessonWriteError::Io {
+        path: root.to_owned(),
+        source,
+    })?;
+    ensure_real_directory(root)?;
+    let destination = root.join(format!("{}.json", lesson.id));
+    if fs::symlink_metadata(&destination).is_ok() {
+        return Err(LessonWriteError::AlreadyExists(destination));
+    }
+    ensure_id_available(catalog_roots, &lesson.id, None)?;
+    atomic_write(&destination, lesson, false)
+}
+
+/// Replace an existing JSON file in the user directory. Nested paths are allowed;
+/// every path component is checked and symlinks are rejected.
+pub fn edit_user_lesson(
+    user_root: impl AsRef<Path>,
+    path: impl AsRef<Path>,
+    catalog_roots: &[impl AsRef<Path>],
+    lesson: &JsonLesson,
+) -> Result<PathBuf, LessonWriteError> {
+    validate_json_lesson(lesson).map_err(LessonWriteError::Invalid)?;
+    let root = user_root.as_ref();
+    ensure_real_directory(root)?;
+    let target = path.as_ref();
+    let relative = target
+        .strip_prefix(root)
+        .map_err(|_| LessonWriteError::UnsafePath)?;
+    if relative
+        .components()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        || target
+            .extension()
+            .is_none_or(|ext| !ext.eq_ignore_ascii_case("json"))
+    {
+        return Err(LessonWriteError::UnsafePath);
+    }
+    let mut current = root.to_owned();
+    let components = relative.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current).map_err(|source| LessonWriteError::Io {
+            path: current.clone(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink()
+            || (index + 1 < components.len() && !metadata.is_dir())
+            || (index + 1 == components.len() && !metadata.is_file())
+        {
+            return Err(LessonWriteError::UnsafePath);
+        }
+    }
+    ensure_id_available(catalog_roots, &lesson.id, Some(target))?;
+    atomic_write(target, lesson, true)
+}
+
+#[derive(Debug)]
+pub enum LessonWriteError {
+    Invalid(String),
+    UnsafePath,
+    AlreadyExists(PathBuf),
+    DuplicateId(String),
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl fmt::Display for LessonWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(message) => write!(f, "недопустимый урок: {message}"),
+            Self::UnsafePath => write!(f, "небезопасный путь к пользовательскому уроку"),
+            Self::AlreadyExists(path) => write!(f, "файл уже существует: {}", path.display()),
+            Self::DuplicateId(id) => write!(f, "ID урока уже используется: {id}"),
+            Self::Io { path, source } => {
+                write!(f, "не удалось записать {}: {source}", path.display())
+            }
+        }
+    }
+}
+impl Error for LessonWriteError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+fn ensure_real_directory(root: &Path) -> Result<(), LessonWriteError> {
+    let metadata = fs::symlink_metadata(root).map_err(|source| LessonWriteError::Io {
+        path: root.to_owned(),
+        source,
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(LessonWriteError::UnsafePath);
+    }
+    Ok(())
+}
+
+fn ensure_id_available(
+    roots: &[impl AsRef<Path>],
+    id: &str,
+    except: Option<&Path>,
+) -> Result<(), LessonWriteError> {
+    let catalog = load_lesson_catalog(roots);
+    if catalog
+        .lessons
+        .iter()
+        .any(|entry| entry.lesson.id == id && Some(entry.path.as_path()) != except)
+        || catalog.diagnostics.iter().any(|item| {
+            item.message
+                .contains(&format!("повторяется ID урока {id} "))
+        })
+    {
+        return Err(LessonWriteError::DuplicateId(id.to_owned()));
+    }
+    Ok(())
+}
+
+fn atomic_write(
+    path: &Path,
+    lesson: &JsonLesson,
+    replace: bool,
+) -> Result<PathBuf, LessonWriteError> {
+    use std::io::Write;
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let bytes = serde_json::to_vec_pretty(lesson)
+        .map_err(|error| LessonWriteError::Invalid(error.to_string()))?;
+    let parent = path.parent().ok_or(LessonWriteError::UnsafePath)?;
+    let mut temporary;
+    let mut file;
+    loop {
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        temporary = parent.join(format!(".lesson-{}-{id}.tmp", std::process::id()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(opened) => {
+                file = opened;
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(LessonWriteError::Io {
+                    path: temporary,
+                    source,
+                });
+            }
+        }
+    }
+    let result = (|| {
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|source| LessonWriteError::Io {
+                path: temporary.clone(),
+                source,
+            })?;
+        drop(file);
+        if replace {
+            fs::rename(&temporary, path).map_err(|source| LessonWriteError::Io {
+                path: path.to_owned(),
+                source,
+            })?;
+        } else {
+            fs::hard_link(&temporary, path).map_err(|source| {
+                if source.kind() == std::io::ErrorKind::AlreadyExists {
+                    LessonWriteError::AlreadyExists(path.to_owned())
+                } else {
+                    LessonWriteError::Io {
+                        path: path.to_owned(),
+                        source,
+                    }
+                }
+            })?;
+            let _ = fs::remove_file(&temporary);
+        }
+        Ok(path.to_owned())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
 
 // Deliberately validate a lexical subset: primary subtag is 2-8 ASCII letters;
@@ -411,6 +628,206 @@ mod tests {
             format!(r#"{{"version":1,"id":"{id}","title":"Title {id}","language":"ru","text":"{text}"}}"#),
         )
         .unwrap();
+    }
+
+    fn json_lesson(id: &str, text: &str) -> JsonLesson {
+        JsonLesson {
+            version: 1,
+            id: id.into(),
+            title: format!("Title {id}"),
+            language: "ru".into(),
+            description: None,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn changing_lesson_id_to_an_existing_id_keeps_both_files() {
+        let root = temp_dir("edit-conflict");
+        let first = root.join("first.json");
+        let second = root.join("second.json");
+        write_json(&first, "first", "one");
+        write_json(&second, "second", "two");
+        let result = edit_user_lesson(
+            &root,
+            &first,
+            std::slice::from_ref(&root),
+            &json_lesson("second", "changed"),
+        );
+        assert!(matches!(result, Err(LessonWriteError::DuplicateId(_))));
+        assert_eq!(read_json_lesson(&first).unwrap().text, "one");
+        assert_eq!(read_json_lesson(&second).unwrap().text, "two");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_future_version_and_empty_title() {
+        let mut lesson = json_lesson("id", "body");
+        lesson.version = 2;
+        assert!(validate_json_lesson(&lesson)
+            .unwrap_err()
+            .contains("версия"));
+        lesson.version = 1;
+        lesson.title.clear();
+        assert!(validate_json_lesson(&lesson)
+            .unwrap_err()
+            .contains("название"));
+        lesson.title = "Title".into();
+        lesson.language = "ru_XX".into();
+        assert!(validate_json_lesson(&lesson).unwrap_err().contains("язык"));
+    }
+
+    #[test]
+    fn edit_rejects_missing_files_non_json_and_non_directory_roots() {
+        let root = temp_dir("writer-errors");
+        let roots = [root.clone()];
+        let text = root.join("existing.txt");
+        fs::write(&text, "original").unwrap();
+        let lesson = json_lesson("safe", "new");
+        assert!(matches!(
+            edit_user_lesson(&root, &text, &roots, &lesson),
+            Err(LessonWriteError::UnsafePath)
+        ));
+        let error =
+            edit_user_lesson(&root, root.join("missing.json"), &roots, &lesson).unwrap_err();
+        assert!(matches!(error, LessonWriteError::Io { .. }));
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(error.to_string().contains("missing.json"));
+        assert!(matches!(
+            edit_user_lesson(&text, text.join("lesson.json"), &roots, &lesson),
+            Err(LessonWriteError::UnsafePath)
+        ));
+        assert_eq!(fs::read_to_string(&text).unwrap(), "original");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lesson_writer_creates_directory_and_preserves_duplicate_sources() {
+        let root = temp_dir("writer-cases");
+        let builtin = root.join("builtin");
+        let user = root.join("user");
+        write_json(&builtin.join("a.json"), "duplicate", "first");
+        write_json(&builtin.join("b.json"), "duplicate", "second");
+        let roots = [builtin.clone(), user.clone()];
+        let error =
+            create_user_lesson(&user, &roots, &json_lesson("duplicate", "third")).unwrap_err();
+        assert!(error.to_string().contains("duplicate"));
+        assert_eq!(
+            read_json_lesson(&builtin.join("a.json")).unwrap().text,
+            "first"
+        );
+        assert_eq!(
+            read_json_lesson(&builtin.join("b.json")).unwrap().text,
+            "second"
+        );
+        let created = create_user_lesson(&user, &roots, &json_lesson("unique", "hello")).unwrap();
+        assert!(created.exists());
+        let invalid_path = user.join("nested/../unique.json");
+        assert!(matches!(
+            edit_user_lesson(
+                &user,
+                &invalid_path,
+                &roots,
+                &json_lesson("unique", "changed")
+            ),
+            Err(LessonWriteError::UnsafePath)
+        ));
+        assert_eq!(read_json_lesson(&created).unwrap().text, "hello");
+        let bad_root = root.join("file");
+        fs::write(&bad_root, "keep").unwrap();
+        assert!(create_user_lesson(&bad_root, &roots, &json_lesson("another", "text")).is_err());
+        assert_eq!(fs::read_to_string(&bad_root).unwrap(), "keep");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn user_lesson_create_rejects_duplicates_and_path_like_ids_without_changing_files() {
+        let built_in = temp_dir("write-built-in");
+        let user = temp_dir("write-user");
+        write_json(&built_in.join("existing.json"), "existing", "original");
+
+        assert!(matches!(
+            create_user_lesson(
+                &user,
+                &[built_in.clone(), user.clone()],
+                &json_lesson("../escape", "x")
+            ),
+            Err(LessonWriteError::Invalid(_))
+        ));
+        assert!(matches!(
+            create_user_lesson(
+                &user,
+                &[built_in.clone(), user.clone()],
+                &json_lesson("existing", "x")
+            ),
+            Err(LessonWriteError::DuplicateId(_))
+        ));
+        assert!(!user.join("escape.json").exists());
+        assert!(fs::read_to_string(built_in.join("existing.json"))
+            .unwrap()
+            .contains("original"));
+
+        let created = create_user_lesson(
+            &user,
+            &[built_in.clone(), user.clone()],
+            &json_lesson("new_1", "текст"),
+        )
+        .unwrap();
+        assert_eq!(created, user.join("new_1.json"));
+        assert_eq!(
+            read_json_lesson(&created).unwrap(),
+            json_lesson("new_1", "текст")
+        );
+        assert!(matches!(
+            create_user_lesson(
+                &user,
+                &[built_in.clone(), user.clone()],
+                &json_lesson("new_1", "other")
+            ),
+            Err(LessonWriteError::AlreadyExists(_))
+        ));
+        assert_eq!(read_json_lesson(&created).unwrap().text, "текст");
+        fs::remove_dir_all(built_in).unwrap();
+        fs::remove_dir_all(user).unwrap();
+    }
+
+    #[test]
+    fn user_lesson_edit_validates_before_replacing_and_rejects_outside_paths() {
+        let user = temp_dir("edit-user");
+        let target = user.join("nested/current.json");
+        write_json(&target, "current", "original");
+        let roots = [user.clone()];
+
+        let invalid = JsonLesson {
+            text: "  ".into(),
+            ..json_lesson("current", "replacement")
+        };
+        assert!(matches!(
+            edit_user_lesson(&user, &target, &roots, &invalid),
+            Err(LessonWriteError::Invalid(_))
+        ));
+        assert_eq!(read_json_lesson(&target).unwrap().text, "original");
+
+        let outside = temp_dir("edit-outside").join("outside.json");
+        write_json(&outside, "outside", "protected");
+        assert!(matches!(
+            edit_user_lesson(&user, &outside, &roots, &json_lesson("updated", "x")),
+            Err(LessonWriteError::UnsafePath)
+        ));
+        let edited = edit_user_lesson(
+            &user,
+            &target,
+            &roots,
+            &json_lesson("updated", "replacement"),
+        )
+        .unwrap();
+        assert_eq!(edited, target);
+        assert_eq!(
+            read_json_lesson(&target).unwrap(),
+            json_lesson("updated", "replacement")
+        );
+        fs::remove_dir_all(user).unwrap();
+        fs::remove_dir_all(outside.parent().unwrap()).unwrap();
     }
 
     fn temp_file(label: &str) -> std::path::PathBuf {

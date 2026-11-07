@@ -1,7 +1,9 @@
 mod content;
+mod content_editor;
 mod external_text;
 mod generated_modes;
 mod keyboard;
+mod lesson_generator;
 mod progress_view;
 mod result_view;
 mod sound;
@@ -106,6 +108,8 @@ struct StaminatorApp {
     selected_lessons: [Option<String>; 2],
     chooser_open: bool,
     chooser_filter: String,
+    lesson_editor: Option<content_editor::LessonEditor>,
+    phrase_editor: Option<content_editor::PhraseEditor>,
     external_path: Option<PathBuf>,
     external_text: String,
     external_error: String,
@@ -207,6 +211,8 @@ impl StaminatorApp {
             selected_lessons: [None, None],
             chooser_open: false,
             chooser_filter: String::new(),
+            lesson_editor: None,
+            phrase_editor: None,
             external_path: None,
             external_text: String::new(),
             external_error: String::new(),
@@ -722,7 +728,12 @@ impl StaminatorApp {
     }
 
     fn handle_input(&mut self, ctx: &egui::Context) {
-        if self.result_open || self.chooser_open || self.profiles_open {
+        if self.result_open
+            || self.chooser_open
+            || self.profiles_open
+            || self.lesson_editor.is_some()
+            || self.phrase_editor.is_some()
+        {
             return;
         }
         let now = self.now_ms();
@@ -810,6 +821,9 @@ impl StaminatorApp {
         let mut open = self.chooser_open;
         let mut chosen = None;
         let mut refresh = false;
+        let mut create = false;
+        let mut edit = false;
+        let mut add_phrases = false;
         let current = self.current_index();
         egui::Window::new(if self.selected_mode == TrainingMode::Lessons {
             "Выбор урока"
@@ -820,13 +834,20 @@ impl StaminatorApp {
         .default_size([620.0, 470.0])
         .show(ctx, |ui| {
             if self.selected_mode == TrainingMode::Lessons {
-                refresh = ui.button("Обновить список уроков").clicked();
+                ui.horizontal(|ui| {
+                    refresh = ui.button("Обновить список уроков").clicked();
+                    create = ui.button("Создать урок").clicked();
+                    edit = ui.button("Изменить выбранный урок").clicked();
+                });
                 if let Some(path) = self.catalog.user_lesson_path() {
                     ui.label(format!("Папка ваших уроков: {}", path.display()));
                 }
                 if !self.catalog.lesson_diagnostics().is_empty() {
                     ui.colored_label(egui::Color32::RED, self.catalog.lesson_diagnostics());
                 }
+            }
+            if self.selected_mode == TrainingMode::Phrases {
+                add_phrases = ui.button("Добавить фразы").clicked();
             }
             ui.text_edit_singleline(&mut self.chooser_filter);
             let filter = self.chooser_filter.trim().to_lowercase();
@@ -855,6 +876,49 @@ impl StaminatorApp {
             );
         });
         self.chooser_open = open;
+        if create {
+            self.lesson_editor = Some(content_editor::LessonEditor::new(
+                if self.language() == ContentLanguage::English {
+                    "en"
+                } else {
+                    "ru"
+                },
+            ));
+            self.chooser_open = false;
+        }
+        if edit {
+            let id = self.catalog.lesson_id(self.language(), current);
+            let item = stamina_data::load_lesson_catalog(self.catalog.lesson_roots())
+                .lessons
+                .into_iter()
+                .find(|item| Some(item.lesson.id.as_str()) == id);
+            let mut editor =
+                content_editor::LessonEditor::new(if self.language() == ContentLanguage::English {
+                    "en"
+                } else {
+                    "ru"
+                });
+            if let Some(item) = item {
+                if self
+                    .catalog
+                    .user_lesson_path()
+                    .is_some_and(|root| item.path.starts_with(root))
+                {
+                    editor.lesson = item.lesson;
+                    editor.path = Some(item.path);
+                } else {
+                    editor.error = "Встроенный урок нельзя изменить; создайте свой урок".into();
+                }
+            } else {
+                editor.error = "Выберите урок".into();
+            }
+            self.lesson_editor = Some(editor);
+            self.chooser_open = false;
+        }
+        if add_phrases {
+            self.phrase_editor = Some(content_editor::PhraseEditor::default());
+            self.chooser_open = false;
+        }
         if refresh {
             for (index, language) in [ContentLanguage::Russian, ContentLanguage::English]
                 .into_iter()
@@ -874,6 +938,90 @@ impl StaminatorApp {
             self.select_content(index);
             self.chooser_open = false;
             self.chooser_filter.clear();
+        }
+    }
+
+    fn show_content_editors(&mut self, ctx: &egui::Context) {
+        if let Some(mut editor) = self.lesson_editor.take() {
+            let mut open = true;
+            if editor.show(ctx, &mut open) {
+                if !["ru", "en"].iter().any(|lang| {
+                    editor
+                        .lesson
+                        .language
+                        .split('-')
+                        .next()
+                        .is_some_and(|value| value.eq_ignore_ascii_case(lang))
+                }) {
+                    editor.error = "Доступны только уроки на русском или английском языке".into();
+                    self.lesson_editor = Some(editor);
+                    return;
+                }
+                let result = if let Some(root) = self.catalog.user_lesson_path() {
+                    if let Some(path) = &editor.path {
+                        stamina_data::edit_user_lesson(
+                            root,
+                            path,
+                            self.catalog.lesson_roots(),
+                            &editor.lesson,
+                        )
+                    } else {
+                        stamina_data::create_user_lesson(
+                            root,
+                            self.catalog.lesson_roots(),
+                            &editor.lesson,
+                        )
+                    }
+                } else {
+                    editor.error = "Не найден пользовательский каталог уроков".into();
+                    self.lesson_editor = Some(editor);
+                    return;
+                };
+                match result {
+                    Ok(_) => {
+                        let language = if editor
+                            .lesson
+                            .language
+                            .split('-')
+                            .next()
+                            .is_some_and(|v| v.eq_ignore_ascii_case("en"))
+                        {
+                            ContentLanguage::English
+                        } else {
+                            ContentLanguage::Russian
+                        };
+                        self.catalog.refresh_lessons();
+                        self.content_language = language;
+                        self.selected_mode = TrainingMode::Lessons;
+                        self.selected_lessons[usize::from(language == ContentLanguage::English)] =
+                            Some(editor.lesson.id.clone());
+                        self.session = None;
+                        self.last_result = None;
+                        open = false;
+                    }
+                    Err(error) => editor.error = format!("Не удалось сохранить урок: {error}"),
+                }
+            }
+            if open {
+                self.lesson_editor = Some(editor);
+            }
+        }
+        if let Some(mut editor) = self.phrase_editor.take() {
+            let mut open = true;
+            if editor.show(ctx, &mut open) {
+                let phrases = editor.parsed_phrases();
+                match self.catalog.add_user_phrases(self.language(), &phrases) {
+                    Ok(_) => {
+                        self.session = None;
+                        self.last_result = None;
+                        open = false;
+                    }
+                    Err(error) => editor.error = format!("Не удалось сохранить фразы: {error}"),
+                }
+            }
+            if open {
+                self.phrase_editor = Some(editor);
+            }
         }
     }
 
@@ -1285,6 +1433,7 @@ impl StaminatorApp {
         if self.chooser_open {
             self.show_content_chooser(root.ctx());
         }
+        self.show_content_editors(root.ctx());
         if self.profiles_open {
             self.show_profiles(root.ctx());
         }
@@ -1461,6 +1610,318 @@ mod tests {
         app.external_path = Some(PathBuf::from("example.txt"));
         app.external_text = "ab".into();
         app
+    }
+
+    #[test]
+    fn phrase_editor_saves_and_reopens_training_content() {
+        let root = std::env::temp_dir().join(format!(
+            "staminator-phrase-ui-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut app = test_app(root.join("profiles.json"));
+        app.catalog.set_phrase_root(root.join("phrases"));
+        app.selected_mode = TrainingMode::Phrases;
+        app.chooser_open = true;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let id = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Добавить фразы"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(id)]);
+        app.phrase_editor.as_mut().unwrap().text = "Новая фраза!".into();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let id = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Сохранить фразы"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(id)]);
+        assert!(app.phrase_editor.is_none());
+        let index = app.catalog.phrases(ContentLanguage::Russian).len() - 1;
+        app.select_content(index);
+        app.start();
+        assert_eq!(app.session_text, "Новая фраза! ");
+        for (index, ch) in "Новая фраза! ".chars().enumerate() {
+            app.type_input_char(ch, index as u64);
+        }
+        let mut reopened = ContentCatalog::fixture();
+        reopened.set_phrase_root(root.join("phrases"));
+        assert!(
+            reopened
+                .phrases(ContentLanguage::Russian)
+                .iter()
+                .any(|p| p.text == "Новая фраза! ")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn phrase_editor_rejects_empty_input_and_can_retry() {
+        let root = std::env::temp_dir().join(format!(
+            "staminator-phrase-retry-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut app = test_app(root.join("profile"));
+        app.catalog.set_phrase_root(root.join("phrases"));
+        app.content_language = ContentLanguage::English;
+        app.selected_mode = TrainingMode::Phrases;
+        app.phrase_editor = Some(content_editor::PhraseEditor::default());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let id = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Сохранить фразы"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(id)]);
+        assert!(
+            app.phrase_editor
+                .as_ref()
+                .unwrap()
+                .error
+                .contains("Не удалось")
+        );
+        app.phrase_editor.as_mut().unwrap().text = "Hello!".into();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let id = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Сохранить фразы"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(id)]);
+        assert!(app.phrase_editor.is_none());
+        assert!(
+            app.catalog
+                .phrases(ContentLanguage::English)
+                .iter()
+                .any(|p| p.text == "Hello! ")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn builtin_lesson_is_not_opened_for_overwriting() {
+        let root = std::env::temp_dir().join(format!(
+            "staminator-builtin-edit-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let builtin = root.join("builtin");
+        fs::create_dir_all(&builtin).unwrap();
+        let path = builtin.join("one.json");
+        let original =
+            r#"{"version":1,"id":"builtin","title":"Built in","language":"ru","text":"original"}"#;
+        fs::write(&path, original).unwrap();
+        let mut app = test_app(root.join("profile"));
+        app.catalog
+            .set_lesson_roots(vec![builtin, root.join("user")]);
+        app.selected_mode = TrainingMode::Lessons;
+        app.chooser_open = true;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let id = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Изменить выбранный урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(id)]);
+        let editor = app.lesson_editor.as_ref().unwrap();
+        assert!(editor.path.is_none());
+        assert!(editor.error.contains("Встроенный урок"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn editor_keeps_invalid_content_on_validation_error() {
+        let root = std::env::temp_dir().join(format!(
+            "staminator-editor-invalid-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let builtin = root.join("builtin");
+        let user = root.join("user");
+        fs::create_dir_all(&builtin).unwrap();
+        fs::write(
+            builtin.join("one.json"),
+            r#"{"version":1,"id":"used","title":"Existing","language":"ru","text":"original"}"#,
+        )
+        .unwrap();
+        let mut app = test_app(root.join("profiles.json"));
+        app.catalog.set_lesson_roots(vec![builtin.clone(), user]);
+        app.lesson_editor = Some(content_editor::LessonEditor::new("fr"));
+        let editor = app.lesson_editor.as_mut().unwrap();
+        editor.lesson.id = "used".into();
+        editor.lesson.title = "Edited".into();
+        editor.lesson.text = "new".into();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let id = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Сохранить урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(id)]);
+        assert!(
+            app.lesson_editor
+                .as_ref()
+                .unwrap()
+                .error
+                .contains("русском")
+        );
+        app.lesson_editor.as_mut().unwrap().lesson.language = "ru".into();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let id = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Сохранить урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(id)]);
+        let editor = app.lesson_editor.as_ref().unwrap();
+        assert!(editor.error.contains("используется"));
+        assert_eq!(editor.lesson.text, "new");
+        assert!(
+            fs::read_to_string(builtin.join("one.json"))
+                .unwrap()
+                .contains("original")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn editor_reports_invalid_lesson_and_phrase_storage_errors() {
+        let mut app = test_app(test_path());
+        app.lesson_editor = Some(content_editor::LessonEditor::new("ru"));
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let id = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Сохранить урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(id)]);
+        assert!(
+            app.lesson_editor
+                .as_ref()
+                .unwrap()
+                .error
+                .contains("каталог")
+        );
+        app.lesson_editor = None;
+        app.phrase_editor = Some(content_editor::PhraseEditor {
+            text: "Фраза".into(),
+            error: String::new(),
+        });
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let id = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Сохранить фразы"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(id)]);
+        assert!(
+            app.phrase_editor
+                .as_ref()
+                .unwrap()
+                .error
+                .contains("Не удалось сохранить")
+        );
+    }
+
+    #[test]
+    fn editor_generates_saves_edits_and_reloads_a_lesson() {
+        let root = std::env::temp_dir().join(format!(
+            "staminator-editor-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let builtin = root.join("builtin");
+        let user = root.join("user");
+        fs::create_dir_all(&builtin).unwrap();
+        let mut app = test_app(root.join("profiles.json"));
+        app.catalog
+            .set_lesson_roots(vec![builtin.clone(), user.clone()]);
+        app.selected_mode = TrainingMode::Lessons;
+        app.chooser_open = true;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let id = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Создать урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(id)]);
+        let editor = app.lesson_editor.as_mut().unwrap();
+        editor.lesson.id = "my-lesson".into();
+        editor.lesson.title = "Мой урок".into();
+        editor.symbols = "аб".into();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let id = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Добавить упражнение"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(id)]);
+        assert!(
+            app.lesson_editor
+                .as_ref()
+                .unwrap()
+                .lesson
+                .text
+                .starts_with("аааббб")
+        );
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let id = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Сохранить урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(id)]);
+        assert!(app.lesson_editor.is_none());
+        app.start();
+        let generated = app.session_text.clone();
+        for (index, ch) in generated.chars().enumerate() {
+            app.type_input_char(ch, index as u64);
+        }
+        assert_eq!(app.session.as_ref().unwrap().remaining_chars(), 0);
+        let catalog = stamina_data::load_lesson_catalog(&[builtin, user.clone()]);
+        assert_eq!(catalog.lessons[0].lesson.id, "my-lesson");
+        app.session = None;
+        app.chooser_open = true;
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let id = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Изменить выбранный урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(id)]);
+        app.lesson_editor.as_mut().unwrap().lesson.text = "новый текст".into();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let id = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Сохранить урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(id)]);
+        assert_eq!(app.exercise(), "новый текст");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
