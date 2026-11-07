@@ -1,5 +1,43 @@
 use stamina_data::parse_lessons;
-use staminator_core::{Keystroke, Session, SessionState};
+use staminator_core::{Keystroke, Session, SessionState, StopReason};
+
+#[test]
+fn manual_result_can_continue_without_losing_time_or_errors() {
+    let mut session = Session::new("ab");
+    session.type_char('x', 100);
+    session.type_char('a', 200);
+    session.stop(600);
+    assert_eq!(session.stop_reason(), Some(StopReason::Manual));
+    assert_eq!(session.stats().elapsed_ms, 500);
+    assert!(session.continue_after_stop());
+    assert_eq!(session.elapsed_ms(5_000), 500);
+    session.type_char('b', 5_000);
+    assert_eq!(session.stop_reason(), Some(StopReason::Completed));
+    assert_eq!(
+        (
+            session.stats().correct,
+            session.stats().errors,
+            session.stats().elapsed_ms
+        ),
+        (2, 1, 500)
+    );
+    assert!(!session.continue_after_stop());
+}
+
+#[test]
+fn time_limit_uses_active_time_and_cannot_resume() {
+    let mut session = Session::new("abc");
+    session.type_char('a', 100);
+    session.pause(600);
+    assert!(!session.check_time_limit(10_000, 1_000));
+    session.resume(10_000);
+    session.type_char('b', 11_000);
+    assert!(!session.check_time_limit(11_499, 1_000));
+    assert!(session.check_time_limit(11_500, 1_000));
+    assert_eq!(session.stop_reason(), Some(StopReason::TimeLimit));
+    assert_eq!(session.type_char('c', 11_500), Keystroke::Ignored);
+    assert!(!session.continue_after_stop());
+}
 
 #[test]
 fn parsed_lesson_drives_a_session_through_pause_and_completion() {

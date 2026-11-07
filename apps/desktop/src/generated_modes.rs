@@ -32,28 +32,41 @@ pub fn letters_from_phrases(phrases: &[Exercise], seed: u64) -> String {
     output
 }
 
-/// Build a passage by sampling keys from a layout's printable key string.
-///
-/// Keys are grouped into words of three to eight characters separated by spaces.
-/// Control characters and whitespace in `keys` are ignored. An empty usable
-/// key set falls back to a simple home-row sequence.
+/// Build a passage by shuffling the layout's printable keys and emitting each
+/// key once per cycle. Keys are grouped into words of three to eight characters.
+/// Control characters and whitespace are ignored.
 pub fn all_keys(keys: &str, seed: u64) -> String {
     let keys: Vec<char> = keys
         .chars()
         .filter(|character| !character.is_control() && !character.is_whitespace())
         .collect();
     let fallback: Vec<char> = "asdfjkl;".chars().collect();
-    let keys = if keys.is_empty() { &fallback } else { &keys };
+    let key_set = if keys.is_empty() { fallback } else { keys };
     let mut random = Generator::new(seed);
     let mut output = String::with_capacity(TARGET_TEXT_CHARS);
 
+    let mut bag = Vec::new();
     while output.chars().count() < TARGET_TEXT_CHARS {
+        if bag.is_empty() {
+            bag.clone_from(&key_set);
+            for index in (1..bag.len()).rev() {
+                let other = random.index(index + 1);
+                bag.swap(index, other);
+            }
+        }
         if !output.is_empty() {
             output.push(' ');
         }
         let word_len = 3 + random.index(6);
         for _ in 0..word_len {
-            output.push(keys[random.index(keys.len())]);
+            if bag.is_empty() {
+                bag.clone_from(&key_set);
+                for index in (1..bag.len()).rev() {
+                    let other = random.index(index + 1);
+                    bag.swap(index, other);
+                }
+            }
+            output.push(bag.pop().expect("key set is nonempty"));
         }
     }
 
@@ -137,6 +150,15 @@ mod tests {
                 .all(|word| (3..=8).contains(&word.len()))
         );
         assert_eq!(generated, all_keys("ab\n\t c", 9));
+
+        let generated = all_keys("abcdef", 9);
+        let cycle = generated
+            .chars()
+            .filter(|character| *character != ' ')
+            .take(6);
+        let mut cycle: Vec<_> = cycle.collect();
+        cycle.sort_unstable();
+        assert_eq!(cycle, "abcdef".chars().collect::<Vec<_>>());
     }
 
     #[test]

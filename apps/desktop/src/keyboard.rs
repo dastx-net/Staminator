@@ -448,6 +448,16 @@ mod tests {
     }
 
     #[test]
+    fn number_row_uses_the_documented_finger_zones() {
+        // Physical positions are shared by the Russian and English layouts.
+        let expected = [0, 0, 1, 2, 3, 3, 4, 4, 5, 6, 7, 7, 7, 7];
+        for (key, finger) in expected.into_iter().enumerate() {
+            assert_eq!(finger_for_key(0, key), Some(finger), "number row key {key}");
+        }
+        assert_eq!(finger_for_key(0, expected.len()), None);
+    }
+
+    #[test]
     fn assigns_both_shifts_and_control_keys() {
         assert_eq!(finger_for_key(3, 0), Some(0));
         assert_eq!(finger_for_key(3, 11), Some(7));

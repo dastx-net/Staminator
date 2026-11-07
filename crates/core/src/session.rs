@@ -14,6 +14,13 @@ pub enum Keystroke {
     Ignored,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    Manual,
+    TimeLimit,
+    Completed,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionStats {
     pub correct: usize,
@@ -45,6 +52,7 @@ pub struct Session {
     state: SessionState,
     elapsed_before_run_ms: u64,
     run_started_at_ms: Option<u64>,
+    stop_reason: Option<StopReason>,
 }
 
 impl Session {
@@ -57,6 +65,7 @@ impl Session {
             state: SessionState::Ready,
             elapsed_before_run_ms: 0,
             run_started_at_ms: None,
+            stop_reason: None,
         }
     }
 
@@ -93,7 +102,7 @@ impl Session {
             self.position += 1;
             self.correct += 1;
             if self.position == self.expected.len() {
-                self.stop(now_ms);
+                self.stop_with_reason(now_ms, StopReason::Completed);
             }
             Keystroke::Correct
         } else {
@@ -128,10 +137,46 @@ impl Session {
     }
 
     pub fn stop(&mut self, now_ms: u64) -> SessionStats {
+        self.stop_with_reason(now_ms, StopReason::Manual)
+    }
+
+    pub fn stop_reason(&self) -> Option<StopReason> {
+        self.stop_reason
+    }
+
+    pub fn continue_after_stop(&mut self) -> bool {
+        if self.state != SessionState::Stopped
+            || self.stop_reason != Some(StopReason::Manual)
+            || self.remaining_chars() == 0
+        {
+            return false;
+        }
+        self.state = SessionState::Ready;
+        self.stop_reason = None;
+        true
+    }
+
+    pub fn check_time_limit(&mut self, now_ms: u64, limit_ms: u64) -> bool {
+        if matches!(
+            self.state,
+            SessionState::Ready | SessionState::Running | SessionState::Paused
+        ) && self.elapsed_ms(now_ms) >= limit_ms
+        {
+            self.stop_with_reason(now_ms, StopReason::TimeLimit);
+            return true;
+        }
+        false
+    }
+
+    fn stop_with_reason(&mut self, now_ms: u64, reason: StopReason) -> SessionStats {
+        if self.state == SessionState::Stopped {
+            return self.stats();
+        }
         if self.state == SessionState::Running {
             self.accumulate(now_ms);
         }
         self.state = SessionState::Stopped;
+        self.stop_reason = Some(reason);
         self.run_started_at_ms = None;
         self.stats()
     }

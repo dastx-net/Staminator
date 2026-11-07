@@ -3,6 +3,13 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $projectRoot
 try {
+    Write-Host "`n=== UTF-8 ==="
+    & (Join-Path $PSScriptRoot 'check-utf8.ps1')
+    if (-not $?) {
+        Write-Error 'Failed checks: UTF-8' -ErrorAction Continue
+        exit 1
+    }
+
     $checks = @(
         @{ Name = 'Format'; Arguments = @('fmt', '--all', '--', '--check') },
         @{ Name = 'Clippy'; Arguments = @('clippy', '--workspace', '--all-targets', '--all-features', '--', '-D', 'warnings') },

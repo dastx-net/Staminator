@@ -39,6 +39,17 @@ pub struct Profile {
     pub name: String,
     #[serde(default)]
     pub results: Vec<ResultRecord>,
+    #[serde(default)]
+    pub external_text: Option<ExternalProgress>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalProgress {
+    pub path: PathBuf,
+    pub size: u64,
+    pub hash: u64,
+    pub encoding: String,
+    pub position: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -172,6 +183,7 @@ impl UserStore {
             id: id.clone(),
             name,
             results: Vec::new(),
+            external_text: None,
         });
         self.active_profile_id = id;
         self.save()?;
@@ -251,6 +263,16 @@ impl UserStore {
             .unwrap_or(&[])
     }
 
+    pub fn set_external_progress(&mut self, progress: ExternalProgress) -> io::Result<()> {
+        let profile = self
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == self.active_profile_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "active profile not found"))?;
+        profile.external_text = Some(progress);
+        self.save()
+    }
+
     fn normalize(&mut self) {
         self.profiles
             .retain(|p| !p.id.trim().is_empty() && !p.name.trim().is_empty());
@@ -294,6 +316,7 @@ impl UserStore {
                 id: id.clone(),
                 name: DEFAULT_PROFILE_NAME.into(),
                 results: Vec::new(),
+                external_text: None,
             });
             self.active_profile_id = id;
         } else if !self.profiles.iter().any(|p| p.id == self.active_profile_id) {

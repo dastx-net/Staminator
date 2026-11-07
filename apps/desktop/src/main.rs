@@ -1,4 +1,5 @@
 mod content;
+mod external_text;
 mod generated_modes;
 mod keyboard;
 mod progress_view;
@@ -11,7 +12,7 @@ use content::{ContentCatalog, ContentLanguage, Exercise};
 use eframe::egui;
 use result_view::ResultAction;
 use sound::SoundEvent;
-use staminator_core::{Keystroke, Session, SessionState};
+use staminator_core::{Keystroke, Session, SessionState, StopReason};
 use std::{fs, path::PathBuf, time::Instant};
 use user_store::UserStore;
 
@@ -105,6 +106,8 @@ struct StaminatorApp {
     external_path: Option<PathBuf>,
     external_text: String,
     external_error: String,
+    external_source: Option<external_text::ExternalText>,
+    external_start: usize,
     generation: u64,
     session: Option<Session>,
     session_text: String,
@@ -114,7 +117,6 @@ struct StaminatorApp {
     background: Option<egui::TextureHandle>,
     show_keyboard: bool,
     keyboard_setting_path: Option<PathBuf>,
-    escape_pending: bool,
     result_open: bool,
     result_completed: bool,
     result_title: String,
@@ -160,7 +162,7 @@ impl StaminatorApp {
                 (users, format!("Не удалось загрузить профили: {error}"))
             }
         };
-        Self::from_parts(
+        let mut app = Self::from_parts(
             catalog,
             background,
             show_keyboard,
@@ -168,7 +170,9 @@ impl StaminatorApp {
             users,
             profile_error,
             sound::play,
-        )
+        );
+        app.restore_external_text();
+        app
     }
 
     fn from_parts(
@@ -191,6 +195,8 @@ impl StaminatorApp {
             external_path: None,
             external_text: String::new(),
             external_error: String::new(),
+            external_source: None,
+            external_start: 0,
             generation: 0,
             session: None,
             session_text: String::new(),
@@ -200,7 +206,6 @@ impl StaminatorApp {
             background,
             show_keyboard,
             keyboard_setting_path,
-            escape_pending: false,
             result_open: false,
             result_completed: false,
             result_title: String::new(),
@@ -290,22 +295,99 @@ impl StaminatorApp {
     }
 
     fn load_external_text(&mut self, path: PathBuf) {
-        match fs::read(&path) {
-            Ok(bytes) => {
-                let decoded = stamina_data::decode_legacy(&bytes);
-                let text = decoded.split_whitespace().collect::<Vec<_>>().join(" ");
+        match external_text::ExternalText::load(&path) {
+            Ok(source) => {
+                let text = source.text.clone();
                 if text.is_empty() {
                     self.external_error = "В выбранном файле нет текста для набора".into();
                 } else {
                     self.external_path = Some(path);
                     self.external_text = text;
+                    self.external_source = Some(source);
+                    self.external_start = 0;
                     self.external_error.clear();
                     self.session = None;
                     self.last_result = None;
                     self.result_open = false;
+                    self.save_external_progress();
                 }
             }
             Err(error) => self.external_error = format!("Не удалось открыть файл: {error}"),
+        }
+    }
+
+    fn restore_external_text(&mut self) {
+        self.external_path = None;
+        self.external_text.clear();
+        self.external_source = None;
+        self.external_start = 0;
+        self.external_error.clear();
+        let Some(saved) = self
+            .users
+            .active_profile()
+            .and_then(|p| p.external_text.clone())
+        else {
+            return;
+        };
+        match external_text::ExternalText::load(&saved.path) {
+            Ok(source)
+                if source.file_id.size == saved.size
+                    && source.file_id.content_hash == saved.hash
+                    && saved.encoding == "Utf8" =>
+            {
+                let index = source
+                    .byte_positions
+                    .iter()
+                    .position(|range| range.start == saved.position)
+                    .or_else(|| {
+                        (saved.position == saved.size as usize)
+                            .then_some(source.byte_positions.len())
+                    });
+                if let Some(index) = index {
+                    self.external_text = source.text.chars().skip(index).collect();
+                    self.external_start = index;
+                    self.external_path = Some(saved.path);
+                    self.external_source = Some(source);
+                } else {
+                    self.external_error =
+                        "Позиция файла недействительна; выберите файл заново".into();
+                }
+            }
+            Ok(_) => self.external_error = "Файл изменился; выберите его заново".into(),
+            Err(error) => {
+                self.external_error = format!("Не удалось открыть сохранённый файл: {error}")
+            }
+        }
+    }
+
+    fn save_external_progress(&mut self) {
+        if self.selected_mode != TrainingMode::ExternalText {
+            return;
+        }
+        let Some(source) = &self.external_source else {
+            return;
+        };
+        let count = self
+            .session
+            .as_ref()
+            .map_or(0, |s| s.snapshot(self.now_ms()).position);
+        let index = (self.external_start + count).min(source.byte_positions.len());
+        let position = source
+            .byte_positions
+            .get(index)
+            .map_or(source.file_id.size as usize, |range| range.start);
+        let progress = user_store::ExternalProgress {
+            path: source.file_id.path().to_path_buf(),
+            size: source.file_id.size,
+            hash: source.file_id.content_hash,
+            encoding: "Utf8".into(),
+            position,
+        };
+        if let Err(error) = self.users.set_external_progress(progress) {
+            self.external_error = format!("Не удалось сохранить позицию: {error}");
+        } else {
+            self.external_start = index;
+            self.external_text = source.text.chars().skip(index).collect();
         }
     }
 
@@ -314,7 +396,6 @@ impl StaminatorApp {
         self.session = None;
         self.last_result = None;
         self.result_open = false;
-        self.escape_pending = false;
     }
 
     fn advance_content(&mut self) -> bool {
@@ -342,7 +423,6 @@ impl StaminatorApp {
         self.phrase_start_index = self.selected_content[self.content_slot()];
         self.session = Some(Session::new(self.session_text.clone()));
         self.last_result = None;
-        self.escape_pending = false;
         self.result_open = false;
         self.result_completed = false;
         self.result_recorded = false;
@@ -365,8 +445,35 @@ impl StaminatorApp {
             self.last_result = Some(session.stop(now));
             self.result_open = true;
         }
-        self.escape_pending = false;
+    }
+
+    fn check_time_limit(&mut self, now: u64) {
+        if self.selected_mode != TrainingMode::Lessons
+            && self
+                .session
+                .as_mut()
+                .is_some_and(|session| session.check_time_limit(now, 300_000))
+        {
+            self.open_stopped_result();
+        }
+    }
+
+    fn open_stopped_result(&mut self) {
+        self.last_result = self.session.as_ref().map(Session::stats);
+        self.result_completed = self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.remaining_chars() == 0);
+        self.result_title = self.session_result_title();
+        self.result_open = true;
+    }
+
+    fn accept_result(&mut self) {
+        if !self.result_recorded {
+            self.save_external_progress();
+        }
         self.record_current_result();
+        self.result_open = false;
     }
 
     fn record_current_result(&mut self) {
@@ -465,7 +572,6 @@ impl StaminatorApp {
                 }
                 SessionState::Paused => {
                     session.resume(now);
-                    self.escape_pending = false;
                     (self.play_sound)(SoundEvent::Start);
                 }
                 _ => {}
@@ -478,6 +584,10 @@ impl StaminatorApp {
             return;
         }
         let now = self.now_ms();
+        self.check_time_limit(now);
+        if self.result_open {
+            return;
+        }
         let mut consume_space_text = false;
         for event in ctx.input(|input| input.events.clone()) {
             match event {
@@ -487,17 +597,7 @@ impl StaminatorApp {
                     repeat: false,
                     ..
                 } => {
-                    let state = self.session.as_ref().map(|s| s.snapshot(now).state);
-                    match state {
-                        Some(SessionState::Ready | SessionState::Running) => {
-                            self.session.as_mut().unwrap().pause(now);
-                            self.escape_pending = true;
-                            (self.play_sound)(SoundEvent::Pause);
-                        }
-                        Some(SessionState::Paused) if self.escape_pending => self.stop(),
-                        Some(SessionState::Paused) => self.escape_pending = true,
-                        _ => {}
-                    }
+                    self.stop();
                 }
                 egui::Event::Key {
                     key: egui::Key::C,
@@ -509,7 +609,7 @@ impl StaminatorApp {
                 // egui-winit converts Ctrl+C into Copy before emitting a Key event.
                 egui::Event::Copy => self.stop(),
                 egui::Event::Key {
-                    key: egui::Key::Space,
+                    key: egui::Key::Space | egui::Key::Enter,
                     pressed: true,
                     repeat: false,
                     ..
@@ -522,7 +622,6 @@ impl StaminatorApp {
                         }
                         Some(SessionState::Paused) => {
                             self.session.as_mut().unwrap().resume(now);
-                            self.escape_pending = false;
                             (self.play_sound)(SoundEvent::Start);
                             consume_space_text = true;
                         }
@@ -535,6 +634,15 @@ impl StaminatorApp {
                     ..
                 } => self.toggle_pause(),
                 egui::Event::Text(text) => {
+                    if self
+                        .session
+                        .as_ref()
+                        .is_some_and(|s| s.snapshot(now).state == SessionState::Paused)
+                    {
+                        self.session.as_mut().unwrap().resume(now);
+                        (self.play_sound)(SoundEvent::Start);
+                        continue;
+                    }
                     for ch in text.chars() {
                         if ch == ' ' && consume_space_text {
                             consume_space_text = false;
@@ -552,11 +660,7 @@ impl StaminatorApp {
                 .as_ref()
                 .is_some_and(|session| session.snapshot(now).state == SessionState::Stopped)
         {
-            self.last_result = self.session.as_ref().map(Session::stats);
-            self.result_open = true;
-            self.result_completed = true;
-            self.result_title = self.session_result_title();
-            self.record_current_result();
+            self.open_stopped_result();
         }
     }
 
@@ -630,6 +734,7 @@ impl StaminatorApp {
                                 self.last_result = None;
                                 self.result_open = false;
                                 self.profile_error.clear();
+                                self.restore_external_text();
                             }
                             Err(error) => self.profile_error = error.to_string(),
                         }
@@ -644,6 +749,8 @@ impl StaminatorApp {
                             Ok(_) => {
                                 self.profile_name_input.clear();
                                 self.profile_error.clear();
+                                self.session = None;
+                                self.restore_external_text();
                             }
                             Err(error) => self.profile_error = error.to_string(),
                         }
@@ -667,7 +774,11 @@ impl StaminatorApp {
                     {
                         let id = self.users.active_profile_id().to_owned();
                         match self.users.delete(&id) {
-                            Ok(()) => self.profile_error.clear(),
+                            Ok(()) => {
+                                self.profile_error.clear();
+                                self.session = None;
+                                self.restore_external_text();
+                            }
                             Err(error) => self.profile_error = error.to_string(),
                         }
                     }
@@ -690,7 +801,7 @@ impl StaminatorApp {
                 s.state,
                 SessionState::Ready | SessionState::Running | SessionState::Paused
             )
-        });
+        }) || self.result_open;
         let position = snapshot.as_ref().map_or(0, |s| s.position);
         let elapsed = snapshot.as_ref().map_or(0, |s| s.elapsed_ms);
         let next_char = if snapshot
@@ -901,10 +1012,9 @@ impl StaminatorApp {
                     elapsed,
                     self.users.active_name(),
                     match snapshot.as_ref().map(|s| s.state) {
-                        Some(SessionState::Paused) if self.escape_pending => {
-                            Some("Пауза · пробел — продолжить · Esc / Ctrl+C — завершить")
+                        Some(SessionState::Paused) => {
+                            Some("Пауза · символ — продолжить · Esc — завершить")
                         }
-                        Some(SessionState::Paused) => Some("Пауза · пробел — продолжить"),
                         Some(SessionState::Stopped) => Some("Занятие завершено · пробел — заново"),
                         None if self.selected_mode == TrainingMode::ExternalText
                             && self.external_text.is_empty() =>
@@ -956,23 +1066,47 @@ impl StaminatorApp {
         if self.result_open
             && let Some(stats) = self.last_result.clone()
         {
-            let has_next = self.content_mode()
+            let has_next = self.result_completed
+                && self.content_mode()
                 && self.selected_content[self.content_slot()] + 1 < self.items().len();
+            let can_continue = self.session.as_ref().is_some_and(|s| {
+                s.stop_reason() == Some(StopReason::Manual) && s.remaining_chars() > 0
+            });
             match result_view::show(
                 root.ctx(),
                 &self.result_title,
                 &stats,
                 self.result_completed,
                 has_next,
+                can_continue,
             ) {
                 ResultAction::Stay => {}
-                ResultAction::Retry => self.start(),
+                ResultAction::Continue => {
+                    if self
+                        .session
+                        .as_mut()
+                        .is_some_and(Session::continue_after_stop)
+                    {
+                        self.result_open = false;
+                        self.last_result = None;
+                    }
+                }
+                ResultAction::Retry => {
+                    self.accept_result();
+                    self.start();
+                }
                 ResultAction::Next => {
+                    self.accept_result();
                     if self.advance_content() {
                         self.start();
                     }
                 }
-                ResultAction::Close => self.result_open = false,
+                ResultAction::Close => {
+                    self.accept_result();
+                    if self.result_completed && self.selected_mode == TrainingMode::Lessons {
+                        self.advance_content();
+                    }
+                }
             }
         }
         if active {
@@ -984,6 +1118,9 @@ impl StaminatorApp {
 
 impl eframe::App for StaminatorApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if root.ctx().input(|input| input.viewport().close_requested()) && !self.result_recorded {
+            self.save_external_progress();
+        }
         self.draw(root);
     }
 }
@@ -1125,6 +1262,62 @@ mod tests {
     }
 
     #[test]
+    fn continue_button_keeps_one_result_until_final_acceptance() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.show_keyboard = false;
+        app.start();
+        app.type_input_char('x', 0);
+        app.type_input_char('a', 0);
+        app.stop();
+        assert!(app.users.active_records().is_empty());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let button = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Продолжить"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(button)]);
+        assert!(!app.result_open);
+        input(&mut app, &ctx, vec![egui::Event::Text("b".into())]);
+        assert!(app.result_completed);
+        app.accept_result();
+        app.accept_result();
+        let records = UserStore::load_from(&path).unwrap();
+        assert_eq!(records.active_records().len(), 1);
+        assert_eq!(
+            (
+                records.active_records()[0].correct,
+                records.active_records()[0].errors
+            ),
+            (2, 1)
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn time_limit_stops_free_mode_but_not_lessons() {
+        let mut app = test_app(test_path());
+        app.start();
+        app.type_input_char('a', 0);
+        app.check_time_limit(300_000);
+        assert_eq!(
+            app.session.as_ref().unwrap().stop_reason(),
+            Some(StopReason::TimeLimit)
+        );
+        assert!(app.result_open);
+        app.selected_mode = TrainingMode::Lessons;
+        app.start();
+        let ch = app.session_text.chars().next().unwrap();
+        app.type_input_char(ch, 0);
+        app.check_time_limit(300_000);
+        assert!(!app.result_open);
+    }
+
+    #[test]
     fn keyboard_events_start_pause_resume_and_complete() {
         let path = test_path();
         let mut app = test_app(path.clone());
@@ -1153,6 +1346,8 @@ mod tests {
         assert_eq!(app.session.as_ref().unwrap().snapshot(0).position, 1);
         input(&mut app, &ctx, vec![egui::Event::Text("b".into())]);
         assert!(app.result_open && app.result_completed);
+        assert_eq!(app.users.active_records().len(), 0);
+        app.accept_result();
         assert_eq!(app.users.active_records().len(), 1);
         input(&mut app, &ctx, vec![egui::Event::Text("a".into())]);
         assert_eq!(app.users.active_records().len(), 1);
@@ -1160,7 +1355,7 @@ mod tests {
     }
 
     #[test]
-    fn escape_twice_stops_and_modal_blocks_input() {
+    fn escape_stops_and_modal_blocks_input() {
         let path = test_path();
         let mut app = test_app(path.clone());
         let ctx = egui::Context::default();
@@ -1177,13 +1372,9 @@ mod tests {
         );
         app.chooser_open = false;
         input(&mut app, &ctx, vec![key(egui::Key::Escape)]);
-        assert_eq!(
-            app.session.as_ref().unwrap().snapshot(0).state,
-            SessionState::Paused
-        );
-        input(&mut app, &ctx, vec![key(egui::Key::Escape)]);
         assert!(app.result_open);
         assert!(!app.result_completed);
+        app.accept_result();
         assert_eq!(app.users.active_records().len(), 1);
         fs::remove_file(path).unwrap();
     }
@@ -1201,6 +1392,7 @@ mod tests {
         input(&mut app, &ctx, vec![egui::Event::Copy]);
         assert!(app.result_open);
         assert!(!app.result_completed);
+        app.accept_result();
         assert_eq!(app.users.active_records().len(), 1);
         input(&mut app, &ctx, vec![egui::Event::Copy]);
         assert_eq!(app.users.active_records().len(), 1);
@@ -1251,15 +1443,15 @@ mod tests {
         let path = test_path();
         let mut app = test_app(test_path());
         app.start();
-        fs::write(
-            &path,
-            [0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2, b'\r', b'\n', b' ', b'!'],
-        )
-        .unwrap();
+        fs::write(&path, "Привет\r\n !").unwrap();
         app.load_external_text(path.clone());
         assert_eq!(app.external_text, "Привет !");
         assert!(app.external_error.is_empty());
         assert!(app.session.is_none());
+        fs::write(&path, [0xCF, 0xF0, 0xE8]).unwrap();
+        app.load_external_text(path.clone());
+        assert!(app.external_error.contains("UTF-8"));
+        assert_eq!(app.external_text, "Привет !");
         fs::write(&path, " \r\n ").unwrap();
         app.load_external_text(path.clone());
         assert!(!app.external_error.is_empty());
@@ -1268,6 +1460,50 @@ mod tests {
         app.load_external_text(path);
         assert!(app.external_error.contains("Не удалось открыть файл"));
         assert_eq!(app.external_text, "Привет !");
+    }
+
+    #[test]
+    fn external_progress_roundtrips_per_profile_and_rejects_changed_file() {
+        let store_path = test_path();
+        let text_path = store_path.with_extension("txt");
+        fs::write(&text_path, "я\r\n  бв").unwrap();
+        let mut app = test_app(store_path.clone());
+        app.load_external_text(text_path.clone());
+        app.start();
+        app.type_input_char('я', 1);
+        app.type_input_char('x', 2);
+        app.stop();
+        app.accept_result();
+        app.accept_result();
+        assert_eq!(app.external_text, " бв");
+
+        let mut reopened = test_app(store_path.clone());
+        reopened.users = UserStore::load_from(&store_path).unwrap();
+        reopened.restore_external_text();
+        assert_eq!(reopened.external_text, " бв");
+        assert_eq!(
+            reopened
+                .users
+                .active_profile()
+                .unwrap()
+                .external_text
+                .as_ref()
+                .unwrap()
+                .position,
+            2
+        );
+        reopened.users.create("Другой").unwrap();
+        reopened.restore_external_text();
+        assert!(reopened.external_text.is_empty());
+        let original = reopened.users.profiles()[0].id.clone();
+        reopened.users.select(&original).unwrap();
+        fs::write(&text_path, "я\r\n  бг").unwrap();
+        reopened.restore_external_text();
+        assert!(reopened.external_text.is_empty());
+        assert!(reopened.external_error.contains("изменился"));
+        fs::remove_file(text_path).unwrap();
+        reopened.restore_external_text();
+        assert!(reopened.external_error.contains("Не удалось открыть"));
     }
 
     #[test]
@@ -1338,6 +1574,7 @@ mod tests {
         app.stop();
         render(&mut app);
         assert!(app.result_open);
+        app.accept_result();
         fs::remove_file(path).unwrap();
     }
 
@@ -1365,6 +1602,7 @@ mod tests {
         app.type_input_char('a', 0);
         draw_accessible(&mut app, &ctx, vec![accessible_click(stop)]);
         assert!(app.result_open);
+        app.accept_result();
         assert_eq!(app.users.active_records().len(), 1);
         fs::remove_file(path).unwrap();
     }
@@ -1606,9 +1844,10 @@ mod tests {
         app.show_keyboard = false;
         app.selected_mode = TrainingMode::Lessons;
         app.start();
-        let ch = app.session_text.chars().next().unwrap();
-        app.type_input_char(ch, 0);
-        app.stop();
+        for ch in app.session_text.clone().chars() {
+            app.type_input_char(ch, 0);
+        }
+        app.open_stopped_result();
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         draw_accessible(&mut app, &ctx, vec![]);
@@ -1677,6 +1916,7 @@ mod tests {
         app.start();
         app.type_input_char('a', 0);
         app.stop();
+        app.accept_result();
         assert!(app.profile_error.contains("Не удалось сохранить результат"));
         fs::remove_file(blocker).unwrap();
     }

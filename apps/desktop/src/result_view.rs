@@ -4,6 +4,7 @@ use staminator_core::SessionStats;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultAction {
     Stay,
+    Continue,
     Retry,
     Next,
     Close,
@@ -16,6 +17,7 @@ pub fn show(
     stats: &SessionStats,
     completed: bool,
     has_next: bool,
+    can_continue: bool,
 ) -> ResultAction {
     let mut action = ResultAction::Stay;
 
@@ -47,6 +49,9 @@ pub fn show(
 
             ui.add_space(14.0);
             ui.horizontal(|ui| {
+                if can_continue && ui.button("Продолжить").clicked() {
+                    action = ResultAction::Continue;
+                }
                 if ui.button("Повторить").clicked() {
                     action = ResultAction::Retry;
                 }
@@ -104,7 +109,7 @@ mod tests {
                 },
                 |ctx| {
                     ctx.root_ui(|_| {
-                        show(ctx, "Доступность", &stats, true, has_next);
+                        show(ctx, "Доступность", &stats, true, has_next, false);
                     })
                 },
             );
@@ -131,7 +136,7 @@ mod tests {
                 events: vec![request],
                 ..Default::default()
             },
-            |ctx| ctx.root_ui(|_| action = show(ctx, "Доступность", &stats, true, has_next)),
+            |ctx| ctx.root_ui(|_| action = show(ctx, "Доступность", &stats, true, has_next, false)),
         );
         output.textures_delta.clear();
         action
@@ -173,7 +178,7 @@ mod tests {
         };
         let mut action = ResultAction::Stay;
         let shapes = frame(&ctx, |ctx| {
-            action = show(ctx, "Урок 1", &stats, true, false);
+            action = show(ctx, "Урок 1", &stats, true, false, false);
         });
 
         assert_eq!(action, ResultAction::Stay);
@@ -208,7 +213,7 @@ mod tests {
         };
         let shapes = frame(&ctx, |ctx| {
             assert_eq!(
-                show(ctx, "Свободный режим", &stats, false, true),
+                show(ctx, "Свободный режим", &stats, false, true, true),
                 ResultAction::Stay
             );
         });

@@ -4,4 +4,4 @@
 
 mod session;
 
-pub use session::{Keystroke, Session, SessionSnapshot, SessionState, SessionStats};
+pub use session::{Keystroke, Session, SessionSnapshot, SessionState, SessionStats, StopReason};
