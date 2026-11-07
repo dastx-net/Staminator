@@ -187,6 +187,15 @@ pub fn read_layouts(path: impl AsRef<Path>) -> Result<Vec<Layout>, DataError> {
 mod tests {
     use super::*;
 
+    fn temp_file(label: &str) -> std::path::PathBuf {
+        static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        std::env::temp_dir().join(format!(
+            "stamina-data-{label}-{}-{}.tmp",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
     #[test]
     fn parses_lesson_types_headers_and_bodies() {
         let input = "[#]>Раздел\r\nописание\r\n[#] Урок\r\nАБ\r\nВ\r\n[#]-разделитель\r\n[#]<\r\n";
@@ -257,5 +266,51 @@ mod tests {
                 keys: "abc,def".into(),
             }]
         );
+    }
+
+    #[test]
+    fn read_functions_decode_legacy_bytes_before_parsing() {
+        let lessons_path = temp_file("lessons");
+        let phrases_path = temp_file("phrases");
+        let layouts_path = temp_file("layouts");
+        let lesson_name = "Урок";
+        let mut lesson_bytes = b"[#] ".to_vec();
+        lesson_bytes.extend_from_slice(&WINDOWS_1251.encode(lesson_name).0);
+        lesson_bytes.extend_from_slice(b"\r\nABC\r\n");
+        fs::write(&lessons_path, lesson_bytes).unwrap();
+        fs::write(
+            &phrases_path,
+            [0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2, b'\r', b'\n'],
+        )
+        .unwrap();
+        fs::write(
+            &layouts_path,
+            b"[LAYOUTS]\r\n00000409=en,us,English,abc\r\n",
+        )
+        .unwrap();
+
+        let lessons = read_lessons(&lessons_path).unwrap();
+        assert_eq!(lessons[0].name, "Урок");
+        assert_eq!(lessons[0].text.as_deref(), Some("ABC"));
+        assert_eq!(read_phrases(&phrases_path).unwrap().lines, ["Привет"]);
+        assert_eq!(
+            read_layouts(&layouts_path).unwrap()[0].display_name,
+            "English"
+        );
+
+        fs::remove_file(lessons_path).unwrap();
+        fs::remove_file(phrases_path).unwrap();
+        fs::remove_file(layouts_path).unwrap();
+    }
+
+    #[test]
+    fn read_error_reports_path_and_preserves_io_source() {
+        let path = temp_file("missing");
+        let error = read_phrases(&path).unwrap_err();
+
+        assert!(error.to_string().contains(&path.display().to_string()));
+        assert!(error
+            .source()
+            .is_some_and(|source| { source.downcast_ref::<std::io::Error>().is_some() }));
     }
 }

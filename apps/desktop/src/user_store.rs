@@ -281,7 +281,11 @@ impl UserStore {
                     suffix += 1;
                 }
             }
-            self.profiles[i].results.truncate(MAX_RESULTS_PER_PROFILE);
+            let results = &mut self.profiles[i].results;
+            if results.len() > MAX_RESULTS_PER_PROFILE {
+                let excess = results.len() - MAX_RESULTS_PER_PROFILE;
+                results.drain(..excess);
+            }
             i += 1;
         }
         if self.profiles.is_empty() {
@@ -430,5 +434,222 @@ mod tests {
         let recovered = UserStore::load_from(&path).unwrap();
         assert_eq!(recovered.active_name(), "Alice");
         let _ = fs::remove_file(backup);
+    }
+
+    #[test]
+    fn reports_corrupt_profile_file_without_replacing_it_with_defaults() {
+        let path = test_path();
+        fs::write(&path, b"{ not valid json").unwrap();
+
+        let error = UserStore::load_from(&path).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&path).unwrap(), b"{ not valid json");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn uses_backup_when_primary_file_is_missing_then_replaces_it_on_save() {
+        let path = test_path();
+        let backup = sibling_path(&path, "bak");
+        let mut original = UserStore::load_from(&path).unwrap();
+        original.create("Recovered").unwrap();
+        fs::rename(&path, &backup).unwrap();
+
+        let mut recovered = UserStore::load_from(&path).unwrap();
+        assert_eq!(recovered.active_name(), "Recovered");
+        recovered.create("After recovery").unwrap();
+
+        let reloaded = UserStore::load_from(&path).unwrap();
+        assert_eq!(reloaded.active_name(), "After recovery");
+        assert_eq!(reloaded.profiles().len(), 3);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(backup);
+    }
+
+    #[test]
+    fn result_history_is_isolated_by_profile_and_survives_reload() {
+        let path = test_path();
+        let mut store = UserStore::load_from(&path).unwrap();
+        let default_id = store.active_profile_id().to_owned();
+        store
+            .record(ResultInput {
+                mode: "Words",
+                layout: "EN",
+                exercise: "Default exercise",
+                correct: 10,
+                errors: 1,
+                elapsed_ms: 2_000,
+                cpm: 300.0,
+                error_percent: 9.1,
+            })
+            .unwrap();
+
+        let alice_id = store.create("Alice").unwrap().id.clone();
+        assert!(store.active_records().is_empty());
+        store
+            .record(ResultInput {
+                mode: "Text",
+                layout: "RU",
+                exercise: "Alice exercise",
+                correct: 50,
+                errors: 0,
+                elapsed_ms: 8_000,
+                cpm: 375.0,
+                error_percent: 0.0,
+            })
+            .unwrap();
+
+        store.select(&default_id).unwrap();
+        assert_eq!(store.active_records().len(), 1);
+        assert_eq!(store.active_records()[0].exercise, "Default exercise");
+        store.select(&alice_id).unwrap();
+        assert_eq!(store.active_records().len(), 1);
+        assert_eq!(store.active_records()[0].exercise, "Alice exercise");
+
+        let reloaded = UserStore::load_from(&path).unwrap();
+        let default = reloaded
+            .profiles()
+            .iter()
+            .find(|p| p.id == default_id)
+            .unwrap();
+        let alice = reloaded
+            .profiles()
+            .iter()
+            .find(|p| p.id == alice_id)
+            .unwrap();
+        assert_eq!(default.results.len(), 1);
+        assert_eq!(default.results[0].exercise, "Default exercise");
+        assert_eq!(alice.results.len(), 1);
+        assert_eq!(alice.results[0].exercise, "Alice exercise");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_create_save_returns_io_error_and_does_not_create_store_file() {
+        let blocker = test_path();
+        fs::write(&blocker, b"not a directory").unwrap();
+        let path = blocker.join("profiles.json");
+        let mut store = UserStore::new_at(&path);
+
+        let error = store.create("Unsaved").unwrap_err();
+
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::AlreadyExists
+                | io::ErrorKind::NotADirectory
+                | io::ErrorKind::Other
+                | io::ErrorKind::PermissionDenied
+        ));
+        assert!(!path.exists());
+        let _ = fs::remove_file(blocker);
+    }
+
+    #[test]
+    fn normalizes_duplicate_and_blank_profile_fields() {
+        let path = test_path();
+        let data = serde_json::json!({
+            "active_profile_id": "missing",
+            "profiles": [
+                {"id": "same", "name": "Alice", "results": []},
+                {"id": "same", "name": "alice", "results": []},
+                {"id": "  ", "name": "Ignored id", "results": []},
+                {"id": "empty-name", "name": " \t ", "results": []}
+            ]
+        });
+        fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
+
+        let store = UserStore::load_from(&path).unwrap();
+
+        assert_eq!(store.profiles().len(), 2);
+        assert_eq!(store.profiles()[0].name, "Alice");
+        assert_eq!(store.profiles()[1].name, "alice (2)");
+        assert_ne!(store.profiles()[0].id, store.profiles()[1].id);
+        assert_eq!(store.active_profile_id(), store.profiles()[0].id);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reports_not_found_and_invalid_input_for_profile_operations() {
+        let path = test_path();
+        let mut store = UserStore::load_from(&path).unwrap();
+        let only_id = store.active_profile_id().to_owned();
+
+        assert_eq!(
+            store.select("missing").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            store.rename("missing", "Renamed").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            store.rename(&only_id, "  ").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let second_id = store.create("Second").unwrap().id.clone();
+        assert_eq!(
+            store.rename(&second_id, "Пользователь").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            store.delete("missing").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn loading_and_recording_trim_history_to_latest_limit() {
+        let path = test_path();
+        let results: Vec<_> = (0..=MAX_RESULTS_PER_PROFILE)
+            .map(|index| ResultRecord {
+                timestamp: index as u64,
+                mode: "Words".into(),
+                layout: "EN".into(),
+                exercise: format!("exercise-{index}"),
+                correct: index as u64,
+                errors: 0,
+                elapsed_ms: 1_000,
+                cpm: 60.0,
+                error_percent: 0.0,
+            })
+            .collect();
+        let data = serde_json::json!({
+            "active_profile_id": "profile",
+            "profiles": [{"id": "profile", "name": "History", "results": results}]
+        });
+        fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
+
+        let mut store = UserStore::load_from(&path).unwrap();
+        assert_eq!(store.active_records().len(), MAX_RESULTS_PER_PROFILE);
+        assert_eq!(
+            store.active_records().first().unwrap().exercise,
+            "exercise-1"
+        );
+        assert_eq!(
+            store.active_records().last().unwrap().exercise,
+            format!("exercise-{MAX_RESULTS_PER_PROFILE}")
+        );
+
+        store
+            .record(ResultInput {
+                mode: "Words",
+                layout: "EN",
+                exercise: "newest",
+                correct: 1,
+                errors: 0,
+                elapsed_ms: 1_000,
+                cpm: 60.0,
+                error_percent: 0.0,
+            })
+            .unwrap();
+
+        let records = store.active_records();
+        assert_eq!(records.len(), MAX_RESULTS_PER_PROFILE);
+        assert_eq!(records.first().unwrap().exercise, "exercise-2");
+        assert_eq!(records.last().unwrap().exercise, "newest");
+        let _ = fs::remove_file(path);
     }
 }

@@ -137,3 +137,72 @@ fn draw_chart(ui: &mut egui::Ui, values: &[f32]) {
         ui.label(RichText::new(format!("{} занятий", values.len())).small());
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(records: &[crate::user_store::ResultRecord]) -> String {
+        let ctx = Context::default();
+        let mut open = true;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 900.0))),
+            ..Default::default()
+        };
+        let mut output = ctx.run_pass(input.clone(), |ctx| {
+            ctx.root_ui(|_| show(ctx, "Тестовый профиль", records, &mut open))
+        });
+        output.textures_delta.clear();
+        let mut output = ctx.run_pass(input, |ctx| {
+            ctx.root_ui(|_| show(ctx, "Тестовый профиль", records, &mut open))
+        });
+        assert!(open);
+        let shapes = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        output.textures_delta.clear();
+        shapes
+    }
+
+    fn record(index: usize) -> crate::user_store::ResultRecord {
+        crate::user_store::ResultRecord {
+            timestamp: 1_700_000_000 + index as u64,
+            mode: "Обычный".into(),
+            layout: "Русская".into(),
+            exercise: format!("Упражнение {index}"),
+            correct: 100,
+            errors: index as u64,
+            elapsed_ms: 60_000,
+            cpm: (40 + index) as f64,
+            error_percent: 2.5,
+        }
+    }
+
+    #[test]
+    fn empty_history_has_profile_specific_empty_state() {
+        let shapes = render(&[]);
+        assert!(shapes.contains("Результаты профиля: Тестовый профиль"));
+        assert!(shapes.contains("Для этого профиля пока нет сохранённых занятий."));
+        assert!(!shapes.contains("Скорость по занятиям"));
+    }
+
+    #[test]
+    fn history_shows_latest_first_and_limits_chart_to_latest_hundred() {
+        let records: Vec<_> = (0..102).map(record).collect();
+        let shapes = render(&records);
+        assert!(shapes.contains("Скорость по занятиям (знаков в минуту)"));
+        assert!(shapes.contains("100 занятий"));
+        assert!(shapes.contains("Упражнение 101"));
+        assert!(shapes.contains("Упражнение 100"));
+        assert!(shapes.find("Упражнение 101").unwrap() < shapes.find("Упражнение 100").unwrap());
+        assert!(!shapes.lines().any(|line| line == "Упражнение 0"));
+        assert!(shapes.contains("Упражнение"));
+        assert!(shapes.contains("Раскладка"));
+    }
+}

@@ -21,14 +21,13 @@ fn keyboard_setting_path() -> Option<PathBuf> {
         .map(|path| path.join("Staminator").join("settings.txt"))
 }
 
-fn load_keyboard_setting() -> bool {
-    keyboard_setting_path()
-        .and_then(|path| fs::read_to_string(path).ok())
+fn load_keyboard_setting_from(path: Option<&std::path::Path>) -> bool {
+    path.and_then(|path| fs::read_to_string(path).ok())
         .is_none_or(|value| value.trim() != "false")
 }
 
-fn save_keyboard_setting(show: bool) {
-    if let Some(path) = keyboard_setting_path()
+fn save_keyboard_setting_to(path: Option<&std::path::Path>, show: bool) {
+    if let Some(path) = path
         && let Some(parent) = path.parent()
         && fs::create_dir_all(parent).is_ok()
     {
@@ -96,6 +95,7 @@ impl TrainingMode {
 }
 
 struct StaminatorApp {
+    play_sound: fn(SoundEvent),
     selected_mode: TrainingMode,
     english_layout: bool,
     catalog: ContentCatalog,
@@ -113,6 +113,7 @@ struct StaminatorApp {
     last_result: Option<staminator_core::SessionStats>,
     background: Option<egui::TextureHandle>,
     show_keyboard: bool,
+    keyboard_setting_path: Option<PathBuf>,
     escape_pending: bool,
     result_open: bool,
     result_completed: bool,
@@ -141,7 +142,8 @@ impl StaminatorApp {
                 egui::TextureOptions::LINEAR,
             )
         });
-        let show_keyboard = load_keyboard_setting();
+        let keyboard_setting_path = keyboard_setting_path();
+        let show_keyboard = load_keyboard_setting_from(keyboard_setting_path.as_deref());
         let (users, profile_error) = match UserStore::load() {
             Ok(users) => (users, String::new()),
             Err(error) => {
@@ -158,7 +160,28 @@ impl StaminatorApp {
                 (users, format!("Не удалось загрузить профили: {error}"))
             }
         };
+        Self::from_parts(
+            catalog,
+            background,
+            show_keyboard,
+            keyboard_setting_path,
+            users,
+            profile_error,
+            sound::play,
+        )
+    }
+
+    fn from_parts(
+        catalog: ContentCatalog,
+        background: Option<egui::TextureHandle>,
+        show_keyboard: bool,
+        keyboard_setting_path: Option<PathBuf>,
+        users: UserStore,
+        profile_error: String,
+        play_sound: fn(SoundEvent),
+    ) -> Self {
         Self {
+            play_sound,
             selected_mode: TrainingMode::Lessons,
             english_layout: false,
             catalog,
@@ -176,6 +199,7 @@ impl StaminatorApp {
             last_result: None,
             background,
             show_keyboard,
+            keyboard_setting_path,
             escape_pending: false,
             result_open: false,
             result_completed: false,
@@ -261,23 +285,27 @@ impl StaminatorApp {
             .set_title("Открыть текст для тренировки")
             .pick_file()
         {
-            match fs::read(&path) {
-                Ok(bytes) => {
-                    let decoded = stamina_data::decode_legacy(&bytes);
-                    let text = decoded.split_whitespace().collect::<Vec<_>>().join(" ");
-                    if text.is_empty() {
-                        self.external_error = "В выбранном файле нет текста для набора".into();
-                    } else {
-                        self.external_path = Some(path);
-                        self.external_text = text;
-                        self.external_error.clear();
-                        self.session = None;
-                        self.last_result = None;
-                        self.result_open = false;
-                    }
+            self.load_external_text(path);
+        }
+    }
+
+    fn load_external_text(&mut self, path: PathBuf) {
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let decoded = stamina_data::decode_legacy(&bytes);
+                let text = decoded.split_whitespace().collect::<Vec<_>>().join(" ");
+                if text.is_empty() {
+                    self.external_error = "В выбранном файле нет текста для набора".into();
+                } else {
+                    self.external_path = Some(path);
+                    self.external_text = text;
+                    self.external_error.clear();
+                    self.session = None;
+                    self.last_result = None;
+                    self.result_open = false;
                 }
-                Err(error) => self.external_error = format!("Не удалось открыть файл: {error}"),
             }
+            Err(error) => self.external_error = format!("Не удалось открыть файл: {error}"),
         }
     }
 
@@ -318,7 +346,7 @@ impl StaminatorApp {
         self.result_open = false;
         self.result_completed = false;
         self.result_recorded = false;
-        sound::play(SoundEvent::Start);
+        (self.play_sound)(SoundEvent::Start);
     }
 
     fn stop(&mut self) {
@@ -423,7 +451,7 @@ impl StaminatorApp {
         if let Some(session) = &mut self.session
             && session.type_char(ch, now) == Keystroke::Incorrect
         {
-            sound::play(SoundEvent::Error);
+            (self.play_sound)(SoundEvent::Error);
         }
     }
 
@@ -433,12 +461,12 @@ impl StaminatorApp {
             match session.snapshot(now).state {
                 SessionState::Ready | SessionState::Running => {
                     session.pause(now);
-                    sound::play(SoundEvent::Pause);
+                    (self.play_sound)(SoundEvent::Pause);
                 }
                 SessionState::Paused => {
                     session.resume(now);
                     self.escape_pending = false;
-                    sound::play(SoundEvent::Start);
+                    (self.play_sound)(SoundEvent::Start);
                 }
                 _ => {}
             }
@@ -464,7 +492,7 @@ impl StaminatorApp {
                         Some(SessionState::Ready | SessionState::Running) => {
                             self.session.as_mut().unwrap().pause(now);
                             self.escape_pending = true;
-                            sound::play(SoundEvent::Pause);
+                            (self.play_sound)(SoundEvent::Pause);
                         }
                         Some(SessionState::Paused) if self.escape_pending => self.stop(),
                         Some(SessionState::Paused) => self.escape_pending = true,
@@ -495,7 +523,7 @@ impl StaminatorApp {
                         Some(SessionState::Paused) => {
                             self.session.as_mut().unwrap().resume(now);
                             self.escape_pending = false;
-                            sound::play(SoundEvent::Start);
+                            (self.play_sound)(SoundEvent::Start);
                             consume_space_text = true;
                         }
                         _ => {}
@@ -652,8 +680,8 @@ impl StaminatorApp {
     }
 }
 
-impl eframe::App for StaminatorApp {
-    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl StaminatorApp {
+    fn draw(&mut self, root: &mut egui::Ui) {
         self.handle_input(root.ctx());
         let now = self.now_ms();
         let snapshot = self.session.as_ref().map(|s| s.snapshot(now));
@@ -785,7 +813,10 @@ impl eframe::App for StaminatorApp {
                         .checkbox(&mut self.show_keyboard, "Показывать клавиатуру")
                         .changed()
                     {
-                        save_keyboard_setting(self.show_keyboard);
+                        save_keyboard_setting_to(
+                            self.keyboard_setting_path.as_deref(),
+                            self.show_keyboard,
+                        );
                     }
                     ui.separator();
                     ui.label(format!("Занятие: {current_label}"));
@@ -897,7 +928,7 @@ impl eframe::App for StaminatorApp {
                     let ctx = ui.ctx().clone();
                     if ctx.input(|input| input.viewport().close_requested()) {
                         self.show_keyboard = false;
-                        save_keyboard_setting(false);
+                        save_keyboard_setting_to(self.keyboard_setting_path.as_deref(), false);
                     }
                     self.handle_input(&ctx);
                     let layout = if self.english_layout {
@@ -951,9 +982,704 @@ impl eframe::App for StaminatorApp {
     }
 }
 
+impl eframe::App for StaminatorApp {
+    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(root);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_path() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "staminator-app-{}-{}.json",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn key(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn input(app: &mut StaminatorApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let released = events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Key { key, .. } => Some(egui::Event::Key {
+                    key: *key,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }),
+                _ => None,
+            })
+            .collect();
+        let raw = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw, |ui| app.handle_input(ui.ctx()));
+        output.textures_delta.clear();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: released,
+                ..Default::default()
+            },
+            |_| {},
+        );
+        output.textures_delta.clear();
+    }
+
+    fn draw_accessible(
+        app: &mut StaminatorApp,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> Vec<(accesskit::NodeId, accesskit::Node)> {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 800.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| app.draw(ui),
+        );
+        output.textures_delta.clear();
+        output
+            .platform_output
+            .accesskit_update
+            .take()
+            .unwrap()
+            .nodes
+    }
+
+    fn accessible_click(id: accesskit::NodeId) -> egui::Event {
+        egui::Event::AccessKitActionRequest(accesskit::ActionRequest {
+            action: accesskit::Action::Click,
+            target_tree: accesskit::TreeId::ROOT,
+            target_node: id,
+            data: None,
+        })
+    }
+
+    fn test_app(path: PathBuf) -> StaminatorApp {
+        let mut app = StaminatorApp::from_parts(
+            ContentCatalog::fixture(),
+            None,
+            true,
+            None,
+            UserStore::new_at(path),
+            String::new(),
+            |_| {},
+        );
+        app.selected_mode = TrainingMode::ExternalText;
+        app.english_layout = true;
+        app.external_path = Some(PathBuf::from("example.txt"));
+        app.external_text = "ab".into();
+        app
+    }
+
+    #[test]
+    fn stopped_session_is_saved_once_to_active_profile() {
+        let path = std::env::temp_dir().join(format!(
+            "staminator-controller-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut app = test_app(path.clone());
+        app.start();
+        app.type_input_char('x', 0);
+        app.type_input_char('a', 0);
+        app.toggle_pause();
+        app.type_input_char('b', 0);
+        assert_eq!(app.session.as_ref().unwrap().remaining_chars(), 1);
+        app.stop();
+        app.stop();
+        app.record_current_result();
+        assert!(app.result_open);
+        assert!(!app.result_completed);
+        let records = UserStore::load_from(&path).unwrap();
+        assert_eq!(records.active_records().len(), 1);
+        let result = &records.active_records()[0];
+        assert_eq!((result.correct, result.errors), (1, 1));
+        assert_eq!(result.exercise, "example.txt");
+        assert_eq!(result.layout, "English");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn keyboard_events_start_pause_resume_and_complete() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        let ctx = egui::Context::default();
+        input(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::Space), egui::Event::Text(" ".into())],
+        );
+        assert_eq!(app.session.as_ref().unwrap().snapshot(0).position, 0);
+        input(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Text("xa".into()), key(egui::Key::F9)],
+        );
+        let paused = app.session.as_ref().unwrap().snapshot(app.now_ms());
+        assert_eq!(
+            (paused.state, paused.correct, paused.errors),
+            (SessionState::Paused, 1, 1)
+        );
+        input(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::Space), egui::Event::Text(" ".into())],
+        );
+        assert_eq!(app.session.as_ref().unwrap().snapshot(0).position, 1);
+        input(&mut app, &ctx, vec![egui::Event::Text("b".into())]);
+        assert!(app.result_open && app.result_completed);
+        assert_eq!(app.users.active_records().len(), 1);
+        input(&mut app, &ctx, vec![egui::Event::Text("a".into())]);
+        assert_eq!(app.users.active_records().len(), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn escape_twice_stops_and_modal_blocks_input() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        let ctx = egui::Context::default();
+        input(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::Space), egui::Event::Text("a".into())],
+        );
+        app.chooser_open = true;
+        input(&mut app, &ctx, vec![key(egui::Key::Escape)]);
+        assert_eq!(
+            app.session.as_ref().unwrap().snapshot(0).state,
+            SessionState::Running
+        );
+        app.chooser_open = false;
+        input(&mut app, &ctx, vec![key(egui::Key::Escape)]);
+        assert_eq!(
+            app.session.as_ref().unwrap().snapshot(0).state,
+            SessionState::Paused
+        );
+        input(&mut app, &ctx, vec![key(egui::Key::Escape)]);
+        assert!(app.result_open);
+        assert!(!app.result_completed);
+        assert_eq!(app.users.active_records().len(), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn copy_shortcut_stops_session_and_does_not_repeat_result() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        let ctx = egui::Context::default();
+        input(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::Space), egui::Event::Text("a".into())],
+        );
+        input(&mut app, &ctx, vec![egui::Event::Copy]);
+        assert!(app.result_open);
+        assert!(!app.result_completed);
+        assert_eq!(app.users.active_records().len(), 1);
+        input(&mut app, &ctx, vec![egui::Event::Copy]);
+        assert_eq!(app.users.active_records().len(), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pause_toggle_and_empty_external_text_are_safe() {
+        let mut app = test_app(test_path());
+        app.external_text.clear();
+        app.start();
+        assert!(app.session.is_none());
+        app.toggle_pause();
+        app.external_text = "ab".into();
+        app.start();
+        app.toggle_pause();
+        assert_eq!(
+            app.session.as_ref().unwrap().snapshot(0).state,
+            SessionState::Paused
+        );
+        app.toggle_pause();
+        assert_eq!(
+            app.session.as_ref().unwrap().snapshot(0).state,
+            SessionState::Ready
+        );
+    }
+
+    #[test]
+    fn content_selection_is_independent_for_language_and_mode() {
+        let mut app = test_app(test_path());
+        app.selected_mode = TrainingMode::Lessons;
+        app.select_content(1);
+        assert_eq!(app.current_label(), "EN words");
+        assert!(!app.advance_content());
+        app.english_layout = false;
+        assert_eq!(app.current_label(), "RU home row");
+        assert!(app.advance_content());
+        app.selected_mode = TrainingMode::Phrases;
+        assert_eq!(app.current_label(), "Кот спит.");
+        app.english_layout = true;
+        assert_eq!(app.current_label(), "Cats nap.");
+        app.selected_mode = TrainingMode::Lessons;
+        assert_eq!(app.current_label(), "EN words");
+    }
+
+    #[test]
+    fn external_file_loading_preserves_previous_text_on_error() {
+        let path = test_path();
+        let mut app = test_app(test_path());
+        app.start();
+        fs::write(
+            &path,
+            [0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2, b'\r', b'\n', b' ', b'!'],
+        )
+        .unwrap();
+        app.load_external_text(path.clone());
+        assert_eq!(app.external_text, "Привет !");
+        assert!(app.external_error.is_empty());
+        assert!(app.session.is_none());
+        fs::write(&path, " \r\n ").unwrap();
+        app.load_external_text(path.clone());
+        assert!(!app.external_error.is_empty());
+        assert_eq!(app.external_text, "Привет !");
+        fs::remove_file(&path).unwrap();
+        app.load_external_text(path);
+        assert!(app.external_error.contains("Не удалось открыть файл"));
+        assert_eq!(app.external_text, "Привет !");
+    }
+
+    #[test]
+    fn keyboard_preference_roundtrips_and_missing_defaults_to_visible() {
+        let path = test_path().with_extension("txt");
+        assert!(load_keyboard_setting_from(Some(&path)));
+        assert!(load_keyboard_setting_from(None));
+        save_keyboard_setting_to(Some(&path), false);
+        assert!(!load_keyboard_setting_from(Some(&path)));
+        save_keyboard_setting_to(Some(&path), true);
+        assert!(load_keyboard_setting_from(Some(&path)));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn default_keyboard_setting_path_follows_appdata() {
+        let expected = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|base| base.join("Staminator").join("settings.txt"));
+        assert_eq!(keyboard_setting_path(), expected);
+    }
+
+    #[test]
+    fn generated_training_continues_and_phrases_advance() {
+        let mut app = test_app(test_path());
+        app.selected_mode = TrainingMode::AllKeys;
+        app.start();
+        let first = app.session_text.clone();
+        for ch in first.chars() {
+            app.type_input_char(ch, 0);
+        }
+        assert!(app.session_text.len() > first.len());
+        assert_eq!(
+            app.session.as_ref().unwrap().snapshot(0).state,
+            SessionState::Running
+        );
+        app.selected_mode = TrainingMode::Letters;
+        app.start();
+        assert!(!app.session_text.is_empty());
+        app.selected_mode = TrainingMode::Phrases;
+        app.start();
+        let first = app.session_text.clone();
+        for ch in first.chars() {
+            app.type_input_char(ch, 0);
+        }
+        assert_eq!(app.selected_content[app.content_slot()], 1);
+        assert_eq!(app.session_result_title(), "Фразы 1–2");
+        assert!(app.session_text.len() > first.len());
+    }
+
+    #[test]
+    fn main_view_renders_ready_active_paused_and_result_states() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.show_keyboard = false;
+        let ctx = egui::Context::default();
+        let render = |app: &mut StaminatorApp| {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
+            assert!(!output.shapes.is_empty());
+            output.textures_delta.clear();
+        };
+        render(&mut app);
+        app.start();
+        render(&mut app);
+        app.type_input_char('a', 0);
+        app.toggle_pause();
+        render(&mut app);
+        app.stop();
+        render(&mut app);
+        assert!(app.result_open);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn accessible_start_and_stop_buttons_record_the_session() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.show_keyboard = false;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let start = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("СТАРТ"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(start)]);
+        assert!(app.session.is_some());
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let stop = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("СТОП"))
+            .unwrap()
+            .0;
+        app.type_input_char('a', 0);
+        draw_accessible(&mut app, &ctx, vec![accessible_click(stop)]);
+        assert!(app.result_open);
+        assert_eq!(app.users.active_records().len(), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn accessible_menu_opens_lesson_chooser_and_selects_lesson() {
+        let mut app = test_app(test_path());
+        app.show_keyboard = false;
+        app.selected_mode = TrainingMode::Lessons;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let menu = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Занятие"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(menu)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let choose = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Выбрать…"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(choose)]);
+        assert!(app.chooser_open);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let lesson = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("2. EN words"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(lesson)]);
+        assert_eq!(app.current_label(), "EN words");
+        assert!(!app.chooser_open);
+    }
+
+    #[test]
+    fn accessible_mode_menu_changes_mode_and_layout() {
+        let mut app = test_app(test_path());
+        app.show_keyboard = false;
+        app.selected_mode = TrainingMode::Lessons;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let menu = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Режим"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(menu)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let phrases = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Фразы"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(phrases)]);
+        assert_eq!(app.current_label(), "Cats nap.");
+        assert!(app.selected_mode == TrainingMode::Phrases);
+        draw_accessible(&mut app, &ctx, vec![accessible_click(menu)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let layout = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Раскладка"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(layout)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let russian = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Русская"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(russian)]);
+        assert_eq!(app.current_label(), "Кот спит.");
+    }
+
+    #[test]
+    fn accessible_profiles_create_select_and_delete() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.show_keyboard = false;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let profiles = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Пользователи"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(profiles)]);
+        assert!(app.profiles_open);
+        app.profile_name_input = "Alice".into();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let create = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Создать"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(create)]);
+        assert_eq!(app.users.active_name(), "Alice");
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let original = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Пользователь"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(original)]);
+        assert_eq!(app.users.active_name(), "Пользователь");
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let delete = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Удалить текущий"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(delete)]);
+        assert_eq!(app.users.active_name(), "Alice");
+        assert_eq!(UserStore::load_from(&path).unwrap().profiles().len(), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn accessible_profiles_validate_and_rename() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.show_keyboard = false;
+        app.profiles_open = true;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let create = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Создать"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(create)]);
+        assert!(!app.profile_error.is_empty());
+        app.profile_name_input = "Renamed".into();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let rename = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Переименовать"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(rename)]);
+        assert_eq!(app.users.active_name(), "Renamed");
+        assert!(app.profile_error.is_empty());
+        assert_eq!(
+            UserStore::load_from(&path).unwrap().active_name(),
+            "Renamed"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn accessible_lesson_navigation_changes_selected_exercise() {
+        let mut app = test_app(test_path());
+        app.show_keyboard = false;
+        app.selected_mode = TrainingMode::Lessons;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let menu = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Занятие"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(menu)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let next = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Следующее"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(next)]);
+        assert_eq!(app.current_label(), "EN words");
+        draw_accessible(&mut app, &ctx, vec![accessible_click(menu)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let previous = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Предыдущее"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(previous)]);
+        assert_eq!(app.current_label(), "EN home row");
+    }
+
+    #[test]
+    fn accessible_keyboard_option_saves_visibility() {
+        let settings = test_path().with_extension("txt");
+        let mut app = test_app(test_path());
+        app.show_keyboard = false;
+        app.keyboard_setting_path = Some(settings.clone());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let options = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Опции"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(options)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let keyboard = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Показывать клавиатуру"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(keyboard)]);
+        assert!(app.show_keyboard);
+        assert!(load_keyboard_setting_from(Some(&settings)));
+        fs::remove_file(settings).unwrap();
+    }
+
+    #[test]
+    fn accessible_progress_opens_current_profile_history() {
+        let mut app = test_app(test_path());
+        app.show_keyboard = false;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let progress = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Прогресс"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(progress)]);
+        assert!(app.progress_open);
+        draw_accessible(&mut app, &ctx, vec![]);
+        assert_eq!(app.users.active_name(), "Пользователь");
+    }
+
+    #[test]
+    fn accessible_result_next_and_retry_start_expected_lesson() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.show_keyboard = false;
+        app.selected_mode = TrainingMode::Lessons;
+        app.start();
+        let ch = app.session_text.chars().next().unwrap();
+        app.type_input_char(ch, 0);
+        app.stop();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let next = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Далее"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(next)]);
+        assert_eq!(app.current_label(), "EN words");
+        assert!(!app.result_open);
+        assert_eq!(
+            app.session.as_ref().unwrap().snapshot(0).state,
+            SessionState::Ready
+        );
+        app.stop();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let retry = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Повторить"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(retry)]);
+        assert!(!app.result_open);
+        assert_eq!(app.current_label(), "EN words");
+        assert_eq!(
+            app.session.as_ref().unwrap().snapshot(0).state,
+            SessionState::Ready
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn accessible_result_close_preserves_record() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.show_keyboard = false;
+        app.start();
+        app.type_input_char('a', 0);
+        app.stop();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let close = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Закрыть"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(close)]);
+        assert!(!app.result_open);
+        assert_eq!(
+            UserStore::load_from(&path).unwrap().active_records().len(),
+            1
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn failure_to_save_result_is_reported() {
+        let blocker = test_path();
+        fs::write(&blocker, "not a directory").unwrap();
+        let mut app = test_app(blocker.join("profiles.json"));
+        app.start();
+        app.type_input_char('a', 0);
+        app.stop();
+        assert!(app.profile_error.contains("Не удалось сохранить результат"));
+        fs::remove_file(blocker).unwrap();
+    }
 
     #[test]
     fn russian_and_english_phrases_continue_in_one_session() {

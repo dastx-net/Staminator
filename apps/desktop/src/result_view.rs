@@ -78,3 +78,149 @@ fn format_duration(elapsed_ms: u64) -> String {
     let seconds = elapsed_ms / 1_000;
     format!("{}:{:02}", seconds / 60, seconds % 60)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{RawInput, Rect, Vec2};
+
+    fn accessible_action(label: &str, has_next: bool) -> ResultAction {
+        let ctx = Context::default();
+        ctx.enable_accesskit();
+        let stats = SessionStats {
+            correct: 1,
+            errors: 0,
+            elapsed_ms: 1_000,
+            cpm: 60,
+            error_percent: 0.0,
+        };
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 700.0));
+        let mut target = None;
+        for _ in 0..2 {
+            let mut output = ctx.run_pass(
+                RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|_| {
+                        show(ctx, "Доступность", &stats, true, has_next);
+                    })
+                },
+            );
+            if let Some(update) = &output.platform_output.accesskit_update {
+                target = update
+                    .nodes
+                    .iter()
+                    .find_map(|(id, node)| (node.label() == Some(label)).then_some(*id))
+                    .or(target);
+            }
+            output.textures_delta.clear();
+        }
+        let target = target.unwrap_or_else(|| panic!("AccessKit button not found: {label}"));
+        let request = egui::Event::AccessKitActionRequest(accesskit::ActionRequest {
+            action: accesskit::Action::Click,
+            target_tree: accesskit::TreeId::ROOT,
+            target_node: target,
+            data: None,
+        });
+        let mut action = ResultAction::Stay;
+        let mut output = ctx.run_pass(
+            RawInput {
+                screen_rect: Some(screen),
+                events: vec![request],
+                ..Default::default()
+            },
+            |ctx| ctx.root_ui(|_| action = show(ctx, "Доступность", &stats, true, has_next)),
+        );
+        output.textures_delta.clear();
+        action
+    }
+
+    fn frame(ctx: &Context, mut f: impl FnMut(&Context)) -> String {
+        let input = RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_pass(input.clone(), |ctx| ctx.root_ui(|_| f(ctx)));
+        output.textures_delta.clear();
+        let mut output = ctx.run_pass(input, |ctx| ctx.root_ui(|_| f(ctx)));
+        let shapes = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        output.textures_delta.clear();
+        shapes
+    }
+
+    #[test]
+    fn result_shows_completed_metrics_and_only_available_actions() {
+        let ctx = Context::default();
+        let stats = SessionStats {
+            correct: 123,
+            errors: 7,
+            elapsed_ms: 125_000,
+            cpm: 61,
+            error_percent: 5.0,
+        };
+        let mut action = ResultAction::Stay;
+        let shapes = frame(&ctx, |ctx| {
+            action = show(ctx, "Урок 1", &stats, true, false);
+        });
+
+        assert_eq!(action, ResultAction::Stay);
+        for text in [
+            "Урок 1",
+            "Упражнение завершено",
+            "2:05",
+            "123",
+            "7",
+            "95.0%",
+            "61 зн./мин",
+            "Повторить",
+            "Закрыть",
+        ] {
+            assert!(
+                shapes.contains(text),
+                "missing visible result text: {text}; got {shapes:?}"
+            );
+        }
+        assert!(!shapes.contains("Далее"));
+    }
+
+    #[test]
+    fn stopped_result_clamps_accuracy_and_includes_next_action() {
+        let ctx = Context::default();
+        let stats = SessionStats {
+            correct: 0,
+            errors: 1,
+            elapsed_ms: 0,
+            cpm: 0,
+            error_percent: 140.0,
+        };
+        let shapes = frame(&ctx, |ctx| {
+            assert_eq!(
+                show(ctx, "Свободный режим", &stats, false, true),
+                ResultAction::Stay
+            );
+        });
+        assert!(shapes.contains("Занятие остановлено"));
+        assert!(shapes.contains("0.0%"));
+        assert!(shapes.contains("Далее"));
+    }
+
+    #[test]
+    fn accessible_button_actions_select_retry_next_and_close() {
+        assert_eq!(accessible_action("Повторить", false), ResultAction::Retry);
+        assert_eq!(accessible_action("Далее", true), ResultAction::Next);
+        assert_eq!(accessible_action("Закрыть", false), ResultAction::Close);
+    }
+}

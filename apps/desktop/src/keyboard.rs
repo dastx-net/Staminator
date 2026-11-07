@@ -410,7 +410,42 @@ fn finger_for_key(row: usize, key: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{finger_for_key, opposite_shift_key, requires_shift};
+    use super::{
+        KeyboardLayout, draw_keyboard, finger_for_key, opposite_shift_key, requires_shift,
+    };
+    use egui::{Context, RawInput, Rect, Vec2};
+
+    fn paint(layout: KeyboardLayout, active: Option<char>) -> String {
+        let ctx = Context::default();
+        let mut output = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(900.0, 500.0),
+                )),
+                ..Default::default()
+            },
+            |ui| draw_keyboard(ui, layout, active),
+        );
+        let shapes = format!("{:?}", output.shapes);
+        output.textures_delta.clear();
+        shapes
+    }
+
+    #[test]
+    fn headless_keyboard_paints_layout_and_active_key_changes() {
+        let english = paint(KeyboardLayout::English, None);
+        let russian = paint(KeyboardLayout::Russian, None);
+        let active = paint(KeyboardLayout::English, Some('q'));
+        assert!(english.contains("Q"));
+        assert!(russian.contains("Й"));
+        assert_ne!(english, russian);
+        assert_ne!(english, active);
+        assert_ne!(
+            paint(KeyboardLayout::English, Some('A')),
+            paint(KeyboardLayout::English, Some('a'))
+        );
+    }
 
     #[test]
     fn assigns_both_shifts_and_control_keys() {

@@ -3126,11 +3126,15 @@ dependencies = [
 [[package]]
 name = "staminator-core"
 version = "0.1.0"
+dependencies = [
+ "stamina-data",
+]
 
 [[package]]
 name = "staminator-desktop"
 version = "0.1.0"
 dependencies = [
+ "accesskit",
  "chrono",
  "eframe",
  "egui",
