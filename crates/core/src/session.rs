@@ -47,6 +47,7 @@ pub struct SessionSnapshot {
 pub struct Session {
     expected: Vec<char>,
     position: usize,
+    discarded: usize,
     correct: usize,
     errors: usize,
     state: SessionState,
@@ -60,6 +61,7 @@ impl Session {
         Self {
             expected: expected.into().chars().collect(),
             position: 0,
+            discarded: 0,
             correct: 0,
             errors: 0,
             state: SessionState::Ready,
@@ -71,6 +73,21 @@ impl Session {
 
     pub fn expected_text(&self) -> String {
         self.expected.iter().collect()
+    }
+
+    /// Cursor position within the retained text returned by `expected_text`.
+    pub fn retained_position(&self) -> usize {
+        self.position
+    }
+
+    /// Discard old, already typed characters while retaining visible context.
+    /// Snapshot positions remain relative to the beginning of the session.
+    pub fn retain_recent(&mut self, count: usize) -> usize {
+        let remove = self.position.saturating_sub(count);
+        self.expected.drain(..remove);
+        self.position -= remove;
+        self.discarded += remove;
+        remove
     }
 
     /// Append more expected input while the session can still accept typing.
@@ -191,7 +208,7 @@ impl Session {
     pub fn snapshot(&self, now_ms: u64) -> SessionSnapshot {
         SessionSnapshot {
             state: self.state,
-            position: self.position,
+            position: self.discarded + self.position,
             correct: self.correct,
             errors: self.errors,
             elapsed_ms: self.elapsed_ms(now_ms),
@@ -345,5 +362,19 @@ mod tests {
         assert_eq!(stats.errors, 0);
         assert_eq!(stats.elapsed_ms, 300);
         assert_eq!(stats.cpm, 800);
+    }
+
+    #[test]
+    fn discarding_typed_context_preserves_position_and_metrics() {
+        let mut session = Session::new("abcdef");
+        for ch in "abcd".chars() {
+            assert_eq!(session.type_char(ch, 100), Keystroke::Correct);
+        }
+        assert_eq!(session.retain_recent(2), 2);
+        assert_eq!(session.expected_text(), "cdef");
+        assert_eq!(session.snapshot(100).position, 4);
+        assert_eq!(session.next_expected(), Some('e'));
+        assert_eq!(session.type_char('e', 200), Keystroke::Correct);
+        assert_eq!(session.stats_at(200).correct, 5);
     }
 }

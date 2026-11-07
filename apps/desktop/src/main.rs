@@ -13,7 +13,7 @@ use eframe::egui;
 use result_view::ResultAction;
 use sound::SoundEvent;
 use staminator_core::{Keystroke, Session, SessionState, StopReason};
-use std::{fs, path::PathBuf, time::Instant};
+use std::{collections::VecDeque, fs, path::PathBuf, time::Instant};
 use user_store::UserStore;
 
 fn keyboard_setting_path() -> Option<PathBuf> {
@@ -39,6 +39,7 @@ fn save_keyboard_setting_to(path: Option<&std::path::Path>, show: bool) {
 fn append_next_phrase(
     session: &mut Session,
     phrases: &[Exercise],
+    sequence: &mut generated_modes::PhraseSequence,
     index: &mut usize,
     ch: char,
     now: u64,
@@ -51,7 +52,7 @@ fn append_next_phrase(
     {
         return None;
     }
-    let next = *index + 1;
+    let next = sequence.next()?;
     let text = phrases.get(next)?.text.clone();
     if session.append_expected(&text) {
         *index = next;
@@ -99,6 +100,7 @@ struct StaminatorApp {
     play_sound: fn(SoundEvent),
     selected_mode: TrainingMode,
     english_layout: bool,
+    content_language: ContentLanguage,
     catalog: ContentCatalog,
     selected_content: [usize; 4],
     chooser_open: bool,
@@ -106,12 +108,14 @@ struct StaminatorApp {
     external_path: Option<PathBuf>,
     external_text: String,
     external_error: String,
-    external_source: Option<external_text::ExternalText>,
+    external_source: Option<external_text::ExternalFile>,
+    external_reader: Option<external_text::ExternalTextStream<fs::File>>,
+    external_positions: VecDeque<std::ops::Range<usize>>,
     external_start: usize,
     generation: u64,
     session: Option<Session>,
     session_text: String,
-    phrase_start_index: usize,
+    phrase_sequence: Option<generated_modes::PhraseSequence>,
     started_at: Instant,
     last_result: Option<staminator_core::SessionStats>,
     background: Option<egui::TextureHandle>,
@@ -188,6 +192,15 @@ impl StaminatorApp {
             play_sound,
             selected_mode: TrainingMode::Lessons,
             english_layout: false,
+            content_language: users
+                .active_profile()
+                .map_or(ContentLanguage::Russian, |profile| {
+                    if profile.content_language == "EN" {
+                        ContentLanguage::English
+                    } else {
+                        ContentLanguage::Russian
+                    }
+                }),
             catalog,
             selected_content: [0; 4],
             chooser_open: false,
@@ -196,11 +209,13 @@ impl StaminatorApp {
             external_text: String::new(),
             external_error: String::new(),
             external_source: None,
+            external_reader: None,
+            external_positions: VecDeque::new(),
             external_start: 0,
             generation: 0,
             session: None,
             session_text: String::new(),
-            phrase_start_index: 0,
+            phrase_sequence: None,
             started_at: Instant::now(),
             last_result: None,
             background,
@@ -219,15 +234,11 @@ impl StaminatorApp {
     }
 
     fn language(&self) -> ContentLanguage {
-        if self.english_layout {
-            ContentLanguage::English
-        } else {
-            ContentLanguage::Russian
-        }
+        self.content_language
     }
 
     fn content_slot(&self) -> usize {
-        usize::from(self.english_layout) * 2
+        usize::from(self.content_language == ContentLanguage::English) * 2
             + usize::from(self.selected_mode == TrainingMode::Phrases)
     }
 
@@ -238,13 +249,17 @@ impl StaminatorApp {
         }
     }
 
-    fn current_exercise(&self) -> &Exercise {
-        &self.items()[self.selected_content[self.content_slot()].min(self.items().len() - 1)]
+    fn current_exercise(&self) -> Option<&Exercise> {
+        self.items().get(
+            self.selected_content[self.content_slot()].min(self.items().len().saturating_sub(1)),
+        )
     }
 
     fn exercise(&self) -> &str {
         match self.selected_mode {
-            TrainingMode::Lessons | TrainingMode::Phrases => &self.current_exercise().text,
+            TrainingMode::Lessons | TrainingMode::Phrases => {
+                self.current_exercise().map_or("", |item| &item.text)
+            }
             TrainingMode::ExternalText => &self.external_text,
             _ => "",
         }
@@ -259,8 +274,17 @@ impl StaminatorApp {
 
     fn current_label(&self) -> String {
         match self.selected_mode {
-            TrainingMode::Lessons | TrainingMode::Phrases => self.current_exercise().name.clone(),
+            TrainingMode::Lessons | TrainingMode::Phrases => self.current_exercise().map_or_else(
+                || "Нет текста для выбранного языка".into(),
+                |item| item.name.clone(),
+            ),
+            TrainingMode::Letters if self.catalog.phrases(self.language()).is_empty() => {
+                "Нет фраз для выбранного языка".into()
+            }
             TrainingMode::Letters => "Буквы из фраз".into(),
+            TrainingMode::AllKeys if self.catalog.all_keys(self.english_layout).is_empty() => {
+                "Нет клавиш для выбранной раскладки".into()
+            }
             TrainingMode::AllKeys => "Все клавиши".into(),
             TrainingMode::ExternalText => self
                 .external_path
@@ -276,10 +300,20 @@ impl StaminatorApp {
         let seed = self.now_ms().wrapping_add(self.generation);
         match self.selected_mode {
             TrainingMode::Letters => {
-                generated_modes::letters_from_phrases(self.catalog.phrases(self.language()), seed)
+                let phrases = self.catalog.phrases(self.language());
+                if phrases.is_empty() {
+                    String::new()
+                } else {
+                    generated_modes::letters_from_phrases(phrases, seed)
+                }
             }
             TrainingMode::AllKeys => {
-                generated_modes::all_keys(self.catalog.keys(self.language()), seed)
+                let keys = self.catalog.all_keys(self.english_layout);
+                if keys.is_empty() {
+                    String::new()
+                } else {
+                    generated_modes::all_keys(&keys, seed)
+                }
             }
             _ => String::new(),
         }
@@ -295,21 +329,24 @@ impl StaminatorApp {
     }
 
     fn load_external_text(&mut self, path: PathBuf) {
-        match external_text::ExternalText::load(&path) {
+        match external_text::ExternalFile::open(&path) {
             Ok(source) => {
-                let text = source.text.clone();
-                if text.is_empty() {
+                if source.char_count() == 0 {
                     self.external_error = "В выбранном файле нет текста для набора".into();
                 } else {
                     self.external_path = Some(path);
-                    self.external_text = text;
                     self.external_source = Some(source);
                     self.external_start = 0;
                     self.external_error.clear();
                     self.session = None;
                     self.last_result = None;
                     self.result_open = false;
-                    self.save_external_progress();
+                    match self.prepare_external() {
+                        Ok(()) => self.save_external_progress(),
+                        Err(error) => {
+                            self.external_error = format!("Не удалось прочитать файл: {error}")
+                        }
+                    }
                 }
             }
             Err(error) => self.external_error = format!("Не удалось открыть файл: {error}"),
@@ -317,9 +354,20 @@ impl StaminatorApp {
     }
 
     fn restore_external_text(&mut self) {
+        self.content_language = if self
+            .users
+            .active_profile()
+            .is_some_and(|p| p.content_language == "EN")
+        {
+            ContentLanguage::English
+        } else {
+            ContentLanguage::Russian
+        };
         self.external_path = None;
         self.external_text.clear();
         self.external_source = None;
+        self.external_reader = None;
+        self.external_positions.clear();
         self.external_start = 0;
         self.external_error.clear();
         let Some(saved) = self
@@ -329,25 +377,19 @@ impl StaminatorApp {
         else {
             return;
         };
-        match external_text::ExternalText::load(&saved.path) {
+        match external_text::ExternalFile::open(&saved.path) {
             Ok(source)
-                if source.file_id.size == saved.size
-                    && source.file_id.content_hash == saved.hash
+                if source.file_id().size == saved.size
+                    && source.file_id().content_hash == saved.hash
                     && saved.encoding == "Utf8" =>
             {
-                let index = source
-                    .byte_positions
-                    .iter()
-                    .position(|range| range.start == saved.position)
-                    .or_else(|| {
-                        (saved.position == saved.size as usize)
-                            .then_some(source.byte_positions.len())
-                    });
-                if let Some(index) = index {
-                    self.external_text = source.text.chars().skip(index).collect();
+                if let Ok(index) = source.index_at_byte(saved.position) {
                     self.external_start = index;
                     self.external_path = Some(saved.path);
                     self.external_source = Some(source);
+                    if let Err(error) = self.prepare_external() {
+                        self.external_error = format!("Не удалось прочитать файл: {error}");
+                    }
                 } else {
                     self.external_error =
                         "Позиция файла недействительна; выберите файл заново".into();
@@ -367,32 +409,71 @@ impl StaminatorApp {
         let Some(source) = &self.external_source else {
             return;
         };
-        let count = self
-            .session
-            .as_ref()
-            .map_or(0, |s| s.snapshot(self.now_ms()).position);
-        let index = (self.external_start + count).min(source.byte_positions.len());
-        let position = source
-            .byte_positions
-            .get(index)
-            .map_or(source.file_id.size as usize, |range| range.start);
+        let id = source.file_id();
+        let position = self
+            .external_positions
+            .front()
+            .map_or(id.size as usize, |range| range.start);
+        match external_text::ExternalFile::open(id.path()) {
+            Ok(current) if current.file_id() == id => {}
+            Ok(_) => {
+                self.external_error = "Файл изменился; выберите его заново".into();
+                return;
+            }
+            Err(error) => {
+                self.external_error = format!("Не удалось проверить файл: {error}");
+                return;
+            }
+        }
         let progress = user_store::ExternalProgress {
-            path: source.file_id.path().to_path_buf(),
-            size: source.file_id.size,
-            hash: source.file_id.content_hash,
+            path: id.path().to_path_buf(),
+            size: id.size,
+            hash: id.content_hash,
             encoding: "Utf8".into(),
             position,
         };
         if let Err(error) = self.users.set_external_progress(progress) {
             self.external_error = format!("Не удалось сохранить позицию: {error}");
-        } else {
-            self.external_start = index;
-            self.external_text = source.text.chars().skip(index).collect();
+        } else if let Err(error) = self.prepare_external() {
+            self.external_error = format!("Не удалось прочитать файл: {error}");
         }
     }
 
+    fn set_external_position(&mut self, index: usize) {
+        let Some(source) = &self.external_source else {
+            return;
+        };
+        self.external_start = index.min(source.char_count());
+        self.session = None;
+        self.last_result = None;
+        self.result_open = false;
+        match self.prepare_external() {
+            Ok(()) => self.save_external_progress(),
+            Err(error) => self.external_error = format!("Не удалось прочитать файл: {error}"),
+        }
+    }
+
+    fn prepare_external(&mut self) -> std::io::Result<()> {
+        self.external_reader = None;
+        self.external_positions.clear();
+        self.external_text.clear();
+        let source = self
+            .external_source
+            .as_ref()
+            .expect("external source exists");
+        let mut reader = source.stream_at_index(self.external_start)?;
+        let fragment = reader.next_fragment(512)?;
+        if let Some(fragment) = fragment {
+            self.external_text = fragment.text;
+            self.external_positions.extend(fragment.byte_positions);
+        }
+        self.external_reader = Some(reader);
+        Ok(())
+    }
+
     fn select_content(&mut self, index: usize) {
-        self.selected_content[self.content_slot()] = index.min(self.items().len() - 1);
+        self.selected_content[self.content_slot()] =
+            index.min(self.items().len().saturating_sub(1));
         self.session = None;
         self.last_result = None;
         self.result_open = false;
@@ -413,6 +494,17 @@ impl StaminatorApp {
     }
 
     fn start(&mut self) {
+        if self.selected_mode == TrainingMode::Phrases {
+            self.generation = self.generation.wrapping_add(1);
+            let slot = self.content_slot();
+            self.phrase_sequence = Some(generated_modes::PhraseSequence::new(
+                self.catalog.phrases(self.language()).len(),
+                self.selected_content[slot],
+                self.now_ms().wrapping_add(self.generation),
+            ));
+        } else {
+            self.phrase_sequence = None;
+        }
         self.session_text = match self.selected_mode {
             TrainingMode::Letters | TrainingMode::AllKeys => self.generated_text(),
             _ => self.exercise().to_owned(),
@@ -420,7 +512,6 @@ impl StaminatorApp {
         if self.session_text.is_empty() {
             return;
         }
-        self.phrase_start_index = self.selected_content[self.content_slot()];
         self.session = Some(Session::new(self.session_text.clone()));
         self.last_result = None;
         self.result_open = false;
@@ -513,11 +604,7 @@ impl StaminatorApp {
 
     fn session_result_title(&self) -> String {
         if self.selected_mode == TrainingMode::Phrases {
-            format!(
-                "Фразы {}–{}",
-                self.phrase_start_index + 1,
-                self.selected_content[self.content_slot()] + 1
-            )
+            "Фразы".into()
         } else {
             self.current_label()
         }
@@ -535,8 +622,15 @@ impl StaminatorApp {
             let slot = self.content_slot();
             let phrases = self.catalog.phrases(self.language());
             if let Some(session) = &mut self.session
-                && let Some(next_text) =
-                    append_next_phrase(session, phrases, &mut self.selected_content[slot], ch, now)
+                && let Some(sequence) = &mut self.phrase_sequence
+                && let Some(next_text) = append_next_phrase(
+                    session,
+                    phrases,
+                    sequence,
+                    &mut self.selected_content[slot],
+                    ch,
+                    now,
+                )
             {
                 self.session_text.push_str(&next_text);
             }
@@ -554,11 +648,39 @@ impl StaminatorApp {
             {
                 self.session_text.push_str(&next_text);
             }
+        } else if at_boundary
+            && self.selected_mode == TrainingMode::ExternalText
+            && let Some(reader) = &mut self.external_reader
+        {
+            match reader.next_fragment(512) {
+                Ok(Some(fragment)) => {
+                    if let Some(session) = &mut self.session
+                        && session.append_expected(&fragment.text)
+                    {
+                        self.session_text.push_str(&fragment.text);
+                        self.external_positions.extend(fragment.byte_positions);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => self.external_error = format!("Не удалось прочитать файл: {error}"),
+            }
+        }
+        if let Some(session) = &mut self.session {
+            match session.type_char(ch, now) {
+                Keystroke::Incorrect => (self.play_sound)(SoundEvent::Error),
+                Keystroke::Correct
+                    if self.selected_mode == TrainingMode::ExternalText
+                        && self.external_positions.pop_front().is_some() =>
+                {
+                    self.external_start += 1;
+                }
+                _ => {}
+            }
         }
         if let Some(session) = &mut self.session
-            && session.type_char(ch, now) == Keystroke::Incorrect
+            && session.retain_recent(128) > 0
         {
-            (self.play_sound)(SoundEvent::Error);
+            self.session_text = session.expected_text();
         }
     }
 
@@ -802,7 +924,7 @@ impl StaminatorApp {
                 SessionState::Ready | SessionState::Running | SessionState::Paused
             )
         }) || self.result_open;
-        let position = snapshot.as_ref().map_or(0, |s| s.position);
+        let position = self.session.as_ref().map_or(0, Session::retained_position);
         let elapsed = snapshot.as_ref().map_or(0, |s| s.elapsed_ms);
         let next_char = if snapshot
             .as_ref()
@@ -859,6 +981,36 @@ impl StaminatorApp {
                             }
                         }
                         ui.separator();
+                        ui.menu_button("Язык текста", |ui| {
+                            let russian = ui
+                                .selectable_value(
+                                    &mut self.content_language,
+                                    ContentLanguage::Russian,
+                                    "Русский",
+                                )
+                                .clicked();
+                            let english = ui
+                                .selectable_value(
+                                    &mut self.content_language,
+                                    ContentLanguage::English,
+                                    "English",
+                                )
+                                .clicked();
+                            if russian || english {
+                                let value = if self.content_language == ContentLanguage::English {
+                                    "EN"
+                                } else {
+                                    "RU"
+                                };
+                                if let Err(error) = self.users.set_content_language(value) {
+                                    self.profile_error = error.to_string();
+                                }
+                                self.session = None;
+                                self.last_result = None;
+                                self.result_open = false;
+                                ui.close();
+                            }
+                        });
                         ui.menu_button("Раскладка", |ui| {
                             let russian = ui
                                 .selectable_value(&mut self.english_layout, false, "Русская")
@@ -901,12 +1053,44 @@ impl StaminatorApp {
                                 ui.close();
                             }
                             ui.separator();
-                            ui.label(format!("{} из {}", current_index + 1, content_count));
+                            ui.label(format!(
+                                "{} из {}",
+                                if content_count == 0 {
+                                    0
+                                } else {
+                                    current_index + 1
+                                },
+                                content_count
+                            ));
                         } else if self.selected_mode == TrainingMode::ExternalText {
                             if ui.button("Открыть текстовый файл…").clicked()
                             {
                                 self.choose_external_text();
                                 ui.close();
+                            }
+                            if self.external_error.starts_with("Файл изменился") {
+                                if ui.button("Начать изменённый файл заново").clicked()
+                                    && let Some(path) = self
+                                        .users
+                                        .active_profile()
+                                        .and_then(|p| p.external_text.as_ref())
+                                        .map(|p| p.path.clone())
+                                {
+                                    self.load_external_text(path);
+                                    ui.close();
+                                }
+                            } else if let Some(source) = &self.external_source {
+                                let mut position = self.external_start;
+                                let length = source.char_count();
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut position, 0..=length)
+                                            .text("Позиция"),
+                                    )
+                                    .changed()
+                                {
+                                    self.set_external_position(position);
+                                }
                             }
                             if !self.external_error.is_empty() {
                                 ui.colored_label(egui::Color32::RED, &self.external_error);
@@ -934,7 +1118,7 @@ impl StaminatorApp {
                     ui.small(if self.catalog.diagnostics().is_empty() {
                         "Загружены локальные данные Stamina"
                     } else {
-                        "Часть файлов не найдена; используются встроенные образцы"
+                        self.catalog.diagnostics()
                     });
                     if !self.profile_error.is_empty() {
                         ui.colored_label(egui::Color32::RED, &self.profile_error);
@@ -952,7 +1136,11 @@ impl StaminatorApp {
                 ui.separator();
                 ui.label(format!(
                     "{} / {} · {}",
-                    current_index + 1,
+                    if content_count == 0 {
+                        0
+                    } else {
+                        current_index + 1
+                    },
                     content_count,
                     current_label.chars().take(44).collect::<String>()
                 ));
@@ -1423,19 +1611,301 @@ mod tests {
     #[test]
     fn content_selection_is_independent_for_language_and_mode() {
         let mut app = test_app(test_path());
+        app.content_language = ContentLanguage::English;
         app.selected_mode = TrainingMode::Lessons;
         app.select_content(1);
         assert_eq!(app.current_label(), "EN words");
         assert!(!app.advance_content());
-        app.english_layout = false;
+        app.content_language = ContentLanguage::Russian;
         assert_eq!(app.current_label(), "RU home row");
         assert!(app.advance_content());
         app.selected_mode = TrainingMode::Phrases;
         assert_eq!(app.current_label(), "Кот спит.");
-        app.english_layout = true;
+        app.content_language = ContentLanguage::English;
         assert_eq!(app.current_label(), "Cats nap.");
         app.selected_mode = TrainingMode::Lessons;
         assert_eq!(app.current_label(), "EN words");
+    }
+
+    #[test]
+    fn missing_content_is_reported_and_does_not_start_a_session() {
+        let mut app = test_app(test_path());
+        app.catalog = ContentCatalog::fixture_empty();
+        for language in [ContentLanguage::Russian, ContentLanguage::English] {
+            app.content_language = language;
+            for mode in [
+                TrainingMode::Lessons,
+                TrainingMode::Phrases,
+                TrainingMode::Letters,
+            ] {
+                app.selected_mode = mode;
+                assert!(app.current_label().contains("Нет"));
+                app.start();
+                assert!(app.session.is_none());
+            }
+        }
+        app.show_keyboard = false;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let _ = draw_accessible(&mut app, &ctx, vec![]);
+    }
+
+    #[test]
+    fn each_mode_starts_in_both_languages_and_all_keys_follow_layout() {
+        let mut app = test_app(test_path());
+        for language in [ContentLanguage::Russian, ContentLanguage::English] {
+            app.content_language = language;
+            for mode in [
+                TrainingMode::Lessons,
+                TrainingMode::Phrases,
+                TrainingMode::Letters,
+                TrainingMode::AllKeys,
+            ] {
+                app.selected_mode = mode;
+                app.session = None;
+                app.start();
+                let session = app.session.as_ref().expect("mode has content");
+                assert!(session.next_expected().is_some());
+                app.stop();
+            }
+        }
+        app.selected_mode = TrainingMode::AllKeys;
+        app.content_language = ContentLanguage::Russian;
+        app.english_layout = true;
+        let english = app.generated_text();
+        assert!(english.chars().all(|c| "asdfjkl; ".contains(c)));
+        app.content_language = ContentLanguage::English;
+        app.english_layout = false;
+        let russian = app.generated_text();
+        assert!(russian.chars().all(|c| "фывапролдж ".contains(c)));
+    }
+
+    #[test]
+    fn content_language_persists_per_profile_independently_of_keyboard_layout() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.selected_mode = TrainingMode::Lessons;
+        app.content_language = ContentLanguage::English;
+        app.users.set_content_language("EN").unwrap();
+        app.english_layout = false;
+        assert_eq!(app.current_label(), "EN home row");
+        let english_id = app.users.active_profile_id().to_owned();
+        let russian_id = app.users.create("Русский профиль").unwrap().id.clone();
+        assert_eq!(app.users.active_profile().unwrap().content_language, "RU");
+        app.users.select(&english_id).unwrap();
+        assert_eq!(app.users.active_profile().unwrap().content_language, "EN");
+        let loaded = UserStore::load_from(path.clone()).unwrap();
+        assert_eq!(loaded.active_profile().unwrap().content_language, "EN");
+        app.users.select(&russian_id).unwrap();
+        assert_eq!(app.users.active_profile().unwrap().content_language, "RU");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn long_external_session_saves_absolute_position_after_trimming() {
+        let profile_path = test_path();
+        let text_path = test_path();
+        fs::write(&text_path, format!("{} конец", "я".repeat(200))).unwrap();
+        let mut app = test_app(profile_path.clone());
+        app.selected_mode = TrainingMode::ExternalText;
+        app.load_external_text(text_path.clone());
+        app.start();
+        for _ in 0..150 {
+            app.type_input_char('я', 100);
+        }
+        let session = app.session.as_ref().unwrap();
+        assert_eq!(session.snapshot(100).position, 150);
+        assert_eq!(session.retained_position(), 128);
+        app.stop();
+        app.accept_result();
+        assert_eq!(
+            app.users
+                .active_profile()
+                .unwrap()
+                .external_text
+                .as_ref()
+                .unwrap()
+                .position,
+            300
+        );
+        app.restore_external_text();
+        assert_eq!(app.external_text, format!("{} конец", "я".repeat(50)));
+        fs::remove_file(text_path).unwrap();
+        fs::remove_file(profile_path).unwrap();
+    }
+
+    #[test]
+    fn external_stream_crosses_fragments_without_losing_position_or_history() {
+        let profile_path = test_path();
+        let text_path = test_path();
+        let content = format!("{}\r\n  конец", "я".repeat(1300));
+        fs::write(&text_path, &content).unwrap();
+        let mut app = test_app(profile_path.clone());
+        app.selected_mode = TrainingMode::ExternalText;
+        app.load_external_text(text_path.clone());
+        assert!(app.external_text.chars().count() <= 512);
+        app.start();
+        for _ in 0..1100 {
+            app.type_input_char('я', 100);
+            assert!(app.session_text.chars().count() <= 640);
+            assert!(app.external_positions.len() <= 512);
+        }
+        app.type_input_char('x', 100);
+        assert_eq!(app.external_start, 1100);
+        app.stop();
+        app.accept_result();
+        assert_eq!(
+            app.users
+                .active_profile()
+                .unwrap()
+                .external_text
+                .as_ref()
+                .unwrap()
+                .position,
+            2200
+        );
+        app.restore_external_text();
+        assert_eq!(app.external_text, format!("{} конец", "я".repeat(200)));
+        fs::remove_file(text_path).unwrap();
+        fs::remove_file(profile_path).unwrap();
+    }
+
+    #[test]
+    fn external_progress_does_not_advance_when_file_changes_during_session() {
+        let profile_path = test_path();
+        let text_path = test_path();
+        fs::write(&text_path, "я текст").unwrap();
+        let mut app = test_app(profile_path.clone());
+        app.selected_mode = TrainingMode::ExternalText;
+        app.load_external_text(text_path.clone());
+        app.start();
+        app.type_input_char('я', 100);
+        fs::write(&text_path, "другой текст").unwrap();
+        app.stop();
+        app.accept_result();
+        assert!(app.external_error.contains("изменился"));
+        assert_eq!(
+            app.users
+                .active_profile()
+                .unwrap()
+                .external_text
+                .as_ref()
+                .unwrap()
+                .position,
+            0
+        );
+        fs::remove_file(text_path).unwrap();
+        fs::remove_file(profile_path).unwrap();
+    }
+
+    #[test]
+    fn changed_external_file_can_be_restarted_from_menu() {
+        let profile_path = test_path();
+        let text_path = test_path();
+        fs::write(&text_path, "старый текст").unwrap();
+        let mut app = test_app(profile_path.clone());
+        app.show_keyboard = false;
+        app.selected_mode = TrainingMode::ExternalText;
+        app.load_external_text(text_path.clone());
+        fs::write(&text_path, "новый текст").unwrap();
+        app.restore_external_text();
+        assert!(app.external_error.contains("изменился"));
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let menu = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Занятие"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(menu)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let restart = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Начать изменённый файл заново"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(restart)]);
+        assert!(app.external_error.is_empty());
+        assert_eq!(app.external_text, "новый текст");
+        assert_eq!(
+            app.users
+                .active_profile()
+                .unwrap()
+                .external_text
+                .as_ref()
+                .unwrap()
+                .position,
+            0
+        );
+        fs::remove_file(text_path).unwrap();
+        fs::remove_file(profile_path).unwrap();
+    }
+
+    #[test]
+    fn selecting_external_position_survives_reload_with_utf8_and_whitespace() {
+        let profile_path = test_path();
+        let text_path = test_path();
+        fs::write(&text_path, "я\r\n  бв").unwrap();
+        let mut app = test_app(profile_path.clone());
+        app.selected_mode = TrainingMode::ExternalText;
+        app.load_external_text(text_path.clone());
+        app.set_external_position(2);
+        assert_eq!(app.external_text, "бв");
+        assert_eq!(
+            app.users
+                .active_profile()
+                .unwrap()
+                .external_text
+                .as_ref()
+                .unwrap()
+                .position,
+            6
+        );
+        app.restore_external_text();
+        assert_eq!(app.external_text, "бв");
+        fs::remove_file(text_path).unwrap();
+        fs::remove_file(profile_path).unwrap();
+    }
+
+    #[test]
+    fn invalid_saved_offset_and_deleted_file_do_not_overwrite_progress() {
+        let profile_path = test_path();
+        let text_path = test_path();
+        fs::write(&text_path, "я текст").unwrap();
+        let mut app = test_app(profile_path.clone());
+        app.selected_mode = TrainingMode::ExternalText;
+        app.load_external_text(text_path.clone());
+        let mut saved = app
+            .users
+            .active_profile()
+            .unwrap()
+            .external_text
+            .clone()
+            .unwrap();
+        saved.position = 1;
+        app.users.set_external_progress(saved).unwrap();
+        app.restore_external_text();
+        assert!(app.external_error.contains("Позиция"));
+        app.load_external_text(text_path.clone());
+        app.start();
+        app.type_input_char('я', 100);
+        fs::remove_file(text_path).unwrap();
+        app.stop();
+        app.accept_result();
+        assert!(app.external_error.contains("проверить файл"));
+        assert_eq!(
+            app.users
+                .active_profile()
+                .unwrap()
+                .external_text
+                .as_ref()
+                .unwrap()
+                .position,
+            0
+        );
+        fs::remove_file(profile_path).unwrap();
     }
 
     #[test]
@@ -1546,11 +2016,14 @@ mod tests {
         app.selected_mode = TrainingMode::Phrases;
         app.start();
         let first = app.session_text.clone();
+        let first_phrase_index = app.selected_content[app.content_slot()];
         for ch in first.chars() {
             app.type_input_char(ch, 0);
         }
-        assert_eq!(app.selected_content[app.content_slot()], 1);
-        assert_eq!(app.session_result_title(), "Фразы 1–2");
+        assert_ne!(app.selected_content[app.content_slot()], first_phrase_index);
+        assert!(
+            app.selected_content[app.content_slot()] < app.catalog.phrases(app.language()).len()
+        );
         assert!(app.session_text.len() > first.len());
     }
 
@@ -1611,6 +2084,7 @@ mod tests {
     fn accessible_menu_opens_lesson_chooser_and_selects_lesson() {
         let mut app = test_app(test_path());
         app.show_keyboard = false;
+        app.content_language = ContentLanguage::English;
         app.selected_mode = TrainingMode::Lessons;
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -1644,6 +2118,7 @@ mod tests {
     fn accessible_mode_menu_changes_mode_and_layout() {
         let mut app = test_app(test_path());
         app.show_keyboard = false;
+        app.content_language = ContentLanguage::English;
         app.selected_mode = TrainingMode::Lessons;
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -1678,7 +2153,80 @@ mod tests {
             .unwrap()
             .0;
         draw_accessible(&mut app, &ctx, vec![accessible_click(russian)]);
-        assert_eq!(app.current_label(), "Кот спит.");
+        assert_eq!(app.current_label(), "Cats nap.");
+        assert!(!app.english_layout);
+    }
+
+    #[test]
+    fn accessible_content_language_menu_saves_choice_and_locks_during_session() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.show_keyboard = false;
+        app.selected_mode = TrainingMode::Lessons;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let mode = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Режим"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(mode)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let language = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Язык текста"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(language)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let english = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("English"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(english)]);
+
+        assert_eq!(app.content_language, ContentLanguage::English);
+        assert_eq!(app.users.active_profile().unwrap().content_language, "EN");
+        assert_eq!(
+            UserStore::load_from(path.clone())
+                .unwrap()
+                .active_profile()
+                .unwrap()
+                .content_language,
+            "EN"
+        );
+
+        app.start();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let mode = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Режим"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(mode)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        if let Some(language) = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Язык текста"))
+            .map(|(id, _)| *id)
+        {
+            draw_accessible(&mut app, &ctx, vec![accessible_click(language)]);
+            let nodes = draw_accessible(&mut app, &ctx, vec![]);
+            if let Some(russian) = nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some("Русский"))
+                .map(|(id, _)| *id)
+            {
+                draw_accessible(&mut app, &ctx, vec![accessible_click(russian)]);
+            }
+        }
+        assert_eq!(app.content_language, ContentLanguage::English);
+        assert_eq!(app.users.active_profile().unwrap().content_language, "EN");
+        assert!(app.session.is_some());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1763,6 +2311,7 @@ mod tests {
     fn accessible_lesson_navigation_changes_selected_exercise() {
         let mut app = test_app(test_path());
         app.show_keyboard = false;
+        app.content_language = ContentLanguage::English;
         app.selected_mode = TrainingMode::Lessons;
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -1842,6 +2391,7 @@ mod tests {
         let path = test_path();
         let mut app = test_app(path.clone());
         app.show_keyboard = false;
+        app.content_language = ContentLanguage::English;
         app.selected_mode = TrainingMode::Lessons;
         app.start();
         for ch in app.session_text.clone().chars() {
@@ -1936,13 +2486,14 @@ mod tests {
             ];
             let mut session = Session::new(first);
             let mut index = 0;
+            let mut sequence = generated_modes::PhraseSequence::new(2, 0, 1);
             let chars: Vec<_> = first.chars().collect();
             for ch in &chars[..chars.len() - 1] {
                 assert_eq!(session.type_char(*ch, 100), Keystroke::Correct);
             }
             let last = *chars.last().unwrap();
             assert_eq!(
-                append_next_phrase(&mut session, &phrases, &mut index, last, 200),
+                append_next_phrase(&mut session, &phrases, &mut sequence, &mut index, last, 200),
                 Some(second.into())
             );
             assert_eq!(session.type_char(last, 200), Keystroke::Correct);
@@ -1956,6 +2507,51 @@ mod tests {
                 session.stats().correct,
                 first.chars().count() + second.chars().count()
             );
+        }
+    }
+
+    #[test]
+    fn chosen_phrase_starts_each_language_sequence_and_cycles_without_stopping() {
+        for phrases_text in [["а1 ", "б2 ", "в3 "], ["a1 ", "b2 ", "c3 "]] {
+            let phrases: Vec<_> = phrases_text
+                .iter()
+                .enumerate()
+                .map(|(index, text)| Exercise {
+                    name: index.to_string(),
+                    text: (*text).into(),
+                })
+                .collect();
+            let start = 2;
+            let mut current = start;
+            let mut sequence = generated_modes::PhraseSequence::new(phrases.len(), start, 73);
+            let mut session = Session::new(phrases[current].text.clone());
+            let mut seen = vec![current];
+
+            for _ in 0..5 {
+                let chars: Vec<_> = phrases[current].text.chars().collect();
+                for (position, ch) in chars.iter().enumerate() {
+                    if position + 1 == chars.len() {
+                        let next_text = append_next_phrase(
+                            &mut session,
+                            &phrases,
+                            &mut sequence,
+                            &mut current,
+                            *ch,
+                            100,
+                        )
+                        .expect("phrase source should append at each boundary");
+                        seen.push(current);
+                        assert_eq!(next_text, phrases[current].text);
+                    }
+                    assert_eq!(session.type_char(*ch, 100), Keystroke::Correct);
+                }
+            }
+            assert_eq!(session.snapshot(100).state, SessionState::Running);
+            for cycle in seen.chunks(3) {
+                let mut cycle = cycle.to_vec();
+                cycle.sort_unstable();
+                assert_eq!(cycle, vec![0, 1, 2]);
+            }
         }
     }
 }

@@ -41,6 +41,12 @@ pub struct Profile {
     pub results: Vec<ResultRecord>,
     #[serde(default)]
     pub external_text: Option<ExternalProgress>,
+    #[serde(default = "default_content_language")]
+    pub content_language: String,
+}
+
+fn default_content_language() -> String {
+    "RU".into()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -167,6 +173,22 @@ impl UserStore {
             .find(|p| p.id == self.active_profile_id)
     }
 
+    pub fn set_content_language(&mut self, language: &str) -> io::Result<()> {
+        if !matches!(language, "RU" | "EN") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid content language",
+            ));
+        }
+        let profile = self
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == self.active_profile_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "profile not found"))?;
+        profile.content_language = language.into();
+        self.save()
+    }
+
     pub fn select(&mut self, id: &str) -> io::Result<()> {
         if !self.profiles.iter().any(|p| p.id == id) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "profile not found"));
@@ -184,6 +206,7 @@ impl UserStore {
             name,
             results: Vec::new(),
             external_text: None,
+            content_language: default_content_language(),
         });
         self.active_profile_id = id;
         self.save()?;
@@ -303,6 +326,9 @@ impl UserStore {
                     suffix += 1;
                 }
             }
+            if !matches!(self.profiles[i].content_language.as_str(), "RU" | "EN") {
+                self.profiles[i].content_language = default_content_language();
+            }
             let results = &mut self.profiles[i].results;
             if results.len() > MAX_RESULTS_PER_PROFILE {
                 let excess = results.len() - MAX_RESULTS_PER_PROFILE;
@@ -317,6 +343,7 @@ impl UserStore {
                 name: DEFAULT_PROFILE_NAME.into(),
                 results: Vec::new(),
                 external_text: None,
+                content_language: default_content_language(),
             });
             self.active_profile_id = id;
         } else if !self.profiles.iter().any(|p| p.id == self.active_profile_id) {
@@ -431,6 +458,32 @@ mod tests {
         assert_eq!(loaded.profiles().len(), 2);
         assert_eq!(loaded.active_profile_id(), default_id);
         assert!(loaded.profiles().iter().all(|p| p.id != created_id));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn content_language_is_profile_scoped_and_legacy_profiles_default_to_russian() {
+        let path = test_path();
+        fs::write(&path, br#"{"active_profile_id":"legacy","profiles":[{"id":"legacy","name":"Legacy","results":[]},{"id":"english","name":"English","results":[]}] }"#).unwrap();
+        let mut store = UserStore::load_from(&path).unwrap();
+        assert_eq!(store.active_profile().unwrap().content_language, "RU");
+        store.set_content_language("EN").unwrap();
+        store.select("english").unwrap();
+        assert_eq!(store.active_profile().unwrap().content_language, "RU");
+        store.set_content_language("EN").unwrap();
+        store.select("legacy").unwrap();
+        assert_eq!(store.active_profile().unwrap().content_language, "EN");
+        let loaded = UserStore::load_from(&path).unwrap();
+        assert_eq!(loaded.active_profile().unwrap().content_language, "EN");
+        assert_eq!(
+            loaded
+                .profiles()
+                .iter()
+                .find(|p| p.id == "english")
+                .unwrap()
+                .content_language,
+            "EN"
+        );
         let _ = fs::remove_file(path);
     }
 

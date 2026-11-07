@@ -22,11 +22,13 @@ pub struct ContentCatalog {
     english_phrases: Vec<Exercise>,
     russian_keys: String,
     english_keys: String,
+    russian_caps: String,
+    english_caps: String,
     diagnostics: String,
 }
 
 impl ContentCatalog {
-    /// Load catalog data from `src/stamina_setup/Data`, falling back per file if unavailable.
+    /// Load catalog data from `src/stamina_setup/Data` and report missing files.
     pub fn load() -> Self {
         let data_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../src/stamina_setup/Data");
@@ -40,34 +42,25 @@ impl ContentCatalog {
             &data_dir.join("lessons.ru"),
             "Russian lessons",
             &mut diagnostics,
-            Exercise {
-                name: "Начальный урок".into(),
-                text: "аа оо уу ыы ее мм нн".into(),
-            },
         );
         let english_lessons = load_lessons(
             &data_dir.join("lessons.us"),
             "English lessons",
             &mut diagnostics,
-            Exercise {
-                name: "Basic lesson".into(),
-                text: "asdf jkl; asdf jkl;".into(),
-            },
         );
         let russian_phrases = load_phrases(
             &data_dir.join("phrases.ru"),
             "Russian phrases",
             &mut diagnostics,
-            "Мама мыла раму. Саша шёл по дороге.",
         );
         let english_phrases = load_phrases(
             &data_dir.join("phrases.en"),
             "English phrases",
             &mut diagnostics,
-            "The quick brown fox jumps over the lazy dog.",
         );
-        let layouts =
-            stamina_data::read_layouts(data_dir.join("../Layouts.ini")).unwrap_or_default();
+        let layouts_path = data_dir.join("../Layouts.ini");
+        let layouts = stamina_data::read_layouts(&layouts_path).unwrap_or_default();
+        let caps = read_caps(&layouts_path);
         let russian_keys = layouts
             .iter()
             .find(|layout| layout.code == "00000419")
@@ -78,6 +71,8 @@ impl ContentCatalog {
             .find(|layout| layout.code == "00000409")
             .map(|layout| layout.keys.clone())
             .unwrap_or_else(|| "qwertyuiopasdfghjklzxcvbnm1234567890".into());
+        let russian_caps = caps.get("ru").cloned().unwrap_or_default();
+        let english_caps = caps.get("en").cloned().unwrap_or_default();
 
         Self {
             russian_lessons,
@@ -86,6 +81,8 @@ impl ContentCatalog {
             english_phrases,
             russian_keys,
             english_keys,
+            russian_caps,
+            english_caps,
             diagnostics: diagnostics.join("\n"),
         }
     }
@@ -135,7 +132,24 @@ impl ContentCatalog {
             ],
             russian_keys: "фывапролдж".into(),
             english_keys: "asdfjkl;".into(),
+            russian_caps: "ФЫВАПРОЛДЖ".into(),
+            english_caps: "ASDFJKL".into(),
             diagnostics: String::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_empty() -> Self {
+        Self {
+            russian_lessons: Vec::new(),
+            english_lessons: Vec::new(),
+            russian_phrases: Vec::new(),
+            english_phrases: Vec::new(),
+            russian_keys: String::new(),
+            english_keys: String::new(),
+            russian_caps: String::new(),
+            english_caps: String::new(),
+            diagnostics: "No training content available".into(),
         }
     }
 
@@ -157,19 +171,51 @@ impl ContentCatalog {
         &self.diagnostics
     }
 
+    #[cfg(test)]
     pub fn keys(&self, language: ContentLanguage) -> &str {
         match language {
             ContentLanguage::Russian => &self.russian_keys,
             ContentLanguage::English => &self.english_keys,
         }
     }
+
+    /// Return printable system-layout keys with symbols listed in the matching
+    /// Stamina `Caps` section removed. `english_layout` is the active OS layout,
+    /// independent of the selected lesson/phrase language.
+    pub fn all_keys(&self, english_layout: bool) -> String {
+        let (keys, caps) = if english_layout {
+            (&self.english_keys, &self.english_caps)
+        } else {
+            (&self.russian_keys, &self.russian_caps)
+        };
+        keys.chars().filter(|key| !caps.contains(*key)).collect()
+    }
+}
+
+fn read_caps(path: &std::path::Path) -> std::collections::HashMap<String, String> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Default::default();
+    };
+    let source = stamina_data::decode_legacy(&bytes);
+    let mut section = String::new();
+    let mut result = std::collections::HashMap::new();
+    for line in source.lines().map(str::trim) {
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].to_ascii_lowercase();
+        } else if let Some((key, value)) = line.split_once('=')
+            && key.trim().eq_ignore_ascii_case("Caps")
+            && !section.is_empty()
+        {
+            result.insert(section.clone(), value.trim().to_owned());
+        }
+    }
+    result
 }
 
 fn load_lessons(
     path: &std::path::Path,
     label: &str,
     diagnostics: &mut Vec<String>,
-    fallback: Exercise,
 ) -> Vec<Exercise> {
     match stamina_data::read_lessons(path) {
         Ok(records) => {
@@ -189,14 +235,14 @@ fn load_lessons(
                     "{label}: no nonempty lessons in {}",
                     path.display()
                 ));
-                vec![fallback]
+                Vec::new()
             } else {
                 exercises
             }
         }
         Err(error) => {
-            diagnostics.push(format!("{label}: {error}; using built-in content"));
-            vec![fallback]
+            diagnostics.push(format!("{label}: {error}; no content available"));
+            Vec::new()
         }
     }
 }
@@ -205,7 +251,6 @@ fn load_phrases(
     path: &std::path::Path,
     label: &str,
     diagnostics: &mut Vec<String>,
-    fallback: &str,
 ) -> Vec<Exercise> {
     match stamina_data::read_phrases(path) {
         Ok(phrases) => {
@@ -223,22 +268,15 @@ fn load_phrases(
                     "{label}: no nonempty phrases in {}",
                     path.display()
                 ));
-                vec![phrase_fallback(fallback)]
+                Vec::new()
             } else {
                 exercises
             }
         }
         Err(error) => {
-            diagnostics.push(format!("{label}: {error}; using built-in content"));
-            vec![phrase_fallback(fallback)]
+            diagnostics.push(format!("{label}: {error}; no content available"));
+            Vec::new()
         }
-    }
-}
-
-fn phrase_fallback(text: &str) -> Exercise {
-    Exercise {
-        name: text.into(),
-        text: phrase_segment(text),
     }
 }
 
@@ -255,6 +293,7 @@ fn phrase_segment(line: &str) -> String {
 mod tests {
     use super::{
         ContentCatalog, ContentLanguage, Exercise, load_lessons, load_phrases, phrase_segment,
+        read_caps,
     };
     use std::{
         fs,
@@ -278,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_loads_both_languages_and_falls_back_per_missing_file() {
+    fn catalog_loads_available_data_and_reports_missing_files() {
         let root = temp_file("catalog");
         let data = root.join("Data");
         fs::create_dir_all(&data).unwrap();
@@ -292,12 +331,9 @@ mod tests {
 
         let catalog = ContentCatalog::load_from(&data);
         assert_eq!(catalog.lessons(ContentLanguage::Russian)[0].text, "тест");
-        assert_eq!(
-            catalog.lessons(ContentLanguage::English)[0].name,
-            "Basic lesson"
-        );
+        assert!(catalog.lessons(ContentLanguage::English).is_empty());
         assert_eq!(catalog.phrases(ContentLanguage::English)[0].text, "First. ");
-        assert!(!catalog.phrases(ContentLanguage::Russian).is_empty());
+        assert!(catalog.phrases(ContentLanguage::Russian).is_empty());
         assert_eq!(catalog.keys(ContentLanguage::Russian), "abc");
         assert_eq!(catalog.keys(ContentLanguage::English), "xyz");
         assert!(catalog.diagnostics().contains("English lessons"));
@@ -320,15 +356,7 @@ mod tests {
         .unwrap();
         let mut diagnostics = Vec::new();
 
-        let lessons = load_lessons(
-            &path,
-            "test lessons",
-            &mut diagnostics,
-            Exercise {
-                name: "fallback".into(),
-                text: "fallback".into(),
-            },
-        );
+        let lessons = load_lessons(&path, "test lessons", &mut diagnostics);
 
         assert_eq!(
             lessons,
@@ -342,37 +370,22 @@ mod tests {
     }
 
     #[test]
-    fn load_lessons_uses_fallback_and_diagnostic_for_missing_or_empty_file() {
+    fn load_lessons_returns_empty_and_diagnostic_for_missing_or_empty_file() {
         let missing = temp_file("lessons-missing");
         let empty = temp_file("lessons-empty");
         fs::write(&empty, "[#]>Only a submenu\r\nbody\r\n[#] Blank\r\n \r\n").unwrap();
-        let fallback = Exercise {
-            name: "fallback lesson".into(),
-            text: "xyz".into(),
-        };
-
         let mut missing_diagnostics = Vec::new();
         assert_eq!(
-            load_lessons(
-                &missing,
-                "test lessons",
-                &mut missing_diagnostics,
-                fallback.clone()
-            ),
-            std::slice::from_ref(&fallback)
+            load_lessons(&missing, "test lessons", &mut missing_diagnostics,),
+            []
         );
         assert!(missing_diagnostics[0].contains("test lessons:"));
-        assert!(missing_diagnostics[0].contains("using built-in content"));
+        assert!(missing_diagnostics[0].contains("no content available"));
 
         let mut empty_diagnostics = Vec::new();
         assert_eq!(
-            load_lessons(
-                &empty,
-                "test lessons",
-                &mut empty_diagnostics,
-                fallback.clone()
-            ),
-            [fallback]
+            load_lessons(&empty, "test lessons", &mut empty_diagnostics,),
+            []
         );
         assert!(empty_diagnostics[0].contains("no nonempty lessons"));
         fs::remove_file(empty).unwrap();
@@ -388,7 +401,7 @@ mod tests {
         .unwrap();
         let mut diagnostics = Vec::new();
 
-        let phrases = load_phrases(&path, "test phrases", &mut diagnostics, "fallback");
+        let phrases = load_phrases(&path, "test phrases", &mut diagnostics);
 
         assert_eq!(
             phrases,
@@ -408,40 +421,51 @@ mod tests {
     }
 
     #[test]
-    fn load_phrases_uses_fallback_and_diagnostic_for_missing_or_empty_file() {
+    fn load_phrases_returns_empty_and_diagnostic_for_missing_or_empty_file() {
         let missing = temp_file("phrases-missing");
         let empty = temp_file("phrases-empty");
         fs::write(&empty, " \r\n\t\n").unwrap();
 
         let mut missing_diagnostics = Vec::new();
         assert_eq!(
-            load_phrases(
-                &missing,
-                "test phrases",
-                &mut missing_diagnostics,
-                "Backup. Later."
-            ),
-            [Exercise {
-                name: "Backup. Later.".into(),
-                text: "Backup. ".into()
-            }]
+            load_phrases(&missing, "test phrases", &mut missing_diagnostics,),
+            []
         );
-        assert!(missing_diagnostics[0].contains("using built-in content"));
+        assert!(missing_diagnostics[0].contains("no content available"));
 
         let mut empty_diagnostics = Vec::new();
         assert_eq!(
-            load_phrases(
-                &empty,
-                "test phrases",
-                &mut empty_diagnostics,
-                "Backup. Later."
-            ),
-            [Exercise {
-                name: "Backup. Later.".into(),
-                text: "Backup. ".into()
-            }]
+            load_phrases(&empty, "test phrases", &mut empty_diagnostics,),
+            []
         );
         assert!(empty_diagnostics[0].contains("no nonempty phrases"));
         fs::remove_file(empty).unwrap();
+    }
+
+    #[test]
+    fn all_keys_uses_system_layout_and_removes_caps_symbols() {
+        let catalog = ContentCatalog::fixture();
+        assert_eq!(catalog.all_keys(true), "asdfjkl;");
+        assert_eq!(catalog.all_keys(false), "фывапролдж");
+    }
+
+    #[test]
+    fn reads_caps_by_layout_extension_and_keeps_empty_when_content_is_absent() {
+        let path = temp_file("caps");
+        fs::write(
+            &path,
+            "[LAYOUTS]\n00000409=en,us,English,abcABC\n00000419=ru,ru,Russian,абвАБВ\n[EN]\nCaps=ABC\n[RU]\nCaps=АБВ\n",
+        )
+        .unwrap();
+        let caps = read_caps(&path);
+        assert_eq!(caps.get("en").map(String::as_str), Some("ABC"));
+        assert_eq!(caps.get("ru").map(String::as_str), Some("АБВ"));
+        fs::remove_file(path).unwrap();
+
+        let missing_path = temp_file("caps-absent");
+        let mut diagnostics = Vec::new();
+        let lessons = load_lessons(&missing_path, "Russian lessons", &mut diagnostics);
+        assert!(lessons.is_empty());
+        assert!(diagnostics[0].contains("no content available"));
     }
 }
