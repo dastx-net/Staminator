@@ -39,6 +39,7 @@ mod windows {
             SoundEvent::Pause => MB_ICONEXCLAMATION,
         };
 
+        // SAFETY: MessageBeep accepts any u32 tone selector and has no pointer arguments.
         // MessageBeep reports failure only when Windows cannot play the tone;
         // sound playback is best-effort and has no useful recovery action here.
         unsafe {

@@ -1,5 +1,7 @@
 //! Read-only parsers for Stamina's legacy lesson and phrase files.
 
+#![forbid(unsafe_code)]
+
 use encoding_rs::WINDOWS_1251;
 use std::{error::Error, fmt, fs, path::Path};
 

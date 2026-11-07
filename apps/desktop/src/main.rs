@@ -28,12 +28,11 @@ fn load_keyboard_setting() -> bool {
 }
 
 fn save_keyboard_setting(show: bool) {
-    if let Some(path) = keyboard_setting_path() {
-        if let Some(parent) = path.parent() {
-            if fs::create_dir_all(parent).is_ok() {
-                let _ = fs::write(path, show.to_string());
-            }
-        }
+    if let Some(path) = keyboard_setting_path()
+        && let Some(parent) = path.parent()
+        && fs::create_dir_all(parent).is_ok()
+    {
+        let _ = fs::write(path, show.to_string());
     }
 }
 
@@ -363,16 +362,16 @@ impl StaminatorApp {
         } else {
             "Русская"
         };
-        if let Err(error) = self.users.record(
+        if let Err(error) = self.users.record(user_store::ResultInput {
             mode,
             layout,
-            &self.result_title,
-            stats.correct as u64,
-            stats.errors as u64,
-            stats.elapsed_ms,
-            stats.cpm as f64,
-            stats.error_percent,
-        ) {
+            exercise: &self.result_title,
+            correct: stats.correct as u64,
+            errors: stats.errors as u64,
+            elapsed_ms: stats.elapsed_ms,
+            cpm: stats.cpm as f64,
+            error_percent: stats.error_percent,
+        }) {
             self.profile_error = format!("Не удалось сохранить результат: {error}");
         }
     }
@@ -400,12 +399,11 @@ impl StaminatorApp {
         if self.selected_mode == TrainingMode::Phrases {
             let slot = self.content_slot();
             let phrases = self.catalog.phrases(self.language());
-            if let Some(session) = &mut self.session {
-                if let Some(next_text) =
+            if let Some(session) = &mut self.session
+                && let Some(next_text) =
                     append_next_phrase(session, phrases, &mut self.selected_content[slot], ch, now)
-                {
-                    self.session_text.push_str(&next_text);
-                }
+            {
+                self.session_text.push_str(&next_text);
             }
         } else if at_boundary
             && matches!(
@@ -422,10 +420,10 @@ impl StaminatorApp {
                 self.session_text.push_str(&next_text);
             }
         }
-        if let Some(session) = &mut self.session {
-            if session.type_char(ch, now) == Keystroke::Incorrect {
-                sound::play(SoundEvent::Error);
-            }
+        if let Some(session) = &mut self.session
+            && session.type_char(ch, now) == Keystroke::Incorrect
+        {
+            sound::play(SoundEvent::Error);
         }
     }
 
@@ -924,26 +922,26 @@ impl eframe::App for StaminatorApp {
                 &mut self.progress_open,
             );
         }
-        if self.result_open {
-            if let Some(stats) = self.last_result.clone() {
-                let has_next = self.content_mode()
-                    && self.selected_content[self.content_slot()] + 1 < self.items().len();
-                match result_view::show(
-                    root.ctx(),
-                    &self.result_title,
-                    &stats,
-                    self.result_completed,
-                    has_next,
-                ) {
-                    ResultAction::Stay => {}
-                    ResultAction::Retry => self.start(),
-                    ResultAction::Next => {
-                        if self.advance_content() {
-                            self.start();
-                        }
+        if self.result_open
+            && let Some(stats) = self.last_result.clone()
+        {
+            let has_next = self.content_mode()
+                && self.selected_content[self.content_slot()] + 1 < self.items().len();
+            match result_view::show(
+                root.ctx(),
+                &self.result_title,
+                &stats,
+                self.result_completed,
+                has_next,
+            ) {
+                ResultAction::Stay => {}
+                ResultAction::Retry => self.start(),
+                ResultAction::Next => {
+                    if self.advance_content() {
+                        self.start();
                     }
-                    ResultAction::Close => self.result_open = false,
                 }
+                ResultAction::Close => self.result_open = false,
             }
         }
         if active {

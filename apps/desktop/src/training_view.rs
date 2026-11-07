@@ -101,7 +101,7 @@ pub fn draw_training(
     let baseline = band.center().y;
     let mut x = text_left + scroll;
 
-    for index in start..end {
+    for (index, ch) in chars.iter().enumerate().take(end).skip(start) {
         let color = if index < position {
             Color32::from_rgb(164, 169, 173)
         } else {
@@ -110,7 +110,7 @@ pub fn draw_training(
         text_painter.text(
             egui::pos2(x, baseline),
             Align2::LEFT_CENTER,
-            chars[index],
+            *ch,
             font.clone(),
             color,
         );

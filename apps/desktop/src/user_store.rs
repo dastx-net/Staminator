@@ -22,6 +22,17 @@ pub struct ResultRecord {
     pub error_percent: f64,
 }
 
+pub struct ResultInput<'a> {
+    pub mode: &'a str,
+    pub layout: &'a str,
+    pub exercise: &'a str,
+    pub correct: u64,
+    pub errors: u64,
+    pub elapsed_ms: u64,
+    pub cpm: f64,
+    pub error_percent: f64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Profile {
     pub id: String,
@@ -198,17 +209,7 @@ impl UserStore {
         self.save()
     }
 
-    pub fn record(
-        &mut self,
-        mode: &str,
-        layout: &str,
-        exercise: &str,
-        correct: u64,
-        errors: u64,
-        elapsed_ms: u64,
-        cpm: f64,
-        error_percent: f64,
-    ) -> io::Result<&ResultRecord> {
+    pub fn record(&mut self, input: ResultInput<'_>) -> io::Result<&ResultRecord> {
         let profile = self
             .profiles
             .iter_mut()
@@ -219,14 +220,14 @@ impl UserStore {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            mode: mode.to_owned(),
-            layout: layout.to_owned(),
-            exercise: exercise.to_owned(),
-            correct,
-            errors,
-            elapsed_ms,
-            cpm,
-            error_percent,
+            mode: input.mode.to_owned(),
+            layout: input.layout.to_owned(),
+            exercise: input.exercise.to_owned(),
+            correct: input.correct,
+            errors: input.errors,
+            elapsed_ms: input.elapsed_ms,
+            cpm: input.cpm,
+            error_percent: input.error_percent,
         });
         if profile.results.len() > MAX_RESULTS_PER_PROFILE {
             profile
@@ -382,7 +383,16 @@ mod tests {
         let created_id = store.create("Alice").unwrap().id.clone();
         assert_eq!(store.active_name(), "Alice");
         store
-            .record("Words", "EN", "Home row", 80, 2, 12_000, 400.0, 2.4)
+            .record(ResultInput {
+                mode: "Words",
+                layout: "EN",
+                exercise: "Home row",
+                correct: 80,
+                errors: 2,
+                elapsed_ms: 12_000,
+                cpm: 400.0,
+                error_percent: 2.4,
+            })
             .unwrap();
         store.create("Bob").unwrap();
         store.select(&created_id).unwrap();

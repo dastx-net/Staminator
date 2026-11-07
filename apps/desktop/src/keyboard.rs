@@ -251,14 +251,12 @@ pub fn draw_keyboard(ui: &mut Ui, layout: KeyboardLayout, active: Option<char>) 
                 Stroke::new(if is_active { 1.8 } else { 1.0 }, border),
                 StrokeKind::Inside,
             );
-            if !is_active {
-                if let Some(color) = zone_color {
-                    let marker = Rect::from_min_max(
-                        Pos2::new(key_rect.left() + 2.0, key_rect.bottom() - 4.0),
-                        Pos2::new(key_rect.right() - 2.0, key_rect.bottom() - 1.0),
-                    );
-                    painter.rect_filled(marker, CornerRadius::same(1), color);
-                }
+            if !is_active && let Some(color) = zone_color {
+                let marker = Rect::from_min_max(
+                    Pos2::new(key_rect.left() + 2.0, key_rect.bottom() - 4.0),
+                    Pos2::new(key_rect.right() - 2.0, key_rect.bottom() - 1.0),
+                );
+                painter.rect_filled(marker, CornerRadius::same(1), color);
             }
             let main_font = FontId::proportional((key_h * 0.45).clamp(10.0, 28.0));
             if !top.is_empty() && !bottom.is_empty() && top.chars().count() == 1 {
