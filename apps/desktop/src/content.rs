@@ -17,6 +17,10 @@ pub struct Exercise {
 #[derive(Clone, Debug)]
 pub struct ContentCatalog {
     russian_lessons: Vec<Exercise>,
+    russian_lesson_ids: Vec<String>,
+    english_lesson_ids: Vec<String>,
+    lesson_roots: Vec<PathBuf>,
+    lesson_diagnostics: String,
     english_lessons: Vec<Exercise>,
     russian_phrases: Vec<Exercise>,
     english_phrases: Vec<Exercise>,
@@ -32,22 +36,40 @@ impl ContentCatalog {
     pub fn load() -> Self {
         let data_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../src/stamina_setup/Data");
-        Self::load_from(&data_dir)
+        let executable_lessons = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.join("lessons")));
+        let development_lessons = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lessons");
+        let builtin = executable_lessons
+            .filter(|p| p.is_dir())
+            .unwrap_or(development_lessons);
+        let user_root = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("XDG_DATA_HOME").map(PathBuf::from))
+            .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/share")))
+            .map(|p| p.join("Staminator/lessons"));
+        Self::load_with_roots(&data_dir, builtin, user_root)
+    }
+
+    fn load_with_roots(
+        data_dir: &std::path::Path,
+        builtin: PathBuf,
+        user_root: Option<PathBuf>,
+    ) -> Self {
+        let mut catalog = Self::load_from(data_dir);
+        catalog.lesson_roots = vec![builtin];
+        if let Some(root) = user_root {
+            catalog.lesson_roots.push(root);
+        }
+        catalog.refresh_lessons();
+        catalog
     }
 
     fn load_from(data_dir: &std::path::Path) -> Self {
         let mut diagnostics = Vec::new();
 
-        let russian_lessons = load_lessons(
-            &data_dir.join("lessons.ru"),
-            "Russian lessons",
-            &mut diagnostics,
-        );
-        let english_lessons = load_lessons(
-            &data_dir.join("lessons.us"),
-            "English lessons",
-            &mut diagnostics,
-        );
+        let russian_lessons: Vec<Exercise> = Vec::new();
+        let english_lessons: Vec<Exercise> = Vec::new();
         let russian_phrases = load_phrases(
             &data_dir.join("phrases.ru"),
             "Russian phrases",
@@ -75,6 +97,14 @@ impl ContentCatalog {
         let english_caps = caps.get("en").cloned().unwrap_or_default();
 
         Self {
+            russian_lesson_ids: (0..russian_lessons.len())
+                .map(|i| format!("legacy.ru.{i}"))
+                .collect(),
+            english_lesson_ids: (0..english_lessons.len())
+                .map(|i| format!("legacy.en.{i}"))
+                .collect(),
+            lesson_roots: Vec::new(),
+            lesson_diagnostics: String::new(),
             russian_lessons,
             english_lessons,
             russian_phrases,
@@ -90,6 +120,10 @@ impl ContentCatalog {
     #[cfg(test)]
     pub(crate) fn fixture() -> Self {
         Self {
+            russian_lesson_ids: vec!["ru.1".into(), "ru.2".into()],
+            english_lesson_ids: vec!["en.1".into(), "en.2".into()],
+            lesson_roots: Vec::new(),
+            lesson_diagnostics: String::new(),
             russian_lessons: vec![
                 Exercise {
                     name: "RU home row".into(),
@@ -141,6 +175,10 @@ impl ContentCatalog {
     #[cfg(test)]
     pub(crate) fn fixture_empty() -> Self {
         Self {
+            russian_lesson_ids: Vec::new(),
+            english_lesson_ids: Vec::new(),
+            lesson_roots: Vec::new(),
+            lesson_diagnostics: String::new(),
             russian_lessons: Vec::new(),
             english_lessons: Vec::new(),
             russian_phrases: Vec::new(),
@@ -151,6 +189,76 @@ impl ContentCatalog {
             english_caps: String::new(),
             diagnostics: "No training content available".into(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_lesson_roots(&mut self, roots: Vec<PathBuf>) {
+        self.lesson_roots = roots;
+        self.refresh_lessons();
+    }
+
+    pub fn refresh_lessons(&mut self) {
+        let catalog = stamina_data::load_lesson_catalog(&self.lesson_roots);
+        self.russian_lessons.clear();
+        self.english_lessons.clear();
+        self.russian_lesson_ids.clear();
+        self.english_lesson_ids.clear();
+        for entry in catalog.lessons {
+            let group = self
+                .lesson_roots
+                .iter()
+                .find_map(|root| entry.path.strip_prefix(root).ok())
+                .and_then(|path| path.parent())
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|path| path.display().to_string());
+            let lesson = entry.lesson;
+            let language = lesson.language.split('-').next().unwrap_or("");
+            let (items, ids) = if language.eq_ignore_ascii_case("ru") {
+                (&mut self.russian_lessons, &mut self.russian_lesson_ids)
+            } else if language.eq_ignore_ascii_case("en") {
+                (&mut self.english_lessons, &mut self.english_lesson_ids)
+            } else {
+                continue;
+            };
+            ids.push(lesson.id);
+            items.push(Exercise {
+                name: group.map_or_else(
+                    || lesson.title.clone(),
+                    |group| format!("{group} / {}", lesson.title),
+                ),
+                text: lesson.text,
+            });
+        }
+        self.lesson_diagnostics = catalog
+            .diagnostics
+            .iter()
+            .map(|d| format!("{}: {}", d.path.display(), d.message))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
+    pub fn lesson_id(&self, language: ContentLanguage, index: usize) -> Option<&str> {
+        let ids = match language {
+            ContentLanguage::Russian => &self.russian_lesson_ids,
+            ContentLanguage::English => &self.english_lesson_ids,
+        };
+        ids.get(index).map(String::as_str)
+    }
+
+    pub fn lesson_index(&self, language: ContentLanguage, id: &str) -> Option<usize> {
+        let ids = match language {
+            ContentLanguage::Russian => &self.russian_lesson_ids,
+            ContentLanguage::English => &self.english_lesson_ids,
+        };
+        ids.iter().position(|value| value == id)
+    }
+
+    pub fn lesson_diagnostics(&self) -> &str {
+        &self.lesson_diagnostics
+    }
+
+    pub fn user_lesson_path(&self) -> Option<&std::path::Path> {
+        self.lesson_roots.get(1).map(PathBuf::as_path)
     }
 
     pub fn lessons(&self, language: ContentLanguage) -> &[Exercise] {
@@ -212,6 +320,7 @@ fn read_caps(path: &std::path::Path) -> std::collections::HashMap<String, String
     result
 }
 
+#[cfg(test)]
 fn load_lessons(
     path: &std::path::Path,
     label: &str,
@@ -311,6 +420,59 @@ mod tests {
     }
 
     #[test]
+    fn startup_loads_built_in_and_user_lessons_without_changing_user_files() {
+        let root = temp_file("startup");
+        let built_in = root.join("lessons");
+        let user = root.join("user-lessons");
+        fs::create_dir_all(&built_in).unwrap();
+        fs::create_dir_all(&user).unwrap();
+        let content =
+            r#"{"version":1,"id":"user.one","title":"One","language":"en","text":"hello"}"#;
+        let user_file = user.join("one.json");
+        fs::write(&user_file, content).unwrap();
+        let catalog =
+            ContentCatalog::load_with_roots(&root.join("data"), built_in, Some(user.clone()));
+        assert_eq!(catalog.lessons(ContentLanguage::English)[0].text, "hello");
+        assert_eq!(catalog.user_lesson_path(), Some(user.as_path()));
+        assert_eq!(fs::read_to_string(user_file).unwrap(), content);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refresh_filters_languages_and_removes_conflicting_lessons() {
+        let root = temp_file("json-catalog");
+        let built_in = root.join("built-in");
+        let user = root.join("user");
+        fs::create_dir_all(&built_in).unwrap();
+        fs::create_dir_all(&user).unwrap();
+        let json = |id: &str, language: &str| {
+            format!(
+                r#"{{"version":1,"id":"{id}","title":"{id}","language":"{language}","text":"abc"}}"#
+            )
+        };
+        fs::write(built_in.join("en.json"), json("english", "en-US")).unwrap();
+        fs::write(built_in.join("fr.json"), json("french", "fr")).unwrap();
+        fs::write(user.join("ru.json"), json("russian", "ru-RU")).unwrap();
+        let mut catalog = ContentCatalog::fixture();
+        catalog.set_lesson_roots(vec![built_in.clone(), user.clone()]);
+        assert_eq!(
+            catalog.lesson_id(ContentLanguage::English, 0),
+            Some("english")
+        );
+        assert_eq!(
+            catalog.lesson_index(ContentLanguage::Russian, "russian"),
+            Some(0)
+        );
+        assert_eq!(catalog.lessons(ContentLanguage::English).len(), 1);
+        fs::write(user.join("duplicate.json"), json("english", "en")).unwrap();
+        catalog.refresh_lessons();
+        assert!(catalog.lessons(ContentLanguage::English).is_empty());
+        assert!(catalog.lesson_diagnostics().contains("duplicate.json"));
+        assert_eq!(catalog.lessons(ContentLanguage::Russian).len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn takes_first_sentence_and_one_following_space() {
         assert_eq!(phrase_segment("  First. Second!  "), "First. ");
         assert_eq!(phrase_segment("Без знака"), "Без знака ");
@@ -330,13 +492,12 @@ mod tests {
         .unwrap();
 
         let catalog = ContentCatalog::load_from(&data);
-        assert_eq!(catalog.lessons(ContentLanguage::Russian)[0].text, "тест");
+        assert!(catalog.lessons(ContentLanguage::Russian).is_empty());
         assert!(catalog.lessons(ContentLanguage::English).is_empty());
         assert_eq!(catalog.phrases(ContentLanguage::English)[0].text, "First. ");
         assert!(catalog.phrases(ContentLanguage::Russian).is_empty());
         assert_eq!(catalog.keys(ContentLanguage::Russian), "abc");
         assert_eq!(catalog.keys(ContentLanguage::English), "xyz");
-        assert!(catalog.diagnostics().contains("English lessons"));
         assert!(catalog.diagnostics().contains("Russian phrases"));
 
         fs::remove_file(data.join("lessons.ru")).unwrap();

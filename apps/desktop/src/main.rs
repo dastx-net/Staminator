@@ -103,6 +103,7 @@ struct StaminatorApp {
     content_language: ContentLanguage,
     catalog: ContentCatalog,
     selected_content: [usize; 4],
+    selected_lessons: [Option<String>; 2],
     chooser_open: bool,
     chooser_filter: String,
     external_path: Option<PathBuf>,
@@ -203,6 +204,7 @@ impl StaminatorApp {
                 }),
             catalog,
             selected_content: [0; 4],
+            selected_lessons: [None, None],
             chooser_open: false,
             chooser_filter: String::new(),
             external_path: None,
@@ -249,10 +251,20 @@ impl StaminatorApp {
         }
     }
 
+    fn current_index(&self) -> usize {
+        if self.selected_mode == TrainingMode::Lessons {
+            let language = usize::from(self.language() == ContentLanguage::English);
+            self.selected_lessons[language]
+                .as_deref()
+                .and_then(|id| self.catalog.lesson_index(self.language(), id))
+                .unwrap_or(0)
+        } else {
+            self.selected_content[self.content_slot()].min(self.items().len().saturating_sub(1))
+        }
+    }
+
     fn current_exercise(&self) -> Option<&Exercise> {
-        self.items().get(
-            self.selected_content[self.content_slot()].min(self.items().len().saturating_sub(1)),
-        )
+        self.items().get(self.current_index())
     }
 
     fn exercise(&self) -> &str {
@@ -472,15 +484,23 @@ impl StaminatorApp {
     }
 
     fn select_content(&mut self, index: usize) {
-        self.selected_content[self.content_slot()] =
-            index.min(self.items().len().saturating_sub(1));
+        let index = index.min(self.items().len().saturating_sub(1));
+        if self.selected_mode == TrainingMode::Lessons {
+            let language = usize::from(self.language() == ContentLanguage::English);
+            self.selected_lessons[language] = self
+                .catalog
+                .lesson_id(self.language(), index)
+                .map(str::to_owned);
+        } else {
+            self.selected_content[self.content_slot()] = index;
+        }
         self.session = None;
         self.last_result = None;
         self.result_open = false;
     }
 
     fn advance_content(&mut self) -> bool {
-        let next = self.selected_content[self.content_slot()] + 1;
+        let next = self.current_index() + 1;
         if next < self.items().len() {
             self.select_content(next);
             true
@@ -789,7 +809,8 @@ impl StaminatorApp {
     fn show_content_chooser(&mut self, ctx: &egui::Context) {
         let mut open = self.chooser_open;
         let mut chosen = None;
-        let current = self.selected_content[self.content_slot()];
+        let mut refresh = false;
+        let current = self.current_index();
         egui::Window::new(if self.selected_mode == TrainingMode::Lessons {
             "Выбор урока"
         } else {
@@ -798,6 +819,15 @@ impl StaminatorApp {
         .open(&mut open)
         .default_size([620.0, 470.0])
         .show(ctx, |ui| {
+            if self.selected_mode == TrainingMode::Lessons {
+                refresh = ui.button("Обновить список уроков").clicked();
+                if let Some(path) = self.catalog.user_lesson_path() {
+                    ui.label(format!("Папка ваших уроков: {}", path.display()));
+                }
+                if !self.catalog.lesson_diagnostics().is_empty() {
+                    ui.colored_label(egui::Color32::RED, self.catalog.lesson_diagnostics());
+                }
+            }
             ui.text_edit_singleline(&mut self.chooser_filter);
             let filter = self.chooser_filter.trim().to_lowercase();
             let matches: Vec<_> = self
@@ -825,6 +855,21 @@ impl StaminatorApp {
             );
         });
         self.chooser_open = open;
+        if refresh {
+            for (index, language) in [ContentLanguage::Russian, ContentLanguage::English]
+                .into_iter()
+                .enumerate()
+            {
+                if self.selected_lessons[index].is_none() {
+                    self.selected_lessons[index] =
+                        self.catalog.lesson_id(language, 0).map(str::to_owned);
+                }
+            }
+            self.catalog.refresh_lessons();
+            self.session = None;
+            self.last_result = None;
+            self.result_open = false;
+        }
         if let Some(index) = chosen {
             self.select_content(index);
             self.chooser_open = false;
@@ -941,7 +986,7 @@ impl StaminatorApp {
             .or(self.last_result.clone());
         let current_label = self.current_label();
         let current_index = if self.content_mode() {
-            self.selected_content[self.content_slot()]
+            self.current_index()
         } else {
             0
         };
@@ -1116,7 +1161,7 @@ impl StaminatorApp {
                     ui.separator();
                     ui.label(format!("Занятие: {current_label}"));
                     ui.small(if self.catalog.diagnostics().is_empty() {
-                        "Загружены локальные данные Stamina"
+                        "Данные загружены"
                     } else {
                         self.catalog.diagnostics()
                     });
@@ -1256,7 +1301,7 @@ impl StaminatorApp {
         {
             let has_next = self.result_completed
                 && self.content_mode()
-                && self.selected_content[self.content_slot()] + 1 < self.items().len();
+                && self.current_index() + 1 < self.items().len();
             let can_continue = self.session.as_ref().is_some_and(|s| {
                 s.stop_reason() == Some(StopReason::Manual) && s.remaining_chars() > 0
             });
@@ -1416,6 +1461,41 @@ mod tests {
         app.external_path = Some(PathBuf::from("example.txt"));
         app.external_text = "ab".into();
         app
+    }
+
+    #[test]
+    fn refresh_preserves_lesson_id_and_new_lesson_can_be_completed() {
+        let root = std::env::temp_dir().join(format!(
+            "staminator-refresh-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let lesson = |id: &str, text: &str| {
+            format!(r#"{{"version":1,"id":"{id}","title":"{id}","language":"ru","text":"{text}"}}"#)
+        };
+        std::fs::write(root.join("one.json"), lesson("b", "ab")).unwrap();
+        std::fs::write(root.join("two.json"), lesson("c", "cd")).unwrap();
+        let mut app = test_app(root.join("profiles.json"));
+        app.catalog.set_lesson_roots(vec![root.clone()]);
+        app.selected_mode = TrainingMode::Lessons;
+        app.content_language = ContentLanguage::Russian;
+        app.select_content(1);
+        assert_eq!(app.exercise(), "cd");
+        std::fs::write(nested.join("new.json"), lesson("a", "xy")).unwrap();
+        std::fs::write(nested.join("bad.json"), "{").unwrap();
+        app.catalog.refresh_lessons();
+        assert_eq!(app.exercise(), "cd");
+        assert!(app.catalog.lesson_diagnostics().contains("bad.json"));
+        app.select_content(0);
+        app.start();
+        app.type_input_char('x', 1);
+        app.type_input_char('y', 2);
+        assert_eq!(app.session.as_ref().unwrap().remaining_chars(), 0);
+        assert!(app.advance_content());
+        assert_eq!(app.exercise(), "ab");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2112,6 +2192,70 @@ mod tests {
         draw_accessible(&mut app, &ctx, vec![accessible_click(lesson)]);
         assert_eq!(app.current_label(), "EN words");
         assert!(!app.chooser_open);
+    }
+
+    #[test]
+    fn accessible_lesson_refresh_shows_errors_and_keeps_selection() {
+        let root = test_path().with_extension("");
+        fs::create_dir_all(&root).unwrap();
+        let file = |id: &str| {
+            format!(r#"{{"version":1,"id":"{id}","title":"{id}","language":"en","text":"abc"}}"#)
+        };
+        fs::write(root.join("b.json"), file("b")).unwrap();
+        let mut app = test_app(test_path());
+        app.catalog
+            .set_lesson_roots(vec![root.clone(), root.join("user")]);
+        app.selected_mode = TrainingMode::Lessons;
+        app.content_language = ContentLanguage::English;
+        app.chooser_open = true;
+        app.show_keyboard = false;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let refresh = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Обновить список уроков"))
+            .unwrap()
+            .0;
+        fs::write(root.join("a.json"), file("a")).unwrap();
+        fs::write(root.join("bad.json"), "{").unwrap();
+        draw_accessible(&mut app, &ctx, vec![accessible_click(refresh)]);
+        assert_eq!(app.current_label(), "b");
+        assert!(app.catalog.lesson_diagnostics().contains("bad.json"));
+        draw_accessible(&mut app, &ctx, vec![]);
+        assert_eq!(app.catalog.lessons(ContentLanguage::English).len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refresh_after_lesson_removal_falls_back_and_recovers_selection() {
+        let root = test_path().with_extension("");
+        fs::create_dir_all(&root).unwrap();
+        let lesson = |id: &str| {
+            format!(r#"{{"version":1,"id":"{id}","title":"{id}","language":"en","text":"abc"}}"#)
+        };
+        fs::write(root.join("first.json"), lesson("first")).unwrap();
+        fs::write(root.join("second.json"), lesson("second")).unwrap();
+        let profile_path = test_path();
+        let mut app = test_app(profile_path.clone());
+        app.catalog.set_lesson_roots(vec![root.clone()]);
+        app.selected_mode = TrainingMode::Lessons;
+        app.content_language = ContentLanguage::English;
+        app.select_content(1);
+        fs::remove_file(root.join("second.json")).unwrap();
+        app.catalog.refresh_lessons();
+        assert_eq!(app.current_label(), "first");
+        fs::write(root.join("second.json"), lesson("second")).unwrap();
+        app.catalog.refresh_lessons();
+        assert_eq!(app.current_label(), "second");
+        app.start();
+        app.type_input_char('a', 1);
+        app.stop();
+        app.accept_result();
+        assert_eq!(app.users.active_records().len(), 1);
+        fs::remove_file(profile_path).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
