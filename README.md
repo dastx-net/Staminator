@@ -18,7 +18,7 @@ This might sound excessive, but we have AI agents now, and they need typing prac
 
 Staminator is a work in progress for Windows. It already has Russian and English exercises, five practice modes, user profiles, results, a lesson editor, and a separate on-screen keyboard. It also supports practice with an external UTF-8 text file.
 
-The application does not yet match every feature or behavior of the original. See the [implementation plan](docs/implementation-plan.md) for progress and [research notes](docs/research.md) for details about Stamina.
+The application does not yet match every feature or behavior of the original. See the [task plans](docs/plan/README.md) for progress and [research notes](docs/research.md) for details about Stamina.
 
 ## Run from source
 
