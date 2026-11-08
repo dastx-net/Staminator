@@ -1,6 +1,4 @@
-use egui::{
-    Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, Rect, TextureHandle, Ui, Vec2,
-};
+use egui::{Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, Rect, Ui, Vec2};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -39,35 +37,9 @@ fn add_text_font(fonts: &mut FontDefinitions, font_path: Option<&Path>) -> bool 
     loaded
 }
 
-fn background_uv(image_size: Vec2, viewport_size: Vec2) -> Option<Rect> {
-    if image_size.x <= 0.0
-        || image_size.y <= 0.0
-        || viewport_size.x <= 0.0
-        || viewport_size.y <= 0.0
-    {
-        return None;
-    }
-    let view_aspect = viewport_size.x / viewport_size.y.max(1.0);
-    let image_aspect = image_size.x / image_size.y;
-    Some(if image_aspect > view_aspect {
-        let width = view_aspect / image_aspect;
-        Rect::from_min_max(
-            egui::pos2((1.0 - width) * 0.5, 0.0),
-            egui::pos2((1.0 + width) * 0.5, 1.0),
-        )
-    } else {
-        let height = image_aspect / view_aspect;
-        Rect::from_min_max(
-            egui::pos2(0.0, (1.0 - height) * 0.5),
-            egui::pos2(1.0, (1.0 + height) * 0.5),
-        )
-    })
-}
-
 /// Draws the focused typing view across the full available egui panel.
 pub fn draw_training(
     ui: &mut Ui,
-    background: Option<&TextureHandle>,
     text: &str,
     position: usize,
     elapsed_ms: u64,
@@ -77,17 +49,7 @@ pub fn draw_training(
     let rect = ui.max_rect();
     let painter = ui.painter().with_clip_rect(rect);
 
-    if let Some(texture) = background {
-        let size = texture.size_vec2();
-        // Crop the texture to cover the viewport without distorting its aspect ratio.
-        if let Some(uv) = background_uv(size, rect.size()) {
-            painter.image(texture.id(), rect, uv, Color32::WHITE);
-        } else {
-            painter.rect_filled(rect, 0.0, Color32::from_rgb(67, 76, 82));
-        }
-    } else {
-        painter.rect_filled(rect, 0.0, Color32::from_rgb(67, 76, 82));
-    }
+    painter.rect_filled(rect, 0.0, Color32::from_rgb(67, 76, 82));
 
     let band_height = 100.0_f32.min(rect.height().max(1.0));
     let band = Rect::from_center_size(
@@ -188,7 +150,7 @@ fn visible_range(text_len: usize, position: usize, visible_count: usize) -> (usi
 
 #[cfg(test)]
 mod tests {
-    use super::{TEXT_FONT, add_text_font, background_uv, draw_training, visible_range};
+    use super::{TEXT_FONT, add_text_font, draw_training, visible_range};
     use egui::{Context, FontDefinitions, FontFamily, RawInput, Rect, Vec2};
     use std::{
         fs,
@@ -231,47 +193,6 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
-    #[test]
-    fn background_crop_uv_covers_viewport_without_distorting_aspect() {
-        let wide = background_uv(Vec2::new(2.0, 1.0), Vec2::new(1.0, 1.0)).unwrap();
-        assert_eq!(
-            wide,
-            Rect::from_min_max(egui::pos2(0.25, 0.0), egui::pos2(0.75, 1.0))
-        );
-
-        let tall = background_uv(Vec2::new(1.0, 2.0), Vec2::new(1.0, 1.0)).unwrap();
-        assert_eq!(
-            tall,
-            Rect::from_min_max(egui::pos2(0.0, 0.25), egui::pos2(1.0, 0.75))
-        );
-        assert!(background_uv(Vec2::ZERO, Vec2::new(1.0, 1.0)).is_none());
-    }
-
-    #[test]
-    fn headless_training_paints_isolated_background_texture() {
-        let ctx = Context::default();
-        let texture = ctx.load_texture(
-            "training-test-background",
-            egui::ColorImage::filled([16, 8], egui::Color32::from_rgb(10, 20, 30)),
-            egui::TextureOptions::NEAREST,
-        );
-        let mut output = ctx.run_ui(
-            RawInput {
-                screen_rect: Some(Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    Vec2::new(800.0, 400.0),
-                )),
-                ..Default::default()
-            },
-            |ui| draw_training(ui, Some(&texture), "test", 0, 0, "test", None),
-        );
-        let is_background_mesh = output.shapes.first().is_some_and(|clipped| {
-            matches!(&clipped.shape, egui::Shape::Mesh(mesh) if mesh.texture_id == texture.id())
-        });
-        output.textures_delta.clear();
-        assert!(is_background_mesh);
-    }
-
     fn paint(
         text: &str,
         position: usize,
@@ -288,8 +209,14 @@ mod tests {
                 )),
                 ..Default::default()
             },
-            |ui| draw_training(ui, None, text, position, elapsed_ms, profile, prompt),
+            |ui| draw_training(ui, text, position, elapsed_ms, profile, prompt),
         );
+        assert!(matches!(
+            output.shapes.first().map(|clipped| &clipped.shape),
+            Some(egui::Shape::Rect(rect))
+                if rect.fill == egui::Color32::from_rgb(67, 76, 82)
+                    && rect.rect.size() == Vec2::new(800.0, 400.0)
+        ));
         let shapes = format!("{:?}", output.shapes);
         output.textures_delta.clear();
         shapes
@@ -313,7 +240,7 @@ mod tests {
                 screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1.0, 1.0))),
                 ..Default::default()
             },
-            |ui| draw_training(ui, None, "", usize::MAX, 999, "", Some("")),
+            |ui| draw_training(ui, "", usize::MAX, 999, "", Some("")),
         );
         output.textures_delta.clear();
         assert!(!output.shapes.is_empty());

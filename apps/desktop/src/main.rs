@@ -188,7 +188,6 @@ struct StaminatorApp {
     phrase_sequence: Option<generated_modes::PhraseSequence>,
     started_at: Instant,
     last_result: Option<staminator_core::SessionStats>,
-    background: Option<egui::TextureHandle>,
     show_keyboard: bool,
     keyboard_setting_path: Option<PathBuf>,
     result_open: bool,
@@ -223,18 +222,6 @@ impl StaminatorApp {
     }
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         training_view::install_text_font(&cc.egui_ctx);
-        let background_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../src/stamina_setup/Skins/Field.jpg");
-        let background = image::open(background_path).ok().map(|image| {
-            let image = image.to_rgba8();
-            let size = [image.width() as usize, image.height() as usize];
-            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
-            cc.egui_ctx.load_texture(
-                "training-background",
-                color_image,
-                egui::TextureOptions::LINEAR,
-            )
-        });
         let keyboard_setting_path = keyboard_setting_path();
         let mut show_keyboard = load_keyboard_setting_from(keyboard_setting_path.as_deref());
         let (users, load_error) = match UserStore::load() {
@@ -293,7 +280,6 @@ impl StaminatorApp {
         }
         let mut app = Self::from_parts(
             catalog,
-            background,
             show_keyboard,
             keyboard_setting_path,
             users,
@@ -306,7 +292,6 @@ impl StaminatorApp {
 
     fn from_parts(
         catalog: ContentCatalog,
-        background: Option<egui::TextureHandle>,
         show_keyboard: bool,
         keyboard_setting_path: Option<PathBuf>,
         users: UserStore,
@@ -347,7 +332,6 @@ impl StaminatorApp {
             phrase_sequence: None,
             started_at: Instant::now(),
             last_result: None,
-            background,
             show_keyboard,
             keyboard_setting_path,
             result_open: false,
@@ -1931,7 +1915,6 @@ impl StaminatorApp {
             .show(root, |ui| {
                 training_view::draw_training(
                     ui,
-                    self.background.as_ref(),
                     if snapshot.as_ref().is_some_and(|s| {
                         matches!(s.state, SessionState::Ready | SessionState::Running)
                     }) {
@@ -2375,7 +2358,6 @@ mod tests {
     fn test_app(path: PathBuf) -> StaminatorApp {
         let mut app = StaminatorApp::from_parts(
             ContentCatalog::fixture(),
-            None,
             true,
             None,
             UserStore::new_at(path),
@@ -2394,7 +2376,6 @@ mod tests {
         let users = UserStore::load_database(path, &legacy).unwrap();
         StaminatorApp::from_parts(
             ContentCatalog::fixture_empty(),
-            None,
             true,
             None,
             users,
