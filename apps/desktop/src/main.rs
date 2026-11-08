@@ -184,6 +184,7 @@ struct StaminatorApp {
     progress_open: bool,
     profile_name_input: String,
     profile_error: String,
+    lesson_transfer_error: String,
 }
 
 impl StaminatorApp {
@@ -320,6 +321,7 @@ impl StaminatorApp {
             progress_open: false,
             profile_name_input: String::new(),
             profile_error,
+            lesson_transfer_error: String::new(),
         }
     }
 
@@ -955,6 +957,7 @@ impl StaminatorApp {
         editor.lesson = lesson;
         self.lesson_editor = Some(editor);
         self.chooser_open = false;
+        self.lesson_transfer_error.clear();
         Ok(())
     }
 
@@ -989,6 +992,7 @@ impl StaminatorApp {
         let mut add_phrases = false;
         let mut import_lesson = false;
         let mut export_lesson = false;
+        let mut clear_error = false;
         let current = self.current_index();
         egui::Window::new(if self.selected_mode == TrainingMode::Lessons {
             "Выбор урока"
@@ -999,6 +1003,10 @@ impl StaminatorApp {
         .default_size([620.0, 470.0])
         .show(ctx, |ui| {
             if self.selected_mode == TrainingMode::Lessons {
+                if !self.lesson_transfer_error.is_empty() {
+                    ui.colored_label(egui::Color32::RED, &self.lesson_transfer_error);
+                    clear_error = ui.button("Очистить сообщение").clicked();
+                }
                 ui.horizontal(|ui| {
                     refresh = ui.button("Обновить список уроков").clicked();
                     create = ui.button("Создать урок").clicked();
@@ -1045,22 +1053,33 @@ impl StaminatorApp {
             );
         });
         self.chooser_open = open;
+        if clear_error {
+            self.lesson_transfer_error.clear();
+        }
         if import_lesson
             && let Some(path) = rfd::FileDialog::new()
                 .add_filter("JSON", &["json"])
                 .pick_file()
-            && let Err(error) = self.import_lesson_from(&path)
         {
-            self.profile_error = format!("Не удалось импортировать урок: {error}");
+            match self.import_lesson_from(&path) {
+                Ok(()) => self.lesson_transfer_error.clear(),
+                Err(error) => {
+                    self.lesson_transfer_error = format!("Не удалось импортировать урок: {error}")
+                }
+            }
         }
         if export_lesson
             && let Some(path) = rfd::FileDialog::new()
                 .add_filter("JSON", &["json"])
                 .set_file_name("lesson.json")
                 .save_file()
-            && let Err(error) = self.export_lesson_to(current, &path)
         {
-            self.profile_error = format!("Не удалось экспортировать урок: {error}");
+            match self.export_lesson_to(current, &path) {
+                Ok(()) => self.lesson_transfer_error.clear(),
+                Err(error) => {
+                    self.lesson_transfer_error = format!("Не удалось экспортировать урок: {error}")
+                }
+            }
         }
         if create {
             self.lesson_editor = Some(content_editor::LessonEditor::new(
@@ -1137,15 +1156,28 @@ impl StaminatorApp {
                         self.catalog.lesson_id(language, 0).map(str::to_owned);
                 }
             }
-            if let Ok(Some(database)) = self.users.database() {
-                match database.list_lessons() {
-                    Ok(lessons) => self.catalog.set_stored_lessons(lessons),
-                    Err(error) => {
-                        self.profile_error = format!("Не удалось загрузить уроки: {error}")
+            match self.users.database() {
+                Ok(Some(mut database)) => {
+                    let mut refreshed_catalog = self.catalog.clone();
+                    refreshed_catalog.refresh_lessons();
+                    match sync_catalog_with_database(&mut refreshed_catalog, &mut database) {
+                        Ok(()) => {
+                            self.catalog = refreshed_catalog;
+                            self.lesson_transfer_error.clear();
+                        }
+                        Err(error) => {
+                            self.lesson_transfer_error =
+                                format!("Не удалось загрузить уроки: {error}");
+                        }
                     }
                 }
-            } else {
-                self.catalog.refresh_lessons();
+                Ok(None) => {
+                    self.catalog.refresh_lessons();
+                    self.lesson_transfer_error.clear();
+                }
+                Err(error) => {
+                    self.lesson_transfer_error = format!("Не удалось открыть базу уроков: {error}");
+                }
             }
             self.session = None;
             self.last_result = None;
@@ -1982,8 +2014,12 @@ mod tests {
         let lesson_path = root.join("lesson.json");
         app.export_lesson_to(0, &lesson_path).unwrap();
         assert!(app.export_lesson_to(0, &lesson_path).is_err());
+        app.chooser_open = true;
+        app.lesson_transfer_error = "Ошибка переноса".into();
         app.import_lesson_from(&lesson_path).unwrap();
         assert_eq!(app.lesson_editor.as_ref().unwrap().lesson, lesson);
+        assert!(!app.chooser_open);
+        assert!(app.lesson_transfer_error.is_empty());
         let missing = root.join("missing.json");
         assert!(app.import_lesson_from(&missing).is_err());
         assert_eq!(app.lesson_editor.as_ref().unwrap().lesson.id, "exported");
@@ -3666,6 +3702,60 @@ mod tests {
     }
 
     #[test]
+    fn accessible_lesson_chooser_shows_and_clears_transfer_error() {
+        let mut app = test_app(test_path());
+        app.selected_mode = TrainingMode::Lessons;
+        app.chooser_open = true;
+        app.show_keyboard = false;
+        app.lesson_transfer_error = "Не удалось импортировать урок: неверный JSON".into();
+        app.profile_error = "Не удалось загрузить профиль".into();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        let initial = draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        assert!(initial.iter().chain(nodes.iter()).any(|(_, node)| {
+            node.value() == Some("Не удалось импортировать урок: неверный JSON")
+        }));
+        let clear = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Очистить сообщение"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(clear)]);
+
+        assert!(app.lesson_transfer_error.is_empty());
+        assert_eq!(app.profile_error, "Не удалось загрузить профиль");
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        assert!(
+            !nodes
+                .iter()
+                .any(|(_, node)| node.value()
+                    == Some("Не удалось импортировать урок: неверный JSON"))
+        );
+    }
+
+    #[test]
+    fn phrase_chooser_does_not_show_lesson_transfer_errors() {
+        let mut app = test_app(test_path());
+        app.selected_mode = TrainingMode::Phrases;
+        app.chooser_open = true;
+        app.show_keyboard = false;
+        app.lesson_transfer_error = "Ошибка урока".into();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let first = draw_accessible(&mut app, &ctx, vec![]);
+        let second = draw_accessible(&mut app, &ctx, vec![]);
+        assert!(
+            !first
+                .iter()
+                .chain(second.iter())
+                .any(|(_, node)| node.value() == Some("Ошибка урока"))
+        );
+        assert_eq!(app.lesson_transfer_error, "Ошибка урока");
+    }
+
+    #[test]
     fn accessible_lesson_refresh_shows_errors_and_keeps_selection() {
         let root = test_path().with_extension("");
         fs::create_dir_all(&root).unwrap();
@@ -3679,6 +3769,7 @@ mod tests {
         app.selected_mode = TrainingMode::Lessons;
         app.content_language = ContentLanguage::English;
         app.chooser_open = true;
+        app.lesson_transfer_error = "Старая ошибка".into();
         app.show_keyboard = false;
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -3692,10 +3783,119 @@ mod tests {
         fs::write(root.join("a.json"), file("a")).unwrap();
         fs::write(root.join("bad.json"), "{").unwrap();
         draw_accessible(&mut app, &ctx, vec![accessible_click(refresh)]);
+        assert!(app.lesson_transfer_error.is_empty());
         assert_eq!(app.current_label(), "b");
         assert!(app.catalog.lesson_diagnostics().contains("bad.json"));
         draw_accessible(&mut app, &ctx, vec![]);
         assert_eq!(app.catalog.lessons(ContentLanguage::English).len(), 2);
+        fs::write(root.join("bad.json"), file("bad")).unwrap();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let refresh = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Обновить список уроков"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(refresh)]);
+        assert!(app.catalog.lesson_diagnostics().is_empty());
+        assert_eq!(app.catalog.lessons(ContentLanguage::English).len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sqlite_chooser_shows_file_error_until_successful_refresh() {
+        let root = test_path().with_extension("sqlite-chooser-diagnostics");
+        let lesson_dir = root.join("lessons");
+        fs::create_dir_all(&lesson_dir).unwrap();
+        let broken = lesson_dir.join("broken.json");
+        fs::write(&broken, "{").unwrap();
+        let mut app = database_test_app(root.join("profiles.sqlite3"));
+        let mut db = app.users.database().unwrap().unwrap();
+        let saved = stamina_data::JsonLesson {
+            version: 1,
+            id: "saved".into(),
+            title: "Saved".into(),
+            language: "en".into(),
+            description: None,
+            text: "abc".into(),
+        };
+        db.create_user_lesson(&saved).unwrap();
+        app.catalog.set_lesson_roots(vec![lesson_dir.clone()]);
+        sync_catalog_with_database(&mut app.catalog, &mut db).unwrap();
+        assert!(app.catalog.lesson_diagnostics().contains("broken.json"));
+        assert_eq!(
+            app.catalog.lessons(ContentLanguage::English)[0].name,
+            "Saved"
+        );
+        drop(db);
+        app.selected_mode = TrainingMode::Lessons;
+        app.content_language = ContentLanguage::English;
+        app.chooser_open = true;
+        app.show_keyboard = false;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let initial = draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        assert!(initial.iter().chain(nodes.iter()).any(|(_, node)| {
+            node.value()
+                .is_some_and(|label| label.contains("broken.json"))
+        }));
+        fs::write(
+            &broken,
+            r#"{"version":1,"id":"fixed","title":"Fixed","language":"en","text":"abc"}"#,
+        )
+        .unwrap();
+        let refresh = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Обновить список уроков"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(refresh)]);
+        assert!(app.catalog.lesson_diagnostics().is_empty());
+        assert_eq!(app.catalog.lessons(ContentLanguage::English).len(), 2);
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sqlite_refresh_keeps_displayed_lessons_if_database_cannot_open() {
+        let root = test_path().with_extension("sqlite-refresh-error");
+        fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("profiles.sqlite3");
+        let mut app = database_test_app(database_path.clone());
+        let saved = stamina_data::JsonLesson {
+            version: 1,
+            id: "saved".into(),
+            title: "Saved".into(),
+            language: "en".into(),
+            description: None,
+            text: "abc".into(),
+        };
+        app.catalog.set_stored_lessons(vec![(saved, false)]);
+        fs::remove_file(&database_path).unwrap();
+        fs::create_dir(&database_path).unwrap();
+        app.selected_mode = TrainingMode::Lessons;
+        app.content_language = ContentLanguage::English;
+        app.chooser_open = true;
+        app.show_keyboard = false;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let refresh = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Обновить список уроков"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(refresh)]);
+        assert_eq!(
+            app.catalog.lessons(ContentLanguage::English)[0].name,
+            "Saved"
+        );
+        assert!(
+            app.lesson_transfer_error
+                .contains("Не удалось открыть базу уроков")
+        );
+        drop(app);
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -284,16 +284,6 @@ impl Database {
         if source_abs == target_abs || safety_backup_path.exists() {
             return Err(StorageError::Sql(rusqlite::Error::InvalidQuery));
         }
-        let safety_abs = if safety_backup_path.exists() {
-            Some(std::fs::canonicalize(safety_backup_path)?)
-        } else {
-            None
-        };
-        if safety_abs.as_deref() == Some(source_abs.as_path())
-            || safety_abs.as_deref() == Some(target_abs.as_path())
-        {
-            return Err(StorageError::Sql(rusqlite::Error::InvalidQuery));
-        }
         let source =
             Connection::open_with_flags(restore_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let source_revision = snapshot_revision(&source)?;
@@ -825,6 +815,14 @@ mod tests {
             destination.load_snapshot().unwrap().profiles[0].id,
             "current"
         );
+        std::fs::write(&safety, b"existing backup").unwrap();
+        assert!(destination.restore_from(&source_path, 1, &safety).is_err());
+        assert_eq!(std::fs::read(&safety).unwrap(), b"existing backup");
+        assert_eq!(
+            destination.load_snapshot().unwrap().profiles[0].id,
+            "current"
+        );
+        std::fs::remove_file(&safety).unwrap();
         assert_eq!(
             destination.restore_from(&source_path, 1, &safety).unwrap(),
             2

@@ -313,7 +313,6 @@ impl ContentCatalog {
                 text: lesson.text.clone(),
             });
         }
-        self.lesson_diagnostics.clear();
     }
 
     pub fn stored_lessons(&self) -> &[(stamina_data::storage::LessonDocument, bool)] {
@@ -822,6 +821,32 @@ mod tests {
             catalog.lesson_id(ContentLanguage::English, 0),
             Some("db-built-in")
         );
+    }
+
+    #[test]
+    fn database_catalog_keeps_file_errors_until_the_files_are_refreshed() {
+        let root = temp_file("database-diagnostics");
+        fs::create_dir_all(&root).unwrap();
+        let broken = root.join("broken.json");
+        fs::write(&broken, "{not valid json}").unwrap();
+        let mut catalog = ContentCatalog::fixture_empty();
+        catalog.set_lesson_roots(vec![root.clone()]);
+        assert!(catalog.lesson_diagnostics().contains("broken.json"));
+        let lesson = stamina_data::storage::LessonDocument {
+            version: 1,
+            id: "saved".into(),
+            title: "Saved".into(),
+            language: "en".into(),
+            description: None,
+            text: "text".into(),
+        };
+        catalog.set_stored_lessons(vec![(lesson, true)]);
+        assert_eq!(catalog.lessons(ContentLanguage::English)[0].name, "Saved");
+        assert!(catalog.lesson_diagnostics().contains("broken.json"));
+        fs::remove_file(broken).unwrap();
+        catalog.refresh_lessons();
+        assert!(catalog.lesson_diagnostics().is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
