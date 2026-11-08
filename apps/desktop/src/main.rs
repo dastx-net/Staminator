@@ -103,7 +103,9 @@ fn sync_catalog_with_database(
             .filter(|(_, built_in)| *built_in)
             .map(|(lesson, _)| lesson.clone())
             .collect::<Vec<_>>();
-        database.sync_builtin_lessons(&builtin)?;
+        if !builtin.is_empty() {
+            database.sync_builtin_lessons(&builtin)?;
+        }
     }
     let lessons = database.list_lessons()?;
     if lessons.is_empty() && !catalog.lesson_diagnostics().is_empty() {
@@ -219,6 +221,7 @@ struct StaminatorApp {
     selected_lessons: [Option<String>; 2],
     chooser_open: bool,
     chooser_filter: String,
+    chooser_preview: Option<usize>,
     lesson_editor: Option<content_editor::LessonEditor>,
     phrase_editor: Option<content_editor::PhraseEditor>,
     external_path: Option<PathBuf>,
@@ -370,6 +373,7 @@ impl StaminatorApp {
             selected_lessons: [None, None],
             chooser_open: false,
             chooser_filter: String::new(),
+            chooser_preview: None,
             lesson_editor: None,
             phrase_editor: None,
             external_path: None,
@@ -1239,7 +1243,19 @@ impl StaminatorApp {
         let mut import_lesson = false;
         let mut export_lesson = false;
         let mut clear_error = false;
-        let current = self.current_index();
+        let filter = self.chooser_filter.trim().to_lowercase();
+        let matches: Vec<_> = self
+            .items()
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| filter.is_empty() || item.name.to_lowercase().contains(&filter))
+            .map(|(index, item)| (index, item.name.chars().take(85).collect::<String>()))
+            .collect();
+        let current = self
+            .chooser_preview
+            .or_else(|| Some(self.current_index()))
+            .filter(|index| matches.iter().any(|(candidate, _)| candidate == index))
+            .or_else(|| matches.first().map(|(index, _)| *index));
         egui::Window::new(if self.selected_mode == TrainingMode::Lessons {
             localization::tr("chooser.lessons_title")
         } else {
@@ -1256,11 +1272,21 @@ impl StaminatorApp {
                 ui.horizontal(|ui| {
                     refresh = ui.button(localization::tr("refresh-lessons")).clicked();
                     create = ui.button(localization::tr("create-lesson")).clicked();
-                    edit = ui.button(localization::tr("edit-lesson")).clicked();
+                    edit = ui
+                        .add_enabled(
+                            current.is_some(),
+                            egui::Button::new(localization::tr("edit-lesson")),
+                        )
+                        .clicked();
                 });
                 ui.horizontal(|ui| {
                     import_lesson = ui.button(localization::tr("lesson-import")).clicked();
-                    export_lesson = ui.button(localization::tr("lesson-export")).clicked();
+                    export_lesson = ui
+                        .add_enabled(
+                            current.is_some(),
+                            egui::Button::new(localization::tr("lesson-export")),
+                        )
+                        .clicked();
                 });
                 if let Some(path) = self.catalog.user_lesson_path() {
                     ui.label(localization::format(
@@ -1276,33 +1302,53 @@ impl StaminatorApp {
                 add_phrases = ui.button(localization::tr("add-phrases")).clicked();
             }
             ui.text_edit_singleline(&mut self.chooser_filter);
-            let filter = self.chooser_filter.trim().to_lowercase();
-            let matches: Vec<_> = self
-                .items()
-                .iter()
-                .enumerate()
-                .filter(|(_, item)| filter.is_empty() || item.name.to_lowercase().contains(&filter))
-                .map(|(index, item)| (index, item.name.chars().take(85).collect::<String>()))
-                .collect();
             ui.label(localization::format(
                 "chooser.matches",
-                &FormatArgs::new().insert("count", matches.len()),
+                &FormatArgs::new().count(matches.len() as i64),
             ));
-            egui::ScrollArea::vertical().max_height(385.0).show_rows(
-                ui,
-                24.0,
-                matches.len(),
-                |ui, range| {
-                    for (index, name) in &matches[range] {
-                        if ui
-                            .selectable_label(*index == current, format!("{}. {}", index + 1, name))
-                            .clicked()
+            ui.columns(2, |columns| {
+                egui::ScrollArea::vertical()
+                    .id_salt("chooser_list")
+                    .max_height(300.0)
+                    .show_rows(&mut columns[0], 24.0, matches.len(), |ui, range| {
+                        for (index, name) in &matches[range] {
+                            let response = ui.selectable_label(
+                                Some(*index) == current,
+                                format!("{}. {}", index + 1, name),
+                            );
+                            if response.double_clicked() {
+                                chosen = Some(*index);
+                            } else if response.clicked() {
+                                self.chooser_preview = Some(*index);
+                            }
+                        }
+                    });
+                if let Some((current, item)) =
+                    current.and_then(|index| self.items().get(index).map(|item| (index, item)))
+                {
+                    columns[1].heading(&item.name);
+                    if self.selected_mode == TrainingMode::Lessons {
+                        if let Some((lesson, _)) = self
+                            .catalog
+                            .lesson_id(self.language(), current)
+                            .and_then(|id| self.catalog.lesson_document(id))
                         {
-                            chosen = Some(*index);
+                            if let Some(description) = &lesson.description {
+                                columns[1].label(description);
+                            }
                         }
                     }
-                },
-            );
+                    egui::ScrollArea::vertical()
+                        .id_salt("chooser_preview")
+                        .max_height(240.0)
+                        .show(&mut columns[1], |ui| {
+                            ui.label(&item.text);
+                        });
+                    if columns[1].button(localization::tr("choose")).clicked() {
+                        chosen = Some(current);
+                    }
+                }
+            });
         });
         self.chooser_open = open;
         if clear_error {
@@ -1321,6 +1367,7 @@ impl StaminatorApp {
             }
         }
         if export_lesson
+            && let Some(current) = current
             && let Some(path) = rfd::FileDialog::new()
                 .add_filter("JSON", &["json"])
                 .set_file_name("lesson.json")
@@ -1343,7 +1390,7 @@ impl StaminatorApp {
             ));
             self.chooser_open = false;
         }
-        if edit {
+        if edit && let Some(current) = current {
             let id = self.catalog.lesson_id(self.language(), current);
             if let Ok(Some(_)) = self.users.database() {
                 let mut editor = content_editor::LessonEditor::new(
@@ -1354,11 +1401,10 @@ impl StaminatorApp {
                     },
                 );
                 match id.and_then(|id| self.catalog.lesson_document(id)) {
-                    Some((lesson, false)) => {
+                    Some((lesson, _)) => {
                         editor.lesson = lesson.clone();
                         editor.path = Some(PathBuf::from(&lesson.id));
                     }
-                    Some(_) => editor.error = localization::tr("lesson.builtin_edit"),
                     None => editor.error = localization::tr("lesson.choose_first"),
                 }
                 self.lesson_editor = Some(editor);
@@ -1439,6 +1485,7 @@ impl StaminatorApp {
             self.select_content(index);
             self.chooser_open = false;
             self.chooser_filter.clear();
+            self.chooser_preview = None;
         }
     }
 
@@ -1478,9 +1525,6 @@ impl StaminatorApp {
                                 .lesson(&editor.lesson.id)
                                 .map_err(|e| localization::storage_error(&e))?
                             {
-                                Some((_, true)) => {
-                                    return Err(localization::tr("lesson.builtin_error"));
-                                }
                                 Some(_) if old_id.is_none() => {
                                     return Err(localization::tr("lesson.id_exists"));
                                 }
@@ -1843,6 +1887,7 @@ impl StaminatorApp {
                                 )
                                 .clicked();
                             if russian || english {
+                                self.chooser_preview = None;
                                 let value = if self.content_language == ContentLanguage::English {
                                     "EN"
                                 } else {
@@ -1877,87 +1922,58 @@ impl StaminatorApp {
                         });
                     });
                 });
-                ui.menu_button(localization::tr("exercise"), |ui| {
-                    ui.add_enabled_ui(!active, |ui| {
-                        if self.content_mode() {
-                            if ui.button(localization::tr("choose")).clicked() {
-                                self.chooser_open = true;
-                                self.chooser_filter.clear();
-                                ui.close();
-                            }
-                            if ui
-                                .add_enabled(
-                                    current_index > 0,
-                                    egui::Button::new(localization::tr("previous")),
-                                )
-                                .clicked()
-                            {
-                                self.select_content(current_index - 1);
-                                ui.close();
-                            }
-                            if ui
-                                .add_enabled(
-                                    current_index + 1 < content_count,
-                                    egui::Button::new(localization::tr("next")),
-                                )
-                                .clicked()
-                            {
-                                self.select_content(current_index + 1);
-                                ui.close();
-                            }
-                            ui.separator();
-                            ui.label(localization::format(
-                                "chooser.counter",
-                                &FormatArgs::new()
-                                    .insert(
-                                        "current",
-                                        if content_count == 0 {
-                                            0
-                                        } else {
-                                            current_index + 1
-                                        },
-                                    )
-                                    .insert("total", content_count),
-                            ));
-                        } else if self.selected_mode == TrainingMode::ExternalText {
-                            if ui.button(localization::tr("open-text")).clicked() {
-                                self.choose_external_text();
-                                ui.close();
-                            }
-                            if self.external_file_changed {
-                                if ui
-                                    .button(localization::tr("file.restart_changed"))
-                                    .clicked()
-                                    && let Some(path) = self
-                                        .users
-                                        .active_profile()
-                                        .and_then(|p| p.external_text.as_ref())
-                                        .map(|p| p.path.clone())
-                                {
-                                    self.load_external_text(path);
+                if self.content_mode() {
+                    if ui
+                        .add_enabled(!active, egui::Button::new(localization::tr("exercise")))
+                        .clicked()
+                    {
+                        self.chooser_open = true;
+                        self.chooser_filter.clear();
+                        self.chooser_preview = None;
+                    }
+                } else {
+                    ui.menu_button(localization::tr("exercise"), |ui| {
+                        ui.add_enabled_ui(!active, |ui| {
+                            if self.selected_mode == TrainingMode::ExternalText {
+                                if ui.button(localization::tr("open-text")).clicked() {
+                                    self.choose_external_text();
                                     ui.close();
                                 }
-                            } else if let Some(source) = &self.external_source {
-                                let mut position = self.external_start;
-                                let length = source.char_count();
-                                if ui
-                                    .add(
-                                        egui::Slider::new(&mut position, 0..=length)
-                                            .text(localization::tr("position")),
-                                    )
-                                    .changed()
-                                {
-                                    self.set_external_position(position);
+                                if self.external_file_changed {
+                                    if ui
+                                        .button(localization::tr("file.restart_changed"))
+                                        .clicked()
+                                        && let Some(path) = self
+                                            .users
+                                            .active_profile()
+                                            .and_then(|p| p.external_text.as_ref())
+                                            .map(|p| p.path.clone())
+                                    {
+                                        self.load_external_text(path);
+                                        ui.close();
+                                    }
+                                } else if let Some(source) = &self.external_source {
+                                    let mut position = self.external_start;
+                                    let length = source.char_count();
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(&mut position, 0..=length)
+                                                .text(localization::tr("position")),
+                                        )
+                                        .changed()
+                                    {
+                                        self.set_external_position(position);
+                                    }
                                 }
+                                if !self.external_error.is_empty() {
+                                    ui.colored_label(egui::Color32::RED, &self.external_error);
+                                }
+                            } else {
+                                ui.label(localization::tr("generated-on-start"));
                             }
-                            if !self.external_error.is_empty() {
-                                ui.colored_label(egui::Color32::RED, &self.external_error);
-                            }
-                        } else {
-                            ui.label(localization::tr("generated-on-start"));
-                        }
+                        });
                     });
-                });
+                }
                 if ui.button(localization::tr("progress")).clicked() {
                     self.progress_open = true;
                 }
@@ -2130,7 +2146,7 @@ impl StaminatorApp {
                     ui.label(localization::format(
                         "metric.errors",
                         &FormatArgs::new()
-                            .insert("count", stats.errors)
+                            .count(stats.errors as i64)
                             .insert("percent", format!("{:.1}", stats.error_percent)),
                     ));
                     ui.separator();
@@ -2358,6 +2374,39 @@ mod tests {
             catalog.lesson_groups().get("custom").map(String::as_str),
             Some("practice")
         );
+        drop(database);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_builtin_directory_preserves_stored_lessons() {
+        let root = test_path().with_extension("missing-builtin");
+        let user = root.join("user");
+        fs::create_dir_all(&user).unwrap();
+        let lesson = stamina_data::JsonLesson {
+            version: 1,
+            id: "old".into(),
+            title: "Old".into(),
+            language: "en".into(),
+            description: None,
+            text: "abc".into(),
+        };
+        let mut database = stamina_data::storage::Database::open(root.join("db.sqlite3")).unwrap();
+        database.save_lesson(&lesson, true).unwrap();
+        let custom = stamina_data::JsonLesson {
+            id: "custom".into(),
+            ..lesson
+        };
+        fs::write(
+            user.join("custom.json"),
+            serde_json::to_vec(&custom).unwrap(),
+        )
+        .unwrap();
+        let mut catalog = ContentCatalog::fixture_empty();
+        catalog.set_lesson_roots(vec![root.join("missing"), user]);
+        sync_catalog_with_database(&mut catalog, &mut database).unwrap();
+        assert!(database.lesson("old").unwrap().is_some());
+        assert!(database.lesson("custom").unwrap().is_some());
         drop(database);
         fs::remove_dir_all(root).unwrap();
     }
@@ -3178,13 +3227,24 @@ mod tests {
             .unwrap()
             .0;
         draw_accessible(&mut app, &ctx, vec![accessible_click(edit)]);
-        assert!(
-            app.lesson_editor
-                .as_ref()
-                .unwrap()
-                .error
-                .contains("Встроенный урок")
-        );
+        assert_eq!(app.lesson_editor.as_ref().unwrap().lesson.text, "original");
+        app.lesson_editor.as_mut().unwrap().lesson.text = "user edit".into();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let save = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Сохранить урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(save)]);
+        let mut db = app.users.database().unwrap().unwrap();
+        db.sync_builtin_lessons(&[built_in]).unwrap();
+        assert_eq!(db.lesson("protected").unwrap().unwrap().0.text, "user edit");
+        drop(db);
+        let reopened = stamina_data::storage::Database::open(&database_path).unwrap();
+        let (saved, built_in) = reopened.lesson("protected").unwrap().unwrap();
+        assert_eq!(saved.text, "user edit");
+        assert!(!built_in);
+        drop(reopened);
         app.lesson_editor = None;
 
         // A new document cannot take the ID of an existing user document.
@@ -4211,13 +4271,6 @@ mod tests {
             .unwrap()
             .0;
         draw_accessible(&mut app, &ctx, vec![accessible_click(menu)]);
-        let nodes = draw_accessible(&mut app, &ctx, vec![]);
-        let choose = nodes
-            .iter()
-            .find(|(_, n)| n.label() == Some("Выбрать…"))
-            .unwrap()
-            .0;
-        draw_accessible(&mut app, &ctx, vec![accessible_click(choose)]);
         assert!(app.chooser_open);
         let nodes = draw_accessible(&mut app, &ctx, vec![]);
         let lesson = nodes
@@ -4226,8 +4279,178 @@ mod tests {
             .unwrap()
             .0;
         draw_accessible(&mut app, &ctx, vec![accessible_click(lesson)]);
+        assert_eq!(app.current_label(), "EN home row");
+        assert!(app.chooser_open);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        assert_eq!(app.chooser_preview, Some(1));
+        let choose = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Выбрать…"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(choose)]);
         assert_eq!(app.current_label(), "EN words");
         assert!(!app.chooser_open);
+    }
+
+    #[test]
+    fn double_click_selects_and_closes_chooser() {
+        let mut app = test_app(test_path());
+        app.show_keyboard = false;
+        app.selected_mode = TrainingMode::Lessons;
+        app.content_language = ContentLanguage::English;
+        app.chooser_open = true;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let bounds = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("2. EN words"))
+            .unwrap()
+            .1
+            .bounds()
+            .unwrap();
+        let pos = egui::pos2(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        for _ in 0..2 {
+            draw_accessible(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            draw_accessible(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        assert_eq!(app.current_label(), "EN words");
+        assert!(!app.chooser_open);
+        assert_eq!(app.chooser_preview, None);
+    }
+
+    #[test]
+    fn chooser_filter_limits_preview_and_actions_to_matching_lessons() {
+        let mut app = test_app(test_path());
+        app.show_keyboard = false;
+        app.selected_mode = TrainingMode::Lessons;
+        app.content_language = ContentLanguage::English;
+        app.chooser_open = true;
+        app.chooser_filter = "words".into();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        assert!(
+            nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some("2. EN words"))
+        );
+        let choose = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Выбрать…"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(choose)]);
+        assert_eq!(app.current_label(), "EN words");
+        app.chooser_open = true;
+        app.chooser_filter = "no matching lesson".into();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        assert!(
+            !nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some("Выбрать…"))
+        );
+        for label in ["Изменить выбранный урок", "Экспорт урока…"]
+        {
+            assert!(
+                nodes
+                    .iter()
+                    .find(|(_, node)| node.label() == Some(label))
+                    .unwrap()
+                    .1
+                    .is_disabled()
+            );
+        }
+        assert_eq!(app.current_label(), "EN words");
+    }
+
+    #[test]
+    fn obsolete_lesson_selection_falls_back_and_starts_training() {
+        let mut app = test_app(test_path());
+        app.selected_mode = TrainingMode::Lessons;
+        app.content_language = ContentLanguage::English;
+        app.selected_lessons[1] = Some("obsolete.bundled.lesson".into());
+        assert_eq!(app.current_index(), 0);
+        assert_eq!(app.current_label(), "EN home row");
+        app.start();
+        assert!(app.session.is_some());
+        assert_eq!(app.session_text, "asdf jkl;");
+    }
+
+    #[test]
+    fn chooser_edits_the_previewed_lesson_without_selecting_it() {
+        let root = test_path();
+        let users = UserStore::load_database(root.with_extension("sqlite"), &root).unwrap();
+        let mut database = users.database().unwrap().unwrap();
+        let lesson = |id: &str, text: &str| stamina_data::JsonLesson {
+            version: 1,
+            id: id.into(),
+            title: id.into(),
+            language: "ru".into(),
+            description: Some(format!("Description {id}")),
+            text: text.into(),
+        };
+        database
+            .save_lesson(&lesson("first", "first text"), true)
+            .unwrap();
+        database
+            .save_lesson(&lesson("second", "second text"), true)
+            .unwrap();
+        let lessons = database.list_lessons().unwrap();
+        drop(database);
+        let mut app = test_app(test_path());
+        app.users = users;
+        app.show_keyboard = false;
+        app.selected_mode = TrainingMode::Lessons;
+        app.catalog.set_stored_lessons(lessons);
+        app.selected_lessons[0] = Some("first".into());
+        app.chooser_open = true;
+        app.chooser_preview = Some(1);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let edit = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some(localization::tr("edit-lesson").as_str()))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(edit)]);
+        let editor = app.lesson_editor.as_ref().unwrap();
+        assert_eq!(editor.lesson.id, "second");
+        assert_eq!(
+            editor.lesson.description.as_deref(),
+            Some("Description second")
+        );
+        assert_eq!(app.selected_lessons[0].as_deref(), Some("first"));
     }
 
     #[test]
@@ -4553,6 +4776,8 @@ mod tests {
         let mut app = test_app(path.clone());
         app.show_keyboard = false;
         app.selected_mode = TrainingMode::Lessons;
+        app.chooser_open = true;
+        app.chooser_preview = Some(1);
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
 
@@ -4578,6 +4803,7 @@ mod tests {
             .0;
         draw_accessible(&mut app, &ctx, vec![accessible_click(english)]);
 
+        assert_eq!(app.chooser_preview, None);
         assert_eq!(app.content_language, ContentLanguage::English);
         assert_eq!(app.users.active_profile().unwrap().content_language, "EN");
         assert_eq!(
@@ -4695,40 +4921,6 @@ mod tests {
             "Renamed"
         );
         fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn accessible_lesson_navigation_changes_selected_exercise() {
-        let mut app = test_app(test_path());
-        app.show_keyboard = false;
-        app.content_language = ContentLanguage::English;
-        app.selected_mode = TrainingMode::Lessons;
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        let nodes = draw_accessible(&mut app, &ctx, vec![]);
-        let menu = nodes
-            .iter()
-            .find(|(_, n)| n.label() == Some("Занятие"))
-            .unwrap()
-            .0;
-        draw_accessible(&mut app, &ctx, vec![accessible_click(menu)]);
-        let nodes = draw_accessible(&mut app, &ctx, vec![]);
-        let next = nodes
-            .iter()
-            .find(|(_, n)| n.label() == Some("Следующее"))
-            .unwrap()
-            .0;
-        draw_accessible(&mut app, &ctx, vec![accessible_click(next)]);
-        assert_eq!(app.current_label(), "EN words");
-        draw_accessible(&mut app, &ctx, vec![accessible_click(menu)]);
-        let nodes = draw_accessible(&mut app, &ctx, vec![]);
-        let previous = nodes
-            .iter()
-            .find(|(_, n)| n.label() == Some("Предыдущее"))
-            .unwrap()
-            .0;
-        draw_accessible(&mut app, &ctx, vec![accessible_click(previous)]);
-        assert_eq!(app.current_label(), "EN home row");
     }
 
     #[test]

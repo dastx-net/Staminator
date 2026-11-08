@@ -623,7 +623,7 @@ impl Database {
         )?;
         Ok(())
     }
-    /// Replace an existing user lesson. Built-in lessons are never updated.
+    /// Replace a lesson and preserve user edits across bundled lesson synchronization.
     pub fn update_user_lesson(
         &mut self,
         id: &str,
@@ -633,7 +633,7 @@ impl Database {
             return Err(StorageError::Sql(rusqlite::Error::InvalidQuery));
         }
         let changed = self.connection.execute(
-            "UPDATE lessons SET document=?1 WHERE id=?2 AND built_in=0",
+            "UPDATE lessons SET document=?1,built_in=0 WHERE id=?2",
             params![serde_json::to_string(lesson)?, id],
         )?;
         Ok(changed != 0)
@@ -641,9 +641,23 @@ impl Database {
     /// Insert missing built-ins and refresh only rows already marked built-in.
     pub fn sync_builtin_lessons(&mut self, lessons: &[LessonDocument]) -> Result<(), StorageError> {
         let tx = self.connection.transaction()?;
+        let mut ids = std::collections::HashSet::with_capacity(lessons.len());
         for lesson in lessons {
+            ids.insert(lesson.id.as_str());
             let document = serde_json::to_string(lesson)?;
             tx.execute("INSERT INTO lessons(id,document,built_in) VALUES(?1,?2,1) ON CONFLICT(id) DO UPDATE SET document=excluded.document WHERE lessons.built_in=1", params![lesson.id, document])?;
+        }
+        let stale = {
+            let mut query = tx.prepare("SELECT id FROM lessons WHERE built_in=1")?;
+            let rows = query
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        for id in stale {
+            if !ids.contains(id.as_str()) {
+                tx.execute("DELETE FROM lessons WHERE id=?1 AND built_in=1", [id])?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -1473,13 +1487,13 @@ mod tests {
             id: "built".into(),
             ..replacement.clone()
         };
-        assert!(!d.update_user_lesson("built", &builtin_update).unwrap());
+        assert!(d.update_user_lesson("built", &builtin_update).unwrap());
         d.sync_builtin_lessons(&[LessonDocument {
             text: "refreshed".into(),
             ..builtin.clone()
         }])
         .unwrap();
-        assert_eq!(d.lesson("built").unwrap().unwrap().0.text, "refreshed");
+        assert_eq!(d.lesson("built").unwrap(), Some((builtin_update, false)));
         d.sync_builtin_lessons(&[LessonDocument {
             text: "attacker".into(),
             ..lesson
@@ -2095,19 +2109,57 @@ mod tests {
             database.lesson("built-in").unwrap().unwrap().0.title,
             "Refreshed bundled"
         );
-        assert!(!database
+        assert!(database
             .update_user_lesson("built-in", &lesson("built-in", "User edit"))
             .unwrap());
+        database
+            .sync_builtin_lessons(&[lesson("built-in", "New bundled")])
+            .unwrap();
         assert_eq!(
-            database.lesson("built-in").unwrap().unwrap().0.title,
-            "Refreshed bundled"
+            database.lesson("built-in").unwrap(),
+            Some((lesson("built-in", "User edit"), false))
         );
-        // Built-in ownership blocks deletion too.
-        assert!(database
-            .delete_lesson("built-in")
-            .map(|deleted| !deleted)
-            .unwrap());
+        assert!(database.delete_lesson("built-in").unwrap());
 
+        drop(database);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn builtin_sync_removes_stale_builtins_but_keeps_user_id_conflicts() {
+        let (mut database, path) = db();
+        let lesson = |id: &str, title: &str| LessonDocument {
+            version: 1,
+            id: id.into(),
+            title: title.into(),
+            language: "en".into(),
+            description: None,
+            text: title.into(),
+        };
+        database
+            .create_user_lesson(&lesson("shared", "User copy"))
+            .unwrap();
+        database
+            .sync_builtin_lessons(&[
+                lesson("shared", "Bundled collision"),
+                lesson("old", "Old built-in"),
+                lesson("kept", "Kept built-in"),
+            ])
+            .unwrap();
+
+        database
+            .sync_builtin_lessons(&[lesson("kept", "Updated built-in")])
+            .unwrap();
+
+        assert_eq!(
+            database.lesson("shared").unwrap(),
+            Some((lesson("shared", "User copy"), false))
+        );
+        assert_eq!(database.lesson("old").unwrap(), None);
+        assert_eq!(
+            database.lesson("kept").unwrap().unwrap().0.title,
+            "Updated built-in"
+        );
         drop(database);
         std::fs::remove_file(path).unwrap();
     }

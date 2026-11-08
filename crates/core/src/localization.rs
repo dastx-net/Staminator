@@ -274,6 +274,22 @@ mod tests {
         );
     }
     #[test]
+    fn count_argument_formats_count_placeholders() {
+        let mut en = Catalog::embedded(Locale::En);
+        assert_eq!(
+            en.format("chooser.matches", &FormatArgs::new().count(7)),
+            "Found: 7"
+        );
+        assert_eq!(
+            en.format(
+                "metric.errors",
+                &FormatArgs::new().count(2).insert("percent", "1.5")
+            ),
+            "Errors: 2 (1.5%)"
+        );
+        assert!(en.diagnostics().is_empty());
+    }
+    #[test]
     fn plural_rules_support_ru_and_en() {
         let mut ru = Catalog::embedded(Locale::Ru);
         assert_eq!(
