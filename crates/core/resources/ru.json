@@ -241,5 +241,15 @@
   "storage.future_schema": "Версия базы данных {version} новее поддерживаемой.",
   "storage.non_empty_import": "Импорт старого профиля отменён: база данных уже содержит данные.",
   "storage.revision_conflict": "Данные профиля изменились в другом окне (ожидалась версия {expected}, текущая версия {actual}).",
-  "storage.restore_conflict": "База данных изменилась во время подготовки восстановления."
+  "storage.restore_conflict": "База данных изменилась во время подготовки восстановления.",
+  "background.title": "Фон",
+  "background.color": "Однотонный цвет",
+  "background.choose": "Выбрать изображение…",
+  "background.refresh": "Обновить папку",
+  "background.fit": "Вписать",
+  "background.fill": "Заполнить",
+  "background.tile": "Замостить",
+  "background.dim": "Затемнение",
+  "background.error": "Не удалось загрузить фон",
+  "background.builtin": "Стандартный пиксель-арт"
 }

@@ -237,5 +237,15 @@
   "storage.future_schema": "Database schema version {version} is newer than supported.",
   "storage.non_empty_import": "Legacy profile import was refused because the database already contains data.",
   "storage.revision_conflict": "Profile data changed in another window (expected revision {expected}, current revision {actual}).",
-  "storage.restore_conflict": "The database changed while restore was being prepared."
+  "storage.restore_conflict": "The database changed while restore was being prepared.",
+  "background.title": "Background",
+  "background.color": "Solid color",
+  "background.choose": "Choose image…",
+  "background.refresh": "Refresh folder",
+  "background.fit": "Fit",
+  "background.fill": "Fill",
+  "background.tile": "Tile",
+  "background.dim": "Darkening",
+  "background.error": "Cannot load background",
+  "background.builtin": "Default pixel art"
 }

@@ -45,11 +45,15 @@ pub fn draw_training(
     elapsed_ms: u64,
     profile_name: &str,
     prompt: Option<&str>,
+    background: Option<(&egui::TextureHandle, &str, u8)>,
 ) {
     let rect = ui.max_rect();
     let painter = ui.painter().with_clip_rect(rect);
 
     painter.rect_filled(rect, 0.0, Color32::from_rgb(67, 76, 82));
+    if let Some((texture, mode, darkness)) = background {
+        crate::background::paint(ui, rect, texture, mode, darkness);
+    }
 
     let band_height = 100.0_f32.min(rect.height().max(1.0));
     let band = Rect::from_center_size(
@@ -64,7 +68,6 @@ pub fn draw_training(
         egui::StrokeKind::Inside,
     );
 
-    let chars: Vec<char> = text.chars().collect();
     let font_size = (band_height * 0.55).clamp(28.0, 58.0);
     let font = FontId::new(font_size, FontFamily::Name(TEXT_FONT.into()));
     // Measure the chosen font so the painted glyphs and fixed cursor position
@@ -78,14 +81,18 @@ pub fn draw_training(
     let text_right = band.right() - margin;
     let text_width = (text_right - text_left).max(advance);
     let visible_count = ((text_width / advance).ceil() as usize + 2).max(1);
-    let (start, end) = visible_range(chars.len(), position, visible_count);
+    // The text can be a large imported document. Only visit the visible
+    // character range instead of allocating a Vec<char> for the whole lesson
+    // on every repaint (including every resize frame).
+    let start = position.saturating_sub(visible_count / 2);
     let current_x = rect.center().x;
     let scroll = current_x - text_left - position.saturating_sub(start) as f32 * advance;
     let text_painter = painter.with_clip_rect(band.shrink(6.0));
     let baseline = band.center().y;
     let mut x = text_left + scroll;
 
-    for (index, ch) in chars.iter().enumerate().take(end).skip(start) {
+    for (offset, ch) in text.chars().skip(start).take(visible_count).enumerate() {
+        let index = start + offset;
         let color = if index < position {
             Color32::from_rgb(164, 169, 173)
         } else {
@@ -94,14 +101,14 @@ pub fn draw_training(
         text_painter.text(
             egui::pos2(x, baseline),
             Align2::LEFT_CENTER,
-            *ch,
+            ch,
             font.clone(),
             color,
         );
         x += advance;
     }
 
-    if !chars.is_empty() {
+    if !text.is_empty() {
         let caret_x = current_x;
         let caret_top = band.center().y - font_size * 0.48;
         let caret_bottom = band.center().y + font_size * 0.48;
@@ -124,6 +131,37 @@ pub fn draw_training(
     }
 
     let elapsed = elapsed_ms / 1000;
+    if background.is_some() {
+        let timer = format!("{}:{:02}", elapsed / 60, elapsed % 60);
+        let timer_galley = painter.layout_no_wrap(timer, FontId::monospace(22.0), Color32::WHITE);
+        let name_galley = painter.layout_no_wrap(
+            profile_name.to_owned(),
+            FontId::proportional(16.0),
+            Color32::WHITE,
+        );
+        painter.rect_filled(
+            Rect::from_min_size(
+                egui::pos2(
+                    rect.right() - 16.0 - timer_galley.size().x,
+                    rect.top() + 8.0,
+                ),
+                timer_galley.size() + Vec2::splat(8.0),
+            ),
+            3.0,
+            Color32::from_black_alpha(190),
+        );
+        painter.rect_filled(
+            Rect::from_min_size(
+                egui::pos2(
+                    rect.left() + 8.0,
+                    rect.bottom() - 14.0 - name_galley.size().y,
+                ),
+                name_galley.size() + Vec2::splat(8.0),
+            ),
+            3.0,
+            Color32::from_black_alpha(190),
+        );
+    }
     painter.text(
         egui::pos2(rect.right() - 12.0, rect.top() + 12.0),
         Align2::RIGHT_TOP,
@@ -142,6 +180,7 @@ pub fn draw_training(
     ui.allocate_rect(rect, egui::Sense::hover());
 }
 
+#[cfg(test)]
 fn visible_range(text_len: usize, position: usize, visible_count: usize) -> (usize, usize) {
     let count = visible_count.max(1);
     let start = position.saturating_sub(count / 2).min(text_len);
@@ -209,7 +248,7 @@ mod tests {
                 )),
                 ..Default::default()
             },
-            |ui| draw_training(ui, text, position, elapsed_ms, profile, prompt),
+            |ui| draw_training(ui, text, position, elapsed_ms, profile, prompt, None),
         );
         assert!(matches!(
             output.shapes.first().map(|clipped| &clipped.shape),
@@ -240,9 +279,57 @@ mod tests {
                 screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1.0, 1.0))),
                 ..Default::default()
             },
-            |ui| draw_training(ui, "", usize::MAX, 999, "", Some("")),
+            |ui| draw_training(ui, "", usize::MAX, 999, "", Some(""), None),
         );
         output.textures_delta.clear();
+        assert!(!output.shapes.is_empty());
+    }
+
+    #[test]
+    fn headless_training_paints_large_text_without_expanding_to_all_glyphs() {
+        let long_text = "x".repeat(1_000_000);
+        let short_text = "x".repeat(1_000);
+        assert_eq!(
+            paint(&long_text, 500_000, 0, "Default", None),
+            paint(&short_text, 500, 0, "Default", None)
+        );
+    }
+
+    #[test]
+    fn headless_training_paints_background_status_panels_and_cursor() {
+        let ctx = Context::default();
+        let texture = ctx.load_texture(
+            "training-test-background",
+            egui::ColorImage::filled([2, 2], egui::Color32::from_rgb(10, 20, 30)),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut output = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(640.0, 320.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                draw_training(
+                    ui,
+                    "typing",
+                    3,
+                    3_661_000,
+                    "Profile",
+                    Some("Paused"),
+                    Some((&texture, "fill", 120)),
+                )
+            },
+        );
+
+        let drew_background = output
+            .shapes
+            .iter()
+            .any(|clipped| clipped.shape.texture_id() == texture.id());
+        output.textures_delta.clear();
+        assert!(drew_background);
         assert!(!output.shapes.is_empty());
     }
 

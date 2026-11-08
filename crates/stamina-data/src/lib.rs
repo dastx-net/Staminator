@@ -1585,4 +1585,47 @@ mod tests {
         fs::remove_file(linked_root).unwrap();
         fs::remove_dir_all(outside).unwrap();
     }
+
+    #[test]
+    fn catalog_requires_utf8_json_files_and_accepts_case_insensitive_extension() {
+        let root = temp_dir("catalog-file-filter");
+        write_json(&root.join("valid.JSON"), "valid", "content");
+        fs::write(root.join("legacy.json"), [0xff, 0xfe]).unwrap();
+        fs::write(root.join("ignored.txt"), b"not a lesson").unwrap();
+
+        let catalog = load_lesson_catalog(std::slice::from_ref(&root));
+
+        assert_eq!(catalog.lessons.len(), 1);
+        assert_eq!(catalog.lessons[0].lesson.id, "valid");
+        assert!(catalog.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path.ends_with("legacy.json")
+                && matches!(diagnostic.code, CatalogDiagnosticCode::InvalidUtf8 { .. })
+        }));
+        assert!(!catalog
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.path.ends_with("ignored.txt")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validation_accepts_language_subtags_and_rejects_invalid_id_characters() {
+        let mut lesson = json_lesson("lesson_2-alpha", "content");
+        lesson.language = "zh-Hant-TW-variant7".into();
+        assert_eq!(validate_json_lesson_typed(&lesson), Ok(()));
+
+        lesson.id = "lesson/name".into();
+        assert_eq!(validate_json_lesson_typed(&lesson), Ok(()));
+        let root = temp_dir("invalid-id");
+        assert!(matches!(
+            create_user_lesson(&root, std::slice::from_ref(&root), &lesson),
+            Err(LessonWriteError::InvalidLesson(
+                LessonValidationError::InvalidIdCharacters
+            ))
+        ));
+        if root.exists() {
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
 }

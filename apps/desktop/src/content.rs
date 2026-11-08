@@ -823,6 +823,95 @@ mod tests {
     }
 
     #[test]
+    fn adding_english_phrases_trims_entries_and_reports_unavailable_storage() {
+        let mut without_storage = ContentCatalog::fixture();
+        assert_eq!(
+            without_storage
+                .add_user_phrases(ContentLanguage::English, &["hello".into()])
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+
+        let root = temp_file("english-user-phrases");
+        let mut catalog = ContentCatalog::fixture();
+        catalog.set_phrase_root(root.clone());
+        assert_eq!(
+            catalog
+                .add_user_phrases(
+                    ContentLanguage::English,
+                    &["  Hello there! More text  ".into(), "  Plain text  ".into()],
+                )
+                .unwrap(),
+            2
+        );
+        let phrases = catalog.phrases(ContentLanguage::English);
+        assert_eq!(phrases[2].name, "Hello there! More text");
+        assert_eq!(phrases[2].text, "Hello there! ");
+        assert_eq!(phrases[3].text, "Plain text ");
+
+        let mut reopened = ContentCatalog::fixture();
+        reopened.set_phrase_root(root.clone());
+        assert_eq!(reopened.phrases(ContentLanguage::English).len(), 4);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stored_unknown_language_remains_retrievable_without_becoming_an_exercise() {
+        let mut catalog = ContentCatalog::fixture();
+        let unsupported = stamina_data::storage::LessonDocument {
+            version: 1,
+            id: "unsupported".into(),
+            title: "French lesson".into(),
+            language: "fr-FR".into(),
+            description: None,
+            text: "bonjour".into(),
+        };
+        catalog.set_stored_lessons(vec![(unsupported.clone(), false)]);
+
+        assert_eq!(catalog.stored_lessons(), &[(unsupported.clone(), false)]);
+        assert_eq!(
+            catalog.lesson_document("unsupported"),
+            Some((&unsupported, false))
+        );
+        assert!(catalog.lesson_document("missing").is_none());
+        assert!(catalog.lessons(ContentLanguage::Russian).is_empty());
+        assert!(catalog.lessons(ContentLanguage::English).is_empty());
+        assert_eq!(catalog.lesson_id(ContentLanguage::Russian, 0), None);
+        assert_eq!(
+            catalog.lesson_index(ContentLanguage::English, "unsupported"),
+            None
+        );
+        assert_eq!(catalog.user_lesson_path(), None);
+    }
+
+    #[test]
+    fn refreshing_startup_diagnostics_rerenders_file_and_lesson_errors() {
+        crate::localization::set_language("RU");
+        let root = temp_file("diagnostics-refresh");
+        let data = root.join("Data");
+        let lessons = root.join("lessons");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&lessons).unwrap();
+        fs::write(lessons.join("broken.json"), "{broken").unwrap();
+
+        let mut catalog = ContentCatalog::load_from(&data);
+        catalog.set_lesson_roots(vec![lessons]);
+        let phrases_before = catalog.phrases(ContentLanguage::Russian).to_vec();
+        assert!(catalog.diagnostics().contains("Русские фразы"));
+        assert!(catalog.lesson_diagnostics().contains("broken.json"));
+
+        crate::localization::set_language("EN");
+        catalog.refresh_diagnostics();
+        assert!(catalog.diagnostics().contains("Russian phrases"));
+        assert!(catalog.lesson_diagnostics().contains("broken.json"));
+        assert_eq!(catalog.phrases(ContentLanguage::Russian), phrases_before);
+
+        fs::remove_dir_all(root).unwrap();
+        crate::localization::set_language("RU");
+    }
+
+    #[test]
     fn refresh_filters_languages_and_removes_conflicting_lessons() {
         let root = temp_file("json-catalog");
         let built_in = root.join("built-in");

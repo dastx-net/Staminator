@@ -52,6 +52,56 @@ pub struct Profile {
     pub content_language: String,
     #[serde(default = "default_content_language")]
     pub interface_language: String,
+    #[serde(default, deserialize_with = "deserialize_background")]
+    pub background: BackgroundImageSettings,
+}
+
+fn deserialize_background<'de, D>(deserializer: D) -> Result<BackgroundImageSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut value = serde_json::Value::deserialize(deserializer)?;
+    if let Some(object) = value.as_object_mut()
+        && !object.contains_key("use_builtin")
+    {
+        let use_builtin = object
+            .get("image_path")
+            .is_none_or(serde_json::Value::is_null);
+        object.insert("use_builtin".into(), use_builtin.into());
+    }
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
+}
+
+/// Per-profile selection for the optional training background image.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct BackgroundImageSettings {
+    pub image_path: Option<PathBuf>,
+    #[serde(default)]
+    pub use_builtin: bool,
+    pub placement: BackgroundPlacement,
+    /// Black overlay opacity, from 0 (none) to 100 (opaque).
+    pub dim_percent: u8,
+}
+
+impl Default for BackgroundImageSettings {
+    fn default() -> Self {
+        Self {
+            image_path: None,
+            use_builtin: true,
+            placement: BackgroundPlacement::Fill,
+            dim_percent: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundPlacement {
+    #[default]
+    Fit,
+    Fill,
+    Tile,
 }
 
 fn default_content_language() -> String {
@@ -79,9 +129,37 @@ pub struct UserStore {
     database: bool,
     #[serde(skip)]
     revision: Cell<u64>,
+    /// Version of the one-time built-in background default migration.
+    #[serde(default)]
+    background_default_version: u8,
 }
 
 impl UserStore {
+    pub fn background_settings(&self) -> Option<&BackgroundImageSettings> {
+        self.active_profile().map(|profile| &profile.background)
+    }
+
+    pub fn set_background_settings(&mut self, settings: BackgroundImageSettings) -> io::Result<()> {
+        if settings.dim_percent > 100 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "background dim must be between 0 and 100",
+            ));
+        }
+        let original = self.clone();
+        let profile = self
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == self.active_profile_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    localization::tr("profile.not_found"),
+                )
+            })?;
+        profile.background = settings;
+        self.commit_or_restore(original)
+    }
     pub fn database(&self) -> io::Result<Option<stamina_data::storage::Database>> {
         if self.database {
             stamina_data::storage::Database::open(&self.path)
@@ -114,6 +192,7 @@ impl UserStore {
                 .map_err(invalid_data)?;
         restored.path = self.path.clone();
         restored.database = true;
+        restored.background_default_version = 1;
         restored.revision.set(loaded.revision);
         *self = restored;
         Ok(safety_path)
@@ -154,9 +233,13 @@ impl UserStore {
                 .map_err(invalid_data)?;
         store.path = path;
         store.database = true;
+        store.background_default_version = 1;
         store.revision.set(loaded.revision);
         store.normalize();
-        if serde_json::to_value(&store).map_err(invalid_data)? != before {
+        let after: stamina_data::storage::Snapshot =
+            serde_json::from_value(serde_json::to_value(&store).map_err(invalid_data)?)
+                .map_err(invalid_data)?;
+        if serde_json::to_value(after).map_err(invalid_data)? != before {
             store.save()?;
         }
         Ok(store)
@@ -173,6 +256,7 @@ impl UserStore {
         } else {
             None
         };
+        let had_source = source.is_some();
         let mut store = if let Some(source) = source {
             let bytes = fs::read(source)?;
             serde_json::from_slice::<Self>(&bytes).map_err(invalid_data)?
@@ -183,10 +267,16 @@ impl UserStore {
                 path: path.clone(),
                 database: false,
                 revision: Cell::new(0),
+                background_default_version: 1,
             }
         };
         store.path = path;
+        let migrate_background_default = store.background_default_version == 0;
         store.normalize();
+        if migrate_background_default && had_source {
+            // Persist the conversion once so a later explicit Fit selection stays Fit.
+            store.save()?;
+        }
         Ok(store)
     }
 
@@ -202,6 +292,7 @@ impl UserStore {
             path: path.into(),
             database: false,
             revision: Cell::new(0),
+            background_default_version: 1,
         };
         store.normalize();
         store
@@ -378,6 +469,7 @@ impl UserStore {
             external_text: None,
             content_language: default_content_language(),
             interface_language: default_content_language(),
+            background: BackgroundImageSettings::default(),
         });
         self.active_profile_id = id;
         self.commit_or_restore(original)?;
@@ -544,6 +636,19 @@ impl UserStore {
     }
 
     fn normalize(&mut self) {
+        if self.background_default_version == 0 {
+            for profile in &mut self.profiles {
+                let background = &mut profile.background;
+                if background.use_builtin
+                    && background.image_path.is_none()
+                    && background.placement == BackgroundPlacement::Fit
+                    && background.dim_percent == 0
+                {
+                    background.placement = BackgroundPlacement::Fill;
+                }
+            }
+            self.background_default_version = 1;
+        }
         self.profiles
             .retain(|p| !p.id.trim().is_empty() && !p.name.trim().is_empty());
         // Repair duplicate IDs/names from malformed or older store files.
@@ -592,6 +697,7 @@ impl UserStore {
                 external_text: None,
                 content_language: default_content_language(),
                 interface_language: "RU".into(),
+                background: BackgroundImageSettings::default(),
             });
             self.active_profile_id = id;
         } else if !self.profiles.iter().any(|p| p.id == self.active_profile_id) {
@@ -735,6 +841,7 @@ mod tests {
             external_text: None,
             content_language: "EN".into(),
             interface_language: "RU".into(),
+            background: BackgroundImageSettings::default(),
         };
         store.import_profile(profile.clone()).unwrap();
         assert_eq!(store.active_profile(), Some(&profile));
@@ -787,6 +894,7 @@ mod tests {
             external_text: None,
             content_language: "RU".into(),
             interface_language: "RU".into(),
+            background: BackgroundImageSettings::default(),
         };
         assert_eq!(
             store.import_profile(duplicate).unwrap_err().to_string(),
@@ -1221,6 +1329,118 @@ mod tests {
     }
 
     #[test]
+    fn background_defaults_to_builtin_and_solid_color_selection_survives_restart() {
+        let path = test_path();
+        let mut store = UserStore::load_from(&path).unwrap();
+        let profile = store.create("Background profile").unwrap().clone();
+        assert_eq!(profile.background, BackgroundImageSettings::default());
+
+        let solid_color = BackgroundImageSettings {
+            image_path: None,
+            use_builtin: false,
+            placement: BackgroundPlacement::Fill,
+            dim_percent: 35,
+        };
+        store.set_background_settings(solid_color.clone()).unwrap();
+        let reopened = UserStore::load_from(&path).unwrap();
+
+        assert_eq!(reopened.background_settings(), Some(&solid_color));
+        assert!(reopened.background_settings().unwrap().image_path.is_none());
+        assert!(!reopened.background_settings().unwrap().use_builtin);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_solid_default_without_source_enables_builtin_but_explicit_solid_is_preserved() {
+        let path = test_path();
+        let legacy = r#"{"profiles":[{"id":"p","name":"Default","background":{"image_path":null,"placement":"fit","dim_percent":0}}],"active_profile_id":"p"}"#;
+        fs::write(&path, legacy).unwrap();
+        let mut store = UserStore::load_from(&path).unwrap();
+        assert!(store.background_settings().unwrap().use_builtin);
+        assert_eq!(
+            store.background_settings().unwrap().placement,
+            BackgroundPlacement::Fill
+        );
+        let settings = BackgroundImageSettings {
+            use_builtin: false,
+            ..Default::default()
+        };
+        store.set_background_settings(settings.clone()).unwrap();
+        assert_eq!(
+            UserStore::load_from(&path).unwrap().background_settings(),
+            Some(&settings)
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_builtin_fit_default_migrates_once_and_new_explicit_fit_persists() {
+        let path = test_path();
+        let legacy = r#"{"profiles":[{"id":"p","name":"Default","background":{"image_path":null,"use_builtin":true,"placement":"fit","dim_percent":0}}],"active_profile_id":"p"}"#;
+        fs::write(&path, legacy).unwrap();
+
+        let mut store = UserStore::load_from(&path).unwrap();
+        assert_eq!(
+            store.background_settings().unwrap().placement,
+            BackgroundPlacement::Fill
+        );
+        let explicit_fit = BackgroundImageSettings {
+            placement: BackgroundPlacement::Fit,
+            ..BackgroundImageSettings::default()
+        };
+        store.set_background_settings(explicit_fit.clone()).unwrap();
+        assert_eq!(
+            UserStore::load_from(&path).unwrap().background_settings(),
+            Some(&explicit_fit)
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reopening_unchanged_database_does_not_advance_revision_for_json_marker() {
+        let path = test_path().with_extension("sqlite3");
+        let legacy = path.with_extension("json");
+        let store = UserStore::load_database(path.clone(), &legacy).unwrap();
+        let first = store
+            .database()
+            .unwrap()
+            .unwrap()
+            .load_snapshot_with_revision()
+            .unwrap()
+            .revision;
+        drop(store);
+
+        let reopened = UserStore::load_database(path.clone(), &legacy).unwrap();
+        let second = reopened
+            .database()
+            .unwrap()
+            .unwrap()
+            .load_snapshot_with_revision()
+            .unwrap()
+            .revision;
+        assert_eq!(second, first);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_custom_background_without_use_builtin_remains_a_custom_image() {
+        let path = test_path();
+        fs::write(
+            &path,
+            br#"{"active_profile_id":"legacy","profiles":[{"id":"legacy","name":"Legacy","results":[],"background":{"image_path":"old-picture.jpg","placement":"fill","dim_percent":12}}]}"#,
+        )
+        .unwrap();
+
+        let store = UserStore::load_from(&path).unwrap();
+        let settings = store.background_settings().unwrap();
+        assert!(!settings.use_builtin);
+        assert_eq!(settings.image_path, Some(PathBuf::from("old-picture.jpg")));
+        assert_eq!(settings.placement, BackgroundPlacement::Fill);
+        assert_eq!(settings.dim_percent, 12);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn interface_language_is_profile_scoped_and_persists_across_switches() {
         let path = test_path().with_extension("sqlite3");
         let legacy = path.with_extension("json");
@@ -1228,9 +1448,25 @@ mod tests {
         let first = store.active_profile_id().to_owned();
         store.set_content_language("EN").unwrap();
         store.set_interface_language("EN").unwrap();
+        store
+            .set_background_settings(BackgroundImageSettings {
+                image_path: Some(PathBuf::from("/photos/lesson.png")),
+                use_builtin: false,
+                placement: BackgroundPlacement::Fill,
+                dim_percent: 45,
+            })
+            .unwrap();
         let second = store.create("Second").unwrap().id.clone();
         assert_eq!(store.active_profile().unwrap().interface_language, "RU");
         store.set_interface_language("EN").unwrap();
+        store
+            .set_background_settings(BackgroundImageSettings {
+                image_path: Some(PathBuf::from("/photos/second.jpg")),
+                use_builtin: false,
+                placement: BackgroundPlacement::Tile,
+                dim_percent: 20,
+            })
+            .unwrap();
         store.select(&first).unwrap();
         assert_eq!(store.active_profile().unwrap().content_language, "EN");
         assert_eq!(store.active_profile().unwrap().interface_language, "EN");
@@ -1240,6 +1476,14 @@ mod tests {
         let reopened = UserStore::load_database(path.clone(), &legacy).unwrap();
         assert_eq!(reopened.active_profile_id(), second);
         assert_eq!(reopened.active_profile().unwrap().interface_language, "EN");
+        assert_eq!(
+            reopened.active_profile().unwrap().background.placement,
+            BackgroundPlacement::Tile
+        );
+        assert_eq!(
+            reopened.active_profile().unwrap().background.dim_percent,
+            20
+        );
         assert_eq!(
             reopened
                 .profiles()

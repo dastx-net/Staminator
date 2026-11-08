@@ -7,11 +7,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 6;
 
 /// Ordered migrations. Entry `n` upgrades schema version `n` to `n + 1`.
-const MIGRATIONS: &[fn(&rusqlite::Transaction<'_>) -> rusqlite::Result<()>] =
-    &[migrate_0_to_1, migrate_1_to_2, migrate_2_to_3];
+const MIGRATIONS: &[fn(&rusqlite::Transaction<'_>) -> rusqlite::Result<()>] = &[
+    migrate_0_to_1,
+    migrate_1_to_2,
+    migrate_2_to_3,
+    migrate_3_to_4,
+    migrate_4_to_5,
+    migrate_5_to_6,
+];
 
 fn migrate_0_to_1(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
     tx.execute_batch("CREATE TABLE profiles(id TEXT PRIMARY KEY,name TEXT NOT NULL,content_language TEXT NOT NULL,external_text TEXT); CREATE TABLE sessions(id INTEGER PRIMARY KEY,profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,timestamp INTEGER NOT NULL,mode TEXT NOT NULL,layout TEXT NOT NULL,exercise TEXT NOT NULL,correct INTEGER NOT NULL,errors INTEGER NOT NULL,elapsed_ms INTEGER NOT NULL,cpm REAL NOT NULL,error_percent REAL NOT NULL); CREATE INDEX sessions_profile_time ON sessions(profile_id,timestamp); CREATE TABLE settings(profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,key TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(profile_id,key)); CREATE TABLE book_positions(profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,identity TEXT NOT NULL,encoding TEXT NOT NULL,offset INTEGER NOT NULL,PRIMARY KEY(profile_id,identity)); CREATE TABLE lessons(id TEXT PRIMARY KEY,document TEXT NOT NULL,built_in INTEGER NOT NULL); CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);")
@@ -23,6 +29,33 @@ fn migrate_2_to_3(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
     tx.execute_batch(
         "ALTER TABLE profiles ADD COLUMN interface_language TEXT NOT NULL DEFAULT 'RU';",
     )
+}
+fn migrate_3_to_4(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch("ALTER TABLE profiles ADD COLUMN background TEXT NOT NULL DEFAULT '{\"image_path\":null,\"placement\":\"fit\",\"dim_percent\":0}';")
+}
+fn migrate_4_to_5(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    // This exact payload was the v4 column default. Rows with it had no saved
+    // background choice; explicitly saved solid backgrounds include use_builtin.
+    tx.execute(
+        "UPDATE profiles SET background=?1 WHERE background=?2",
+        params![
+            r#"{"image_path":null,"use_builtin":true,"placement":"fit","dim_percent":0}"#,
+            r#"{"image_path":null,"placement":"fit","dim_percent":0}"#,
+        ],
+    )?;
+    Ok(())
+}
+fn migrate_5_to_6(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    // The v5 payload is the old implicit built-in default. An explicit Fit
+    // choice with identical values cannot be distinguished and is migrated too.
+    tx.execute(
+        "UPDATE profiles SET background=?1 WHERE background=?2",
+        params![
+            r#"{"image_path":null,"use_builtin":true,"placement":"fill","dim_percent":0}"#,
+            r#"{"image_path":null,"use_builtin":true,"placement":"fit","dim_percent":0}"#,
+        ],
+    )?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -123,6 +156,66 @@ pub struct Profile {
     pub content_language: String,
     #[serde(default = "default_language")]
     pub interface_language: String,
+    #[serde(default)]
+    pub background: BackgroundImageSettings,
+}
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct BackgroundImageSettings {
+    pub image_path: Option<PathBuf>,
+    pub use_builtin: bool,
+    pub placement: BackgroundPlacement,
+    pub dim_percent: u8,
+}
+impl<'de> Deserialize<'de> for BackgroundImageSettings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(default)]
+        struct StoredBackground {
+            image_path: Option<PathBuf>,
+            use_builtin: Option<bool>,
+            placement: BackgroundPlacement,
+            dim_percent: u8,
+        }
+        impl Default for StoredBackground {
+            fn default() -> Self {
+                Self {
+                    image_path: None,
+                    use_builtin: None,
+                    placement: BackgroundPlacement::Fill,
+                    dim_percent: 0,
+                }
+            }
+        }
+        let stored = StoredBackground::deserialize(deserializer)?;
+        let use_builtin = stored.use_builtin.unwrap_or(stored.image_path.is_none());
+        Ok(Self {
+            image_path: stored.image_path,
+            use_builtin,
+            placement: stored.placement,
+            dim_percent: stored.dim_percent,
+        })
+    }
+}
+impl Default for BackgroundImageSettings {
+    fn default() -> Self {
+        Self {
+            image_path: None,
+            use_builtin: true,
+            placement: BackgroundPlacement::Fill,
+            dim_percent: 0,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundPlacement {
+    #[default]
+    Fit,
+    Fill,
+    Tile,
 }
 fn default_language() -> String {
     "RU".into()
@@ -409,16 +502,34 @@ impl Database {
             return Err(StorageError::NonEmptyImport);
         }
         let bytes = std::fs::read(path)?;
-        let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
+        let stored: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let background_defaults_migrated = stored
+            .get("background_default_version")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|version| version >= 1);
+        let mut snapshot: Snapshot = serde_json::from_value(stored)?;
+        if !background_defaults_migrated {
+            for profile in &mut snapshot.profiles {
+                let background = &mut profile.background;
+                if background.use_builtin
+                    && background.image_path.is_none()
+                    && background.placement == BackgroundPlacement::Fit
+                    && background.dim_percent == 0
+                {
+                    background.placement = BackgroundPlacement::Fill;
+                }
+            }
+        }
         for p in &snapshot.profiles {
             let ext = p
                 .external_text
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
+            let background = serde_json::to_string(&p.background)?;
             tx.execute(
-                "INSERT INTO profiles(id,name,content_language,external_text,interface_language) VALUES(?1,?2,?3,?4,?5)",
-                params![p.id, p.name, p.content_language, ext, p.interface_language],
+                "INSERT INTO profiles(id,name,content_language,external_text,interface_language,background) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![p.id, p.name, p.content_language, ext, p.interface_language, background],
             )?;
             for r in &p.results {
                 insert_result(&tx, &p.id, r)?;
@@ -663,7 +774,8 @@ fn save_snapshot_tx(tx: &rusqlite::Transaction<'_>, s: &Snapshot) -> Result<(), 
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        tx.execute("INSERT INTO profiles(id,name,content_language,external_text,interface_language) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET name=excluded.name,content_language=excluded.content_language,external_text=excluded.external_text,interface_language=excluded.interface_language", params![p.id,p.name,p.content_language,ext,p.interface_language])?;
+        let background = serde_json::to_string(&p.background)?;
+        tx.execute("INSERT INTO profiles(id,name,content_language,external_text,interface_language,background) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET name=excluded.name,content_language=excluded.content_language,external_text=excluded.external_text,interface_language=excluded.interface_language,background=excluded.background", params![p.id,p.name,p.content_language,ext,p.interface_language,background])?;
         let old_results = load_results(tx, &p.id)?;
         if p.results.starts_with(&old_results) {
             for r in &p.results[old_results.len()..] {
@@ -710,8 +822,7 @@ fn load_results(c: &Connection, id: &str) -> Result<Vec<ResultRecord>, StorageEr
 }
 
 fn load_snapshot_conn(c: &Connection) -> Result<Snapshot, StorageError> {
-    let mut stmt =
-        c.prepare("SELECT id,name,content_language,external_text,interface_language FROM profiles ORDER BY rowid")?;
+    let mut stmt = c.prepare("SELECT id,name,content_language,external_text,interface_language,background FROM profiles ORDER BY rowid")?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -719,17 +830,19 @@ fn load_snapshot_conn(c: &Connection) -> Result<Snapshot, StorageError> {
             r.get::<_, String>(2)?,
             r.get::<_, Option<String>>(3)?,
             r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
         ))
     })?;
     let mut profiles = Vec::new();
     for row in rows {
-        let (id, name, content_language, ext, interface_language) = row?;
+        let (id, name, content_language, ext, interface_language, background) = row?;
         profiles.push(Profile {
             results: load_results(c, &id)?,
             id,
             name,
             content_language,
             interface_language,
+            background: serde_json::from_str(&background)?,
             external_text: ext.map(|x| serde_json::from_str(&x)).transpose()?,
         });
     }
@@ -771,6 +884,12 @@ mod tests {
                 external_text: None,
                 content_language: "RU".into(),
                 interface_language: "RU".into(),
+                background: BackgroundImageSettings {
+                    image_path: Some(PathBuf::from("/user/background.png")),
+                    use_builtin: false,
+                    placement: BackgroundPlacement::Fill,
+                    dim_percent: 42,
+                },
             }],
             active_profile_id: "p".into(),
         };
@@ -793,6 +912,7 @@ mod tests {
                     name: "Current".into(),
                     content_language: "RU".into(),
                     interface_language: "RU".into(),
+                    background: BackgroundImageSettings::default(),
                     external_text: None,
                     results: vec![],
                 }],
@@ -808,6 +928,7 @@ mod tests {
                     name: "Restored".into(),
                     content_language: "RU".into(),
                     interface_language: "RU".into(),
+                    background: BackgroundImageSettings::default(),
                     external_text: None,
                     results: vec![],
                 }],
@@ -870,6 +991,7 @@ mod tests {
                     name: "Keep".into(),
                     content_language: "RU".into(),
                     interface_language: "RU".into(),
+                    background: BackgroundImageSettings::default(),
                     external_text: None,
                     results: vec![],
                 }],
@@ -908,6 +1030,7 @@ mod tests {
                     name: "Keep".into(),
                     content_language: "RU".into(),
                     interface_language: "RU".into(),
+                    background: BackgroundImageSettings::default(),
                     external_text: None,
                     results: vec![],
                 }],
@@ -948,6 +1071,7 @@ mod tests {
                     name: "Keep".into(),
                     content_language: "RU".into(),
                     interface_language: "RU".into(),
+                    background: BackgroundImageSettings::default(),
                     external_text: None,
                     results: vec![],
                 }],
@@ -988,6 +1112,7 @@ mod tests {
                     name: "Current".into(),
                     content_language: "RU".into(),
                     interface_language: "RU".into(),
+                    background: BackgroundImageSettings::default(),
                     external_text: None,
                     results: vec![],
                 }],
@@ -1043,6 +1168,12 @@ mod tests {
                 external_text: None,
                 content_language: "RU".into(),
                 interface_language: "RU".into(),
+                background: BackgroundImageSettings {
+                    image_path: Some(PathBuf::from("/user/background.png")),
+                    use_builtin: false,
+                    placement: BackgroundPlacement::Tile,
+                    dim_percent: 35,
+                },
             }],
             active_profile_id: "p".into(),
         };
@@ -1088,6 +1219,7 @@ mod tests {
                 name: "Alice".into(),
                 content_language: "RU".into(),
                 interface_language: "RU".into(),
+                background: BackgroundImageSettings::default(),
                 external_text: None,
                 results: vec![ResultRecord {
                     timestamp: 7,
@@ -1120,6 +1252,7 @@ mod tests {
                 name: "first".into(),
                 content_language: "RU".into(),
                 interface_language: "RU".into(),
+                background: BackgroundImageSettings::default(),
                 external_text: None,
                 results: vec![],
             }],
@@ -1137,6 +1270,7 @@ mod tests {
                 name: "stale".into(),
                 content_language: "RU".into(),
                 interface_language: "RU".into(),
+                background: BackgroundImageSettings::default(),
                 external_text: None,
                 results: vec![],
             }],
@@ -1176,6 +1310,7 @@ mod tests {
                 name: "P".into(),
                 content_language: "RU".into(),
                 interface_language: "RU".into(),
+                background: BackgroundImageSettings::default(),
                 external_text: None,
                 results: vec![ResultRecord {
                     timestamp: 1,
@@ -1241,6 +1376,57 @@ mod tests {
         );
         drop(d);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn v4_background_default_migrates_without_overwriting_explicit_choices() {
+        let path =
+            std::env::temp_dir().join(format!("stamina-v4-background-{}.db", std::process::id()));
+        let c = Connection::open(&path).unwrap();
+        let tx = c.unchecked_transaction().unwrap();
+        migrate_0_to_1(&tx).unwrap();
+        migrate_1_to_2(&tx).unwrap();
+        migrate_2_to_3(&tx).unwrap();
+        migrate_3_to_4(&tx).unwrap();
+        tx.execute("INSERT INTO profiles(id,name,content_language,background) VALUES('legacy','Legacy','RU',?1)", [r#"{"image_path":null,"placement":"fit","dim_percent":0}"#]).unwrap();
+        tx.execute("INSERT INTO profiles(id,name,content_language,background) VALUES('solid','Solid','RU',?1)", [r#"{"image_path":null,"use_builtin":false,"placement":"fit","dim_percent":0}"#]).unwrap();
+        tx.execute("INSERT INTO profiles(id,name,content_language,background) VALUES('custom','Custom','RU',?1)", [r#"{"image_path":"/user/bg.png","use_builtin":false,"placement":"fit","dim_percent":0}"#]).unwrap();
+        tx.pragma_update(None, "user_version", 4).unwrap();
+        tx.commit().unwrap();
+        drop(c);
+        let d = Database::open(&path).unwrap();
+        let profiles = d.load_snapshot().unwrap().profiles;
+        assert!(profiles[0].background.use_builtin);
+        assert_eq!(profiles[0].background.placement, BackgroundPlacement::Fill);
+        assert!(!profiles[1].background.use_builtin);
+        assert_eq!(profiles[1].background.placement, BackgroundPlacement::Fit);
+        assert_eq!(
+            profiles[2].background.image_path,
+            Some(PathBuf::from("/user/bg.png"))
+        );
+        assert!(!profiles[2].background.use_builtin);
+        assert_eq!(profiles[2].background.placement, BackgroundPlacement::Fit);
+        drop(d);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_background_json_infers_builtin_only_when_choice_is_missing() {
+        let builtin: BackgroundImageSettings =
+            serde_json::from_str(r#"{"image_path":null,"placement":"fit","dim_percent":0}"#)
+                .unwrap();
+        assert!(builtin.use_builtin);
+        let solid: BackgroundImageSettings = serde_json::from_str(
+            r#"{"image_path":null,"use_builtin":false,"placement":"fit","dim_percent":0}"#,
+        )
+        .unwrap();
+        assert!(!solid.use_builtin);
+        let custom: BackgroundImageSettings = serde_json::from_str(
+            r#"{"image_path":"/user/bg.png","placement":"fit","dim_percent":0}"#,
+        )
+        .unwrap();
+        assert!(!custom.use_builtin);
+        assert_eq!(custom.image_path, Some(PathBuf::from("/user/bg.png")));
     }
 
     #[test]
@@ -1311,6 +1497,7 @@ mod tests {
             name: "P".into(),
             content_language: "RU".into(),
             interface_language: "RU".into(),
+            background: BackgroundImageSettings::default(),
             external_text: None,
             results: vec![],
         };
@@ -1408,6 +1595,7 @@ mod tests {
                 name: "Original".into(),
                 content_language: "RU".into(),
                 interface_language: "RU".into(),
+                background: BackgroundImageSettings::default(),
                 external_text: None,
                 results: vec![],
             }],
@@ -1421,6 +1609,7 @@ mod tests {
                 name: "Changed".into(),
                 content_language: "RU".into(),
                 interface_language: "RU".into(),
+                background: BackgroundImageSettings::default(),
                 external_text: None,
                 results: vec![ResultRecord {
                     timestamp: 1,
@@ -1454,6 +1643,7 @@ mod tests {
                 name: "Existing".into(),
                 content_language: "RU".into(),
                 interface_language: "RU".into(),
+                background: BackgroundImageSettings::default(),
                 external_text: None,
                 results: vec![],
             }],
@@ -1525,6 +1715,7 @@ mod tests {
                 name: "P".into(),
                 content_language: "RU".into(),
                 interface_language: "RU".into(),
+                background: BackgroundImageSettings::default(),
                 external_text: None,
                 results: vec![],
             }],
@@ -1578,6 +1769,7 @@ mod tests {
                 name: "Backup".into(),
                 content_language: "RU".into(),
                 interface_language: "RU".into(),
+                background: BackgroundImageSettings::default(),
                 external_text: None,
                 results: vec![],
             }],
@@ -1607,6 +1799,7 @@ mod tests {
                 name: "P".into(),
                 content_language: "RU".into(),
                 interface_language: "RU".into(),
+                background: BackgroundImageSettings::default(),
                 external_text: None,
                 results: vec![],
             }],
@@ -1745,6 +1938,7 @@ mod tests {
                 external_text: Some(external_text),
                 content_language: "RU".into(),
                 interface_language: "RU".into(),
+                background: BackgroundImageSettings::default(),
             }],
             active_profile_id: "p".into(),
         };
@@ -1754,6 +1948,29 @@ mod tests {
         assert_eq!(database.load_snapshot().unwrap(), imported);
         assert!(!database.import_profiles_json(&source).unwrap());
 
+        drop(database);
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn legacy_json_import_migrates_only_the_unmarked_builtin_default() {
+        let (mut database, db_path) = db();
+        let source = db_path.with_extension("json");
+        std::fs::write(
+            &source,
+            br#"{"active_profile_id":"p","profiles":[{"id":"p","name":"Legacy","background":{"image_path":null,"use_builtin":true,"placement":"fit","dim_percent":0}},{"id":"solid","name":"Solid","background":{"image_path":null,"use_builtin":false,"placement":"fit","dim_percent":0}},{"id":"custom","name":"Custom","background":{"image_path":"/user/bg.png","use_builtin":false,"placement":"fit","dim_percent":0}}]}"#,
+        )
+        .unwrap();
+        database.import_profiles_json(&source).unwrap();
+        let profiles = database.load_snapshot().unwrap().profiles;
+        assert_eq!(profiles[0].background.placement, BackgroundPlacement::Fill);
+        assert_eq!(profiles[1].background.placement, BackgroundPlacement::Fit);
+        assert_eq!(profiles[2].background.placement, BackgroundPlacement::Fit);
+        assert_eq!(
+            profiles[2].background.image_path,
+            Some(PathBuf::from("/user/bg.png"))
+        );
         drop(database);
         std::fs::remove_file(source).unwrap();
         std::fs::remove_file(db_path).unwrap();
@@ -1789,6 +2006,7 @@ mod tests {
                                 external_text: None,
                                 content_language: "RU".into(),
                                 interface_language: "RU".into(),
+                                background: BackgroundImageSettings::default(),
                             }],
                             active_profile_id: "p".into(),
                         })
@@ -1825,5 +2043,72 @@ mod tests {
         assert_eq!(snapshot.profiles[0].content_language, "RU");
         assert!(snapshot.profiles[0].results.is_empty());
         assert!(snapshot.profiles[0].external_text.is_none());
+    }
+
+    #[test]
+    fn user_lesson_crud_and_builtin_sync_preserve_user_owned_content() {
+        let (mut database, path) = db();
+        let lesson = |id: &str, title: &str| LessonDocument {
+            version: 1,
+            id: id.into(),
+            title: title.into(),
+            language: "en".into(),
+            description: None,
+            text: title.into(),
+        };
+
+        let user_copy = lesson("shared", "My version");
+        database.create_user_lesson(&user_copy).unwrap();
+        assert!(matches!(
+            database.create_user_lesson(&lesson("shared", "Duplicate")),
+            Err(StorageError::Sql(_))
+        ));
+        assert!(database
+            .update_user_lesson("shared", &lesson("shared", "Updated"))
+            .unwrap());
+        assert!(database
+            .update_user_lesson("other-id", &lesson("shared", "Mismatch"))
+            .is_err());
+
+        database
+            .sync_builtin_lessons(&[
+                lesson("shared", "Bundled replacement"),
+                lesson("built-in", "First bundled"),
+            ])
+            .unwrap();
+        assert_eq!(
+            database.lesson("shared").unwrap(),
+            Some((lesson("shared", "Updated"), false))
+        );
+        assert_eq!(
+            database.lesson("built-in").unwrap().unwrap().0.title,
+            "First bundled"
+        );
+
+        database
+            .sync_builtin_lessons(&[
+                lesson("shared", "Still ignored"),
+                lesson("built-in", "Refreshed bundled"),
+            ])
+            .unwrap();
+        assert_eq!(
+            database.lesson("built-in").unwrap().unwrap().0.title,
+            "Refreshed bundled"
+        );
+        assert!(!database
+            .update_user_lesson("built-in", &lesson("built-in", "User edit"))
+            .unwrap());
+        assert_eq!(
+            database.lesson("built-in").unwrap().unwrap().0.title,
+            "Refreshed bundled"
+        );
+        // Built-in ownership blocks deletion too.
+        assert!(database
+            .delete_lesson("built-in")
+            .map(|deleted| !deleted)
+            .unwrap());
+
+        drop(database);
+        std::fs::remove_file(path).unwrap();
     }
 }

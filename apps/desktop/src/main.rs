@@ -1,3 +1,4 @@
+mod background;
 mod content;
 mod content_editor;
 mod external_text;
@@ -17,8 +18,22 @@ use eframe::egui;
 use result_view::ResultAction;
 use sound::SoundEvent;
 use staminator_core::{FormatArgs, Keystroke, Session, SessionState, StopReason};
-use std::{collections::VecDeque, fs, path::PathBuf, time::Instant};
+use std::{
+    collections::VecDeque,
+    fs,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 use user_store::UserStore;
+
+fn background_mode(mode: user_store::BackgroundPlacement) -> &'static str {
+    match mode {
+        user_store::BackgroundPlacement::Fit => "fit",
+        user_store::BackgroundPlacement::Fill => "fill",
+        user_store::BackgroundPlacement::Tile => "tile",
+    }
+}
 
 fn localized_error(key: &str, error: impl std::fmt::Display) -> String {
     localization::format(key, &FormatArgs::new().insert("error", error))
@@ -41,6 +56,38 @@ fn save_keyboard_setting_to(path: Option<&std::path::Path>, show: bool) {
         && fs::create_dir_all(parent).is_ok()
     {
         let _ = fs::write(path, show.to_string());
+    }
+}
+
+#[derive(Default)]
+struct KeyboardInputQueue {
+    events: Vec<egui::Event>,
+    close_requested: bool,
+}
+
+fn queue_keyboard_input(
+    queue: &Arc<Mutex<KeyboardInputQueue>>,
+    ctx: &egui::Context,
+    events: Vec<egui::Event>,
+    close_requested: bool,
+) {
+    let events: Vec<_> = events
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                egui::Event::Key { .. } | egui::Event::Text(_) | egui::Event::Copy
+            )
+        })
+        .collect();
+    if !events.is_empty() || close_requested {
+        let mut pending = queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.events.extend(events);
+        pending.close_requested |= close_requested;
+        drop(pending);
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
 }
 
@@ -189,6 +236,8 @@ struct StaminatorApp {
     started_at: Instant,
     last_result: Option<staminator_core::SessionStats>,
     show_keyboard: bool,
+    keyboard_input: Arc<Mutex<KeyboardInputQueue>>,
+    last_keyboard_state: Option<(keyboard::KeyboardLayout, Option<char>)>,
     keyboard_setting_path: Option<PathBuf>,
     result_open: bool,
     result_completed: bool,
@@ -200,6 +249,11 @@ struct StaminatorApp {
     profile_name_input: String,
     profile_error: String,
     lesson_transfer_error: String,
+    background_open: bool,
+    background_selection: Option<(bool, Option<PathBuf>)>,
+    background_texture: Option<egui::TextureHandle>,
+    background_error: String,
+    background_files: Vec<PathBuf>,
 }
 
 impl StaminatorApp {
@@ -333,6 +387,8 @@ impl StaminatorApp {
             started_at: Instant::now(),
             last_result: None,
             show_keyboard,
+            keyboard_input: Arc::default(),
+            last_keyboard_state: None,
             keyboard_setting_path,
             result_open: false,
             result_completed: false,
@@ -344,6 +400,148 @@ impl StaminatorApp {
             profile_name_input: String::new(),
             profile_error,
             lesson_transfer_error: String::new(),
+            background_open: false,
+            background_selection: None,
+            background_texture: None,
+            background_error: String::new(),
+            background_files: Vec::new(),
+        }
+    }
+
+    fn refresh_background(&mut self, ctx: &egui::Context) {
+        let settings = self
+            .users
+            .background_settings()
+            .cloned()
+            .unwrap_or_default();
+        let selection = (settings.use_builtin, settings.image_path);
+        if self.background_selection.as_ref() != Some(&selection) {
+            self.background_selection = Some(selection.clone());
+            self.background_texture = None;
+            self.background_error.clear();
+            let loaded = if selection.0 {
+                Some(background::load_builtin(ctx))
+            } else {
+                selection
+                    .1
+                    .as_deref()
+                    .map(|path| background::load(ctx, path))
+            };
+            if let Some(result) = loaded {
+                match result {
+                    Ok(texture) => self.background_texture = Some(texture),
+                    Err(error) => {
+                        self.background_error =
+                            format!("{}: {}", localization::tr("background.error"), error)
+                    }
+                }
+            }
+        }
+    }
+
+    fn show_background_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.background_open;
+        let mut settings = self
+            .users
+            .background_settings()
+            .cloned()
+            .unwrap_or_default();
+        let mut changed = false;
+        egui::Window::new(localization::tr("background.title"))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if ui
+                    .selectable_label(settings.use_builtin, localization::tr("background.builtin"))
+                    .clicked()
+                {
+                    settings.use_builtin = true;
+                    settings.image_path = None;
+                    changed = true;
+                }
+                if ui
+                    .selectable_label(
+                        !settings.use_builtin && settings.image_path.is_none(),
+                        localization::tr("background.color"),
+                    )
+                    .clicked()
+                {
+                    settings.image_path = None;
+                    settings.use_builtin = false;
+                    changed = true;
+                }
+                if ui.button(localization::tr("background.choose")).clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("PNG / JPEG", &["png", "jpg", "jpeg"])
+                        .pick_file()
+                {
+                    settings.image_path = Some(path);
+                    settings.use_builtin = false;
+                    changed = true;
+                }
+                if let Some(path) = &settings.image_path {
+                    ui.label(path.display().to_string());
+                }
+                ui.horizontal(|ui| {
+                    if ui.button(localization::tr("background.refresh")).clicked() {
+                        let _ = fs::create_dir_all(background::directory());
+                        self.background_files = background::images_in(&background::directory());
+                        self.background_selection = None;
+                    }
+                    ui.small(background::directory().display().to_string());
+                });
+                for path in &self.background_files {
+                    if ui
+                        .selectable_label(
+                            settings.image_path.as_ref() == Some(path),
+                            path.file_name().unwrap_or_default().to_string_lossy(),
+                        )
+                        .clicked()
+                    {
+                        settings.image_path = Some(path.clone());
+                        settings.use_builtin = false;
+                        changed = true;
+                    }
+                }
+                ui.horizontal(|ui| {
+                    for (value, key) in [
+                        (user_store::BackgroundPlacement::Fit, "background.fit"),
+                        (user_store::BackgroundPlacement::Fill, "background.fill"),
+                        (user_store::BackgroundPlacement::Tile, "background.tile"),
+                    ] {
+                        changed |= ui
+                            .selectable_value(&mut settings.placement, value, localization::tr(key))
+                            .changed();
+                    }
+                });
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut settings.dim_percent, 0..=100)
+                            .text(localization::tr("background.dim")),
+                    )
+                    .changed();
+                if !self.background_error.is_empty() {
+                    ui.colored_label(egui::Color32::RED, &self.background_error);
+                }
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(320.0, 120.0), egui::Sense::hover());
+                ui.painter()
+                    .rect_filled(rect, 0.0, egui::Color32::from_rgb(67, 76, 82));
+                if let Some(texture) = &self.background_texture {
+                    background::paint(
+                        ui,
+                        rect,
+                        texture,
+                        background_mode(settings.placement),
+                        (u16::from(settings.dim_percent.min(100)) * 255 / 100) as u8,
+                    );
+                }
+            });
+        self.background_open = open;
+        if changed {
+            if let Err(error) = self.users.set_background_settings(settings) {
+                self.profile_error = error.to_string();
+            }
+            self.refresh_background(ctx);
         }
     }
 
@@ -362,6 +560,24 @@ impl StaminatorApp {
             }
             Err(error) => self.profile_error = localized_error("settings.save_error", error),
         }
+    }
+
+    fn take_keyboard_input(&mut self) -> Vec<egui::Event> {
+        let (events, close_requested) = {
+            let mut queue = self
+                .keyboard_input
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                std::mem::take(&mut queue.events),
+                std::mem::take(&mut queue.close_requested),
+            )
+        };
+        if close_requested && self.show_keyboard {
+            self.show_keyboard = false;
+            self.persist_keyboard_setting();
+        }
+        events
     }
 
     fn language(&self) -> ContentLanguage {
@@ -883,8 +1099,15 @@ impl StaminatorApp {
         }
     }
 
+    #[cfg(test)]
     fn handle_input(&mut self, ctx: &egui::Context) {
+        let events = ctx.input(|input| input.events.clone());
+        self.handle_input_events(ctx, events);
+    }
+
+    fn handle_input_events(&mut self, _ctx: &egui::Context, events: Vec<egui::Event>) {
         if self.result_open
+            || self.background_open
             || self.chooser_open
             || self.profiles_open
             || self.lesson_editor.is_some()
@@ -898,7 +1121,7 @@ impl StaminatorApp {
             return;
         }
         let mut consume_space_text = false;
-        for event in ctx.input(|input| input.events.clone()) {
+        for event in events {
             match event {
                 egui::Event::Key {
                     key: egui::Key::Escape,
@@ -1530,7 +1753,9 @@ impl StaminatorApp {
                 .active_profile()
                 .map_or("RU", |p| p.interface_language.as_str()),
         );
-        self.handle_input(root.ctx());
+        let mut events = root.ctx().input(|input| input.events.clone());
+        events.extend(self.take_keyboard_input());
+        self.handle_input_events(root.ctx(), events);
         let now = self.now_ms();
         let snapshot = self.session.as_ref().map(|s| s.snapshot(now));
         let active = snapshot.as_ref().is_some_and(|s| {
@@ -1759,6 +1984,12 @@ impl StaminatorApp {
                             }
                         }
                     });
+                    if ui.button(localization::tr("background.title")).clicked() {
+                        self.background_open = true;
+                        let _ = fs::create_dir_all(background::directory());
+                        self.background_files = background::images_in(&background::directory());
+                        ui.close();
+                    }
                     if ui.button(localization::tr("backup-create")).clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("SQLite", &["sqlite3"])
@@ -1868,8 +2099,13 @@ impl StaminatorApp {
             });
         });
 
+        self.refresh_background(root.ctx());
         egui::Panel::bottom("metrics").show(root, |ui| {
             ui.horizontal(|ui| {
+                if !self.background_error.is_empty() {
+                    ui.colored_label(egui::Color32::RED, &self.background_error);
+                    ui.separator();
+                }
                 ui.label(if active {
                     if snapshot
                         .as_ref()
@@ -1910,6 +2146,11 @@ impl StaminatorApp {
             });
         });
 
+        let background_settings = self
+            .users
+            .background_settings()
+            .cloned()
+            .unwrap_or_default();
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(root, |ui| {
@@ -1937,6 +2178,13 @@ impl StaminatorApp {
                         _ => None,
                     }
                     .as_deref(),
+                    self.background_texture.as_ref().map(|texture| {
+                        (
+                            texture,
+                            background_mode(background_settings.placement),
+                            (u16::from(background_settings.dim_percent.min(100)) * 255 / 100) as u8,
+                        )
+                    }),
                 );
             });
 
@@ -1946,26 +2194,35 @@ impl StaminatorApp {
                 .with_title(localization::tr("keyboard"))
                 .with_inner_size([1100.0, 420.0])
                 .with_min_inner_size([640.0, 250.0]);
+            let layout = if self.english_layout {
+                keyboard::KeyboardLayout::English
+            } else {
+                keyboard::KeyboardLayout::Russian
+            };
+            let state = (layout, next_char);
+            if self.last_keyboard_state != Some(state) {
+                root.ctx().request_repaint_of(viewport_id);
+                self.last_keyboard_state = Some(state);
+            }
+            let input_queue = Arc::clone(&self.keyboard_input);
             root.ctx()
-                .show_viewport_immediate(viewport_id, builder, |ui, _class| {
-                    let ctx = ui.ctx().clone();
-                    if ctx.input(|input| input.viewport().close_requested()) {
-                        self.show_keyboard = false;
-                        self.persist_keyboard_setting();
-                    }
-                    self.handle_input(&ctx);
-                    let layout = if self.english_layout {
-                        keyboard::KeyboardLayout::English
-                    } else {
-                        keyboard::KeyboardLayout::Russian
-                    };
+                .show_viewport_deferred(viewport_id, builder, move |ui, _class| {
+                    let ctx = ui.ctx();
+                    let events = ctx.input(|input| input.events.clone());
+                    let close_requested = ctx.input(|input| input.viewport().close_requested());
+                    queue_keyboard_input(&input_queue, ctx, events, close_requested);
                     keyboard::draw_keyboard(ui, layout, next_char);
                 });
+        } else {
+            self.last_keyboard_state = None;
         }
         if self.chooser_open {
             self.show_content_chooser(root.ctx());
         }
         self.show_content_editors(root.ctx());
+        if self.background_open {
+            self.show_background_window(root.ctx());
+        }
         if self.profiles_open {
             self.show_profiles(root.ctx());
         }
@@ -2369,6 +2626,66 @@ mod tests {
         app.external_path = Some(PathBuf::from("example.txt"));
         app.external_text = "ab".into();
         app
+    }
+
+    #[test]
+    fn background_follows_profile_and_missing_file_falls_back() {
+        let path = test_path();
+        let image_path = path.with_extension("png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([20, 40, 60, 255]))
+            .save(&image_path)
+            .unwrap();
+        let mut app = test_app(path.clone());
+        let original = app.users.active_profile_id().to_owned();
+        let settings = user_store::BackgroundImageSettings {
+            image_path: Some(image_path.clone()),
+            use_builtin: false,
+            placement: user_store::BackgroundPlacement::Fill,
+            dim_percent: 50,
+        };
+        app.users.set_background_settings(settings.clone()).unwrap();
+        let ctx = egui::Context::default();
+        app.refresh_background(&ctx);
+        assert!(app.background_texture.is_some());
+        let other = app.users.create("Other").unwrap().id.clone();
+        app.users.select(&other).unwrap();
+        app.refresh_background(&ctx);
+        assert!(app.background_texture.is_some());
+        app.users.select(&original).unwrap();
+        app.refresh_background(&ctx);
+        assert!(app.background_texture.is_some());
+        drop(app);
+        let mut app = test_app(path.clone());
+        app.users = UserStore::load_from(&path).unwrap();
+        assert_eq!(app.users.background_settings(), Some(&settings));
+        fs::remove_file(&image_path).unwrap();
+        app.refresh_background(&ctx);
+        assert!(app.background_texture.is_none());
+        assert!(!app.background_error.is_empty());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn background_dialog_renders_options_with_the_builtin_art_selected() {
+        let path = test_path().with_extension("background-dialog.json");
+        let mut app = test_app(path);
+        app.background_open = true;
+        let ctx = egui::Context::default();
+        app.refresh_background(&ctx);
+
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |ui| app.show_background_window(ui.ctx()),
+        );
+        assert!(app.background_texture.is_some());
+        assert!(!output.shapes.is_empty());
+        output.textures_delta.clear();
     }
 
     fn database_test_app(path: PathBuf) -> StaminatorApp {
@@ -3268,7 +3585,63 @@ mod tests {
         assert_eq!(app.users.active_records().len(), 1);
         input(&mut app, &ctx, vec![egui::Event::Text("a".into())]);
         assert_eq!(app.users.active_records().len(), 1);
-        fs::remove_file(path).unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn deferred_keyboard_queue_delivers_text_and_hotkeys_to_the_parent() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        let ctx = egui::Context::default();
+
+        queue_keyboard_input(
+            &app.keyboard_input,
+            &ctx,
+            vec![key(egui::Key::Space), egui::Event::Text(" ".into())],
+            false,
+        );
+        let events = app.take_keyboard_input();
+        app.handle_input_events(&ctx, events);
+        assert_eq!(
+            app.session.as_ref().unwrap().snapshot(0).state,
+            SessionState::Ready
+        );
+        assert_eq!(app.session.as_ref().unwrap().snapshot(0).position, 0);
+
+        queue_keyboard_input(
+            &app.keyboard_input,
+            &ctx,
+            vec![egui::Event::Text("a".into()), key(egui::Key::F9)],
+            false,
+        );
+        let events = app.take_keyboard_input();
+        app.handle_input_events(&ctx, events);
+        let snapshot = app.session.as_ref().unwrap().snapshot(app.now_ms());
+        assert_eq!(snapshot.state, SessionState::Paused);
+        assert_eq!(snapshot.correct, 1);
+        assert_eq!(snapshot.position, 1);
+
+        drop(app);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn deferred_keyboard_close_updates_visibility_and_persists_setting() {
+        let path = test_path();
+        let settings = path.with_extension("settings.txt");
+        let mut app = test_app(path.clone());
+        app.keyboard_setting_path = Some(settings.clone());
+        let ctx = egui::Context::default();
+
+        queue_keyboard_input(&app.keyboard_input, &ctx, vec![], true);
+        let events = app.take_keyboard_input();
+        app.handle_input_events(&ctx, events);
+
+        assert!(!app.show_keyboard);
+        assert_eq!(fs::read_to_string(&settings).unwrap(), "false");
+        drop(app);
+        fs::remove_file(settings).unwrap();
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -3281,6 +3654,10 @@ mod tests {
             &ctx,
             vec![key(egui::Key::Space), egui::Event::Text("a".into())],
         );
+        app.background_open = true;
+        input(&mut app, &ctx, vec![egui::Event::Text("b".into())]);
+        assert_eq!(app.session.as_ref().unwrap().snapshot(0).position, 1);
+        app.background_open = false;
         app.chooser_open = true;
         input(&mut app, &ctx, vec![key(egui::Key::Escape)]);
         assert_eq!(

@@ -304,6 +304,7 @@ mod tests {
             external_text: None,
             content_language: "RU".into(),
             interface_language: "RU".into(),
+            background: stamina_data::storage::BackgroundImageSettings::default(),
         }
     }
 
@@ -390,6 +391,21 @@ mod tests {
     }
 
     #[test]
+    fn profile_without_history_round_trips_and_exports_utf8_with_final_newline() {
+        let root = dir();
+        let mut expected = profile();
+        expected.results.clear();
+        let path = root.join("empty-history.json");
+
+        assert_eq!(export_profile_json(&expected, &path).unwrap(), path);
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.ends_with(b"\n"));
+        assert!(std::str::from_utf8(&bytes).is_ok());
+        assert_eq!(import_profile_json(&path).unwrap(), expected);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn invalid_profile_values_are_rejected() {
         let root = dir();
         let mut invalid = profile();
@@ -404,6 +420,13 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
         assert!(matches!(
             import_profile_json(&path),
+            Err(TransferError::InvalidProfile(_))
+        ));
+
+        let malformed_utf8 = root.join("utf8-offset.json");
+        fs::write(&malformed_utf8, [b'{', b' ', 0xff]).unwrap();
+        assert!(matches!(
+            import_profile_json(&malformed_utf8),
             Err(TransferError::InvalidProfile(_))
         ));
         let _ = fs::remove_dir_all(root);
