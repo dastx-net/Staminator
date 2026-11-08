@@ -1,3 +1,6 @@
+# Local reference sources; already tracked files require separate removal
+src/stamina/
+
 # Legacy IDE state and build output
 src/stamina/*.aps
 src/stamina/*.clw
@@ -20,6 +23,8 @@ src/stamina_setup/
 # Common local editor files
 .vs/
 .idea/
+docs/.obsidian/workspace.json
+docs/.obsidian/workspace-mobile.json
 *.user
 *.suo
 

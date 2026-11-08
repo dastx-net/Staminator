@@ -43,7 +43,7 @@ cargo test --workspace
 ./scripts/check-utf8.ps1
 ```
 
-The legacy Stamina source in `src/stamina` is reference material and retains its original encoding. The optional local installation is excluded from Git and may contain personal data and third-party media.
+The original Stamina source is kept separately as local reference material at `../Stamina` on the project's development machine. It is not included in this repository and may not be available on other machines. The optional local installation is excluded from Git and may contain personal data and third-party media.
 
 ## License and credits
 
