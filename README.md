@@ -1,39 +1,50 @@
 # Staminator
 
-Staminator — проект по воссозданию тренажёра клавиатурного набора Stamina. Исходный код для изучения лежит в [`src/stamina`](src/stamina), локальная установленная программа с дополнительными данными — в `src/stamina_setup`. Первая цель — повторить подтверждённое поведение программы; улучшения и новые функции пойдут после этого этапа.
+Staminator is a touch typing tutor written in Rust. It is inspired by [Stamina](https://stamina.ru/), the keyboard trainer created by Alexey Kazantsev. Our first goal is to bring its familiar training experience to a modern application; improvements can follow.
 
-Rust-реализация начинается с отдельного workspace. Исходники Stamina служат справочным материалом, а не готовой основой для современной сборки. План разработки и критерии паритета: [docs/implementation-plan.md](docs/implementation-plan.md).
+## Thank you, Stamina
 
-## Запуск текущего прототипа
+Stamina was part of a happy childhood. Thank you, Alexey, for that and for all the hours saved since then by knowing how to type without looking at the keyboard.
 
-На Windows с установленными Rustup и инструментами сборки Visual Studio:
+We like Stamina's approach to learning: mistakes count, but they are not punished harshly. You can keep practicing instead of worrying about every wrong key. Your fingers will get there, even if they occasionally take the scenic route.
+
+## Why a rewrite?
+
+We wanted Russian text to display correctly on modern systems. So, naturally, we decided to rewrite the whole thing in Rust.
+
+This might sound excessive, but we have AI agents now, and they need typing practice too.
+
+## Current status
+
+Staminator is a work in progress for Windows. It already has Russian and English exercises, five practice modes, user profiles, results, a lesson editor, and a separate on-screen keyboard. It also supports practice with an external UTF-8 text file.
+
+The application does not yet match every feature or behavior of the original. See the [implementation plan](docs/implementation-plan.md) for progress and [research notes](docs/research.md) for details about Stamina.
+
+## Run from source
+
+On Windows, install [Rustup](https://rustup.rs/) and the Visual Studio C++ build tools. Then run this command from the repository root:
 
 ```powershell
 cargo run -p staminator-desktop
 ```
 
-Версия Rust 1.99.1 закреплена в `rust-toolchain.toml`; Rustup установит её при необходимости. Доступны пять режимов: уроки, фразы, случайные символы из фраз, все клавиши и внешний текстовый файл. Режим и раскладка выбираются в меню «Режим», конкретный урок или начальная фраза — в меню «Занятие». Фразы и генерируемые тексты продолжаются в одном сеансе без сброса метрик. До старта текст скрыт: пробел начинает занятие. Первый Esc ставит его на паузу и показывает предупреждение; пробел возобновляет набор, повторный Esc или Ctrl+C завершает занятие и открывает результат. Ошибка, старт и пауза сопровождаются системными звуками Windows. Текст показан крупной строкой, которая сдвигается вслед за курсором. Экранная клавиатура с цветовыми зонами пальцев открывается отдельным окном: его можно перенести на другой монитор, закрыть крестиком и снова включить через «Опции → Показывать клавиатуру». Выбор сохраняется в `%APPDATA%\Staminator\settings.txt`.
+Rustup will use the toolchain pinned in `rust-toolchain.toml` and install it if needed. An installer is planned for the future; for now, building from source is the way to start.
 
-Фон `Field.jpg`, уроки, фразы и раскладки читаются из локальной `src/stamina_setup`; они не включены в сборку. Если установка недоступна, используются короткие встроенные упражнения и нейтральный фон. Профили, результаты и позиция внешнего файла хранятся отдельно в `%APPDATA%\Staminator\profiles.json`. Внешний текст должен быть в UTF-8, с BOM или без него. Реализованные генераторы и чтение внешнего файла пока упрощены по сравнению с оригиналом; редакторы уроков, музыка и расширенные настройки ещё не готовы.
+Choose a mode and keyboard layout in the Mode menu. Press Space to start, Esc to pause, and Space to resume. Press Esc again or Ctrl+C to finish and see the result. The on-screen keyboard can be moved to another monitor or hidden in Options.
 
-Проверка кода: `cargo test --workspace`. Кодировка текстовых файлов проекта проверяется командой `./scripts/check-utf8.ps1` и в составе `./scripts/check.ps1`. Исходные файлы Stamina исключены из проверки: их кодировка сохраняется для совместимости. Отчёт покрытия и требование 95% описаны в [документации тестов](docs/unit-tests.md). Установку Stamina приложение только читает.
+The optional local `src/stamina_setup` directory can supply original data and resources; it is not included in the repository. Without it, the application uses built-in exercises and a neutral background. User data is stored separately in `%APPDATA%\Staminator\staminator.sqlite3`. External practice texts must use UTF-8.
 
-`src/stamina_setup` содержит исполняемые файлы, уроки, фразы, локализации, изображения, музыку, звуки и личный профиль. Каталог исключён из Git; при переносе репозитория его нужно предоставлять отдельно для исследования. В документы заносим выводы о форматах и поведении, а не копии личных данных или медиатеки.
+## Development
 
-## Что уже известно
+Run the workspace tests and check text file encoding with:
 
-- Пять режимов: урок, фразы, буквы из фраз, все клавиши и набор внешнего текстового файла.
-- Набор начинается по первой клавише; неверный символ учитывается как ошибка, верный продвигает текст. Есть остановка, пауза, ограничение по времени и окно результата.
-- Есть профили пользователей, редактор уроков, список фраз, история результатов с графиком, экранная клавиатура, настройки оформления и звука.
-- Проект написан на C++ с MFC для Win32 x86. Формат проекта — Microsoft Developer Studio 5.0 (`.dsp`/`.dsw`).
+```powershell
+cargo test --workspace
+./scripts/check-utf8.ps1
+```
 
-Подробности, ссылки на исходники и открытые вопросы: [docs/research.md](docs/research.md). Правила работы агента: [AGENTS.md](AGENTS.md).
+The legacy Stamina source in `src/stamina` is reference material and retains its original encoding. The optional local installation is excluded from Git and may contain personal data and third-party media.
 
-## Порядок работы
+## License and credits
 
-1. Завершить инвентаризацию поведения и данных, отмечая, что подтверждено кодом, а что требует проверки в работающей Stamina.
-2. Согласовать платформу и технологический стек новой реализации.
-3. Реализовать минимальный сквозной сценарий набора, затем последовательно закрывать функциональный паритет.
-4. После паритета отдельно планировать улучшения.
-
-Для новой реализации и её документации выбрана [MIT License](LICENSE) в пределах прав авторов. Она не распространяется на исходную Stamina, её ресурсы и другие сторонние материалы. Права на них и на распространение реализации ещё нужно проверить до публикации; решение и ограничения описаны в [ADR](docs/adr/0003-license.md).
+The new Staminator implementation and its documentation are available under the [MIT License](LICENSE), within the rights of their authors. This does not cover the original Stamina source, its resources, or other third-party materials. Their rights, and the right to distribute this implementation, require separate review; see the [licensing decision](docs/adr/0003-license.md).
