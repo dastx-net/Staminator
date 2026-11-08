@@ -22,6 +22,14 @@ pub enum DataError {
     },
 }
 
+impl DataError {
+    pub fn localization_key(&self) -> &'static str {
+        match self {
+            Self::Io { .. } => "lesson.data.read_error",
+        }
+    }
+}
+
 impl fmt::Display for DataError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -214,8 +222,78 @@ pub struct CatalogLesson {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CatalogDiagnostic {
     pub path: PathBuf,
+    /// Stable diagnostic identity for localization. `message` remains for compatibility.
+    pub code: CatalogDiagnosticCode,
     pub message: String,
 }
+
+/// Typed reason for a lesson catalog diagnostic. Dynamic details remain data, not
+/// text that callers need to inspect or match.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CatalogDiagnosticCode {
+    RootIsSymlink,
+    RootNotDirectory,
+    Io { reason: String },
+    InvalidUtf8 { reason: String },
+    InvalidJson { reason: String },
+    InvalidLesson(LessonValidationError),
+    DuplicateId { id: String, paths: Vec<PathBuf> },
+}
+
+impl CatalogDiagnosticCode {
+    /// Localization key for the diagnostic. Callers can pass variant data as
+    /// interpolation arguments without parsing `CatalogDiagnostic::message`.
+    pub fn localization_key(&self) -> &'static str {
+        match self {
+            Self::RootIsSymlink => "lesson.catalog.root_symlink",
+            Self::RootNotDirectory => "lesson.catalog.root_not_directory",
+            Self::Io { .. } => "lesson.catalog.io_error",
+            Self::InvalidUtf8 { .. } => "lesson.catalog.invalid_utf8",
+            Self::InvalidJson { .. } => "lesson.catalog.invalid_json",
+            Self::InvalidLesson(error) => error.localization_key(),
+            Self::DuplicateId { .. } => "lesson.catalog.duplicate_id",
+        }
+    }
+}
+
+/// Validation failure for a JSON lesson, with a stable localization identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LessonValidationError {
+    UnsupportedVersion { version: u32 },
+    EmptyId,
+    EmptyTitle,
+    EmptyText,
+    InvalidLanguage,
+    InvalidIdCharacters,
+}
+
+impl LessonValidationError {
+    pub fn localization_key(&self) -> &'static str {
+        match self {
+            Self::UnsupportedVersion { .. } => "lesson.validation.unsupported_version",
+            Self::EmptyId => "lesson.validation.empty_id",
+            Self::EmptyTitle => "lesson.validation.empty_title",
+            Self::EmptyText => "lesson.validation.empty_text",
+            Self::InvalidLanguage => "lesson.validation.invalid_language",
+            Self::InvalidIdCharacters => "lesson.validation.invalid_id_characters",
+        }
+    }
+}
+
+impl fmt::Display for LessonValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedVersion { version } => write!(f, "неподдерживаемая версия урока {version}"),
+            Self::EmptyId => f.write_str("ID не должен быть пустым"),
+            Self::EmptyTitle => f.write_str("название не должно быть пустым"),
+            Self::EmptyText => f.write_str("текст не должен быть пустым"),
+            Self::InvalidLanguage => f.write_str("язык должен соответствовать поддерживаемому синтаксису BCP 47: 2–8 латинских букв, затем необязательные части из 1–8 букв или цифр"),
+            Self::InvalidIdCharacters => f.write_str("ID должен содержать только латинские буквы, цифры, дефис или подчёркивание"),
+        }
+    }
+}
+
+impl Error for LessonValidationError {}
 
 /// Lessons from both roots, sorted by ID then path. Duplicate IDs are excluded.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -236,6 +314,7 @@ pub fn load_lesson_catalog(roots: &[impl AsRef<Path>]) -> LessonCatalog {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 diagnostics.push(CatalogDiagnostic {
                     path: root.to_owned(),
+                    code: CatalogDiagnosticCode::RootIsSymlink,
                     message: "корень является ссылкой; обход пропущен".into(),
                 })
             }
@@ -244,11 +323,15 @@ pub fn load_lesson_catalog(roots: &[impl AsRef<Path>]) -> LessonCatalog {
             }
             Ok(_) => diagnostics.push(CatalogDiagnostic {
                 path: root.to_owned(),
+                code: CatalogDiagnosticCode::RootNotDirectory,
                 message: "корень не является каталогом".into(),
             }),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => diagnostics.push(CatalogDiagnostic {
                 path: root.to_owned(),
+                code: CatalogDiagnosticCode::Io {
+                    reason: error.to_string(),
+                },
                 message: error.to_string(),
             }),
         }
@@ -262,13 +345,32 @@ pub fn load_lesson_catalog(roots: &[impl AsRef<Path>]) -> LessonCatalog {
                 .entry(lesson.id.clone())
                 .or_default()
                 .push(CatalogLesson { path, lesson }),
-            Err(message) => diagnostics.push(CatalogDiagnostic { path, message }),
+            Err(error) => diagnostics.push(CatalogDiagnostic {
+                path,
+                message: error.to_string(),
+                code: match error {
+                    LessonFileError::Io(reason) => CatalogDiagnosticCode::Io { reason },
+                    LessonFileError::InvalidUtf8(reason) => {
+                        CatalogDiagnosticCode::InvalidUtf8 { reason }
+                    }
+                    LessonFileError::InvalidJson(reason) => {
+                        CatalogDiagnosticCode::InvalidJson { reason }
+                    }
+                    LessonFileError::InvalidLesson(error) => {
+                        CatalogDiagnosticCode::InvalidLesson(error)
+                    }
+                },
+            }),
         }
     }
 
     let mut lessons = Vec::new();
     for (_, mut copies) in by_id {
         if copies.len() > 1 {
+            let conflict_paths = copies
+                .iter()
+                .map(|item| item.path.clone())
+                .collect::<Vec<_>>();
             let paths = copies
                 .iter()
                 .map(|item| item.path.display().to_string())
@@ -277,6 +379,10 @@ pub fn load_lesson_catalog(roots: &[impl AsRef<Path>]) -> LessonCatalog {
             for item in copies {
                 diagnostics.push(CatalogDiagnostic {
                     path: item.path,
+                    code: CatalogDiagnosticCode::DuplicateId {
+                        id: item.lesson.id.clone(),
+                        paths: conflict_paths.clone(),
+                    },
                     message: format!(
                         "повторяется ID урока {} ; конфликтующие пути: {paths}",
                         item.lesson.id
@@ -310,6 +416,9 @@ fn collect_json_files(
         Err(error) => {
             diagnostics.push(CatalogDiagnostic {
                 path: directory.to_owned(),
+                code: CatalogDiagnosticCode::Io {
+                    reason: error.to_string(),
+                },
                 message: error.to_string(),
             });
             return;
@@ -321,6 +430,9 @@ fn collect_json_files(
             Err(error) => {
                 diagnostics.push(CatalogDiagnostic {
                     path: directory.to_owned(),
+                    code: CatalogDiagnosticCode::Io {
+                        reason: error.to_string(),
+                    },
                     message: error.to_string(),
                 });
                 None
@@ -335,6 +447,9 @@ fn collect_json_files(
             Err(error) => {
                 diagnostics.push(CatalogDiagnostic {
                     path,
+                    code: CatalogDiagnosticCode::Io {
+                        reason: error.to_string(),
+                    },
                     message: error.to_string(),
                 });
                 continue;
@@ -355,32 +470,59 @@ fn collect_json_files(
     }
 }
 
-fn read_json_lesson(path: &Path) -> Result<JsonLesson, String> {
-    let bytes = fs::read(path).map_err(|error| error.to_string())?;
-    let source =
-        std::str::from_utf8(&bytes).map_err(|error| format!("файл не в UTF-8: {error}"))?;
-    let lesson: JsonLesson =
-        serde_json::from_str(source).map_err(|error| format!("ошибка JSON: {error}"))?;
-    validate_json_lesson(&lesson)?;
+#[derive(Debug)]
+enum LessonFileError {
+    Io(String),
+    InvalidUtf8(String),
+    InvalidJson(String),
+    InvalidLesson(LessonValidationError),
+}
+
+impl fmt::Display for LessonFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(reason) => f.write_str(reason),
+            Self::InvalidUtf8(reason) => write!(f, "файл не в UTF-8: {reason}"),
+            Self::InvalidJson(reason) => write!(f, "ошибка JSON: {reason}"),
+            Self::InvalidLesson(error) => error.fmt(f),
+        }
+    }
+}
+
+fn read_json_lesson(path: &Path) -> Result<JsonLesson, LessonFileError> {
+    let bytes = fs::read(path).map_err(|error| LessonFileError::Io(error.to_string()))?;
+    let source = std::str::from_utf8(&bytes)
+        .map_err(|error| LessonFileError::InvalidUtf8(error.to_string()))?;
+    let lesson: JsonLesson = serde_json::from_str(source)
+        .map_err(|error| LessonFileError::InvalidJson(error.to_string()))?;
+    validate_json_lesson_typed(&lesson).map_err(LessonFileError::InvalidLesson)?;
     Ok(lesson)
 }
 
 /// Apply the same schema checks used by catalog loading and lesson writes.
 pub fn validate_json_lesson(lesson: &JsonLesson) -> Result<(), String> {
+    validate_json_lesson_typed(lesson).map_err(|error| error.to_string())
+}
+
+/// Typed form of [`validate_json_lesson`] for callers that localize validation
+/// feedback. The string-returning function remains for API compatibility.
+pub fn validate_json_lesson_typed(lesson: &JsonLesson) -> Result<(), LessonValidationError> {
     if lesson.version != 1 {
-        return Err(format!("неподдерживаемая версия урока {}", lesson.version));
+        return Err(LessonValidationError::UnsupportedVersion {
+            version: lesson.version,
+        });
     }
     if lesson.id.trim().is_empty() {
-        return Err("ID не должен быть пустым".into());
+        return Err(LessonValidationError::EmptyId);
     }
     if lesson.title.trim().is_empty() {
-        return Err("название не должно быть пустым".into());
+        return Err(LessonValidationError::EmptyTitle);
     }
     if lesson.text.trim().is_empty() {
-        return Err("текст не должен быть пустым".into());
+        return Err(LessonValidationError::EmptyText);
     }
     if !valid_language_tag_subset(&lesson.language) {
-        return Err("язык должен соответствовать поддерживаемому синтаксису BCP 47: 2–8 латинских букв, затем необязательные части из 1–8 букв или цифр".into());
+        return Err(LessonValidationError::InvalidLanguage);
     }
     Ok(())
 }
@@ -393,15 +535,15 @@ pub fn create_user_lesson(
     catalog_roots: &[impl AsRef<Path>],
     lesson: &JsonLesson,
 ) -> Result<PathBuf, LessonWriteError> {
-    validate_json_lesson(lesson).map_err(LessonWriteError::Invalid)?;
+    validate_json_lesson_typed(lesson).map_err(LessonWriteError::InvalidLesson)?;
     if lesson.id.is_empty()
         || !lesson
             .id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
     {
-        return Err(LessonWriteError::Invalid(
-            "ID должен содержать только латинские буквы, цифры, дефис или подчёркивание".into(),
+        return Err(LessonWriteError::InvalidLesson(
+            LessonValidationError::InvalidIdCharacters,
         ));
     }
     let root = user_root.as_ref();
@@ -426,7 +568,7 @@ pub fn edit_user_lesson(
     catalog_roots: &[impl AsRef<Path>],
     lesson: &JsonLesson,
 ) -> Result<PathBuf, LessonWriteError> {
-    validate_json_lesson(lesson).map_err(LessonWriteError::Invalid)?;
+    validate_json_lesson_typed(lesson).map_err(LessonWriteError::InvalidLesson)?;
     let root = user_root.as_ref();
     ensure_real_directory(root)?;
     let target = path.as_ref();
@@ -463,7 +605,9 @@ pub fn edit_user_lesson(
 
 #[derive(Debug)]
 pub enum LessonWriteError {
+    /// Legacy free-form validation message, retained for API compatibility.
     Invalid(String),
+    InvalidLesson(LessonValidationError),
     UnsafePath,
     AlreadyExists(PathBuf),
     DuplicateId(String),
@@ -473,10 +617,26 @@ pub enum LessonWriteError {
     },
 }
 
+impl LessonWriteError {
+    /// Localization key for this error. Match the public variant to obtain
+    /// interpolation data; do not inspect the display string.
+    pub fn localization_key(&self) -> &'static str {
+        match self {
+            Self::Invalid(_) => "lesson.write.invalid",
+            Self::InvalidLesson(error) => error.localization_key(),
+            Self::UnsafePath => "lesson.write.unsafe_path",
+            Self::AlreadyExists(_) => "lesson.write.already_exists",
+            Self::DuplicateId(_) => "lesson.write.duplicate_id",
+            Self::Io { .. } => "lesson.write.io_error",
+        }
+    }
+}
+
 impl fmt::Display for LessonWriteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid(message) => write!(f, "недопустимый урок: {message}"),
+            Self::InvalidLesson(error) => write!(f, "недопустимый урок: {error}"),
             Self::UnsafePath => write!(f, "небезопасный путь к пользовательскому уроку"),
             Self::AlreadyExists(path) => write!(f, "файл уже существует: {}", path.display()),
             Self::DuplicateId(id) => write!(f, "ID урока уже используется: {id}"),
@@ -517,8 +677,7 @@ fn ensure_id_available(
         .iter()
         .any(|entry| entry.lesson.id == id && Some(entry.path.as_path()) != except)
         || catalog.diagnostics.iter().any(|item| {
-            item.message
-                .contains(&format!("повторяется ID урока {id} "))
+            matches!(&item.code, CatalogDiagnosticCode::DuplicateId { id: duplicate, .. } if duplicate == id)
         })
     {
         return Err(LessonWriteError::DuplicateId(id.to_owned()));
@@ -666,17 +825,118 @@ mod tests {
     fn validation_rejects_future_version_and_empty_title() {
         let mut lesson = json_lesson("id", "body");
         lesson.version = 2;
+        let error = validate_json_lesson_typed(&lesson).unwrap_err();
+        assert_eq!(
+            error,
+            LessonValidationError::UnsupportedVersion { version: 2 }
+        );
+        assert_eq!(
+            error.localization_key(),
+            "lesson.validation.unsupported_version"
+        );
         assert!(validate_json_lesson(&lesson)
             .unwrap_err()
             .contains("версия"));
         lesson.version = 1;
         lesson.title.clear();
+        assert_eq!(
+            validate_json_lesson_typed(&lesson).unwrap_err(),
+            LessonValidationError::EmptyTitle
+        );
         assert!(validate_json_lesson(&lesson)
             .unwrap_err()
             .contains("название"));
         lesson.title = "Title".into();
         lesson.language = "ru_XX".into();
+        assert_eq!(
+            validate_json_lesson_typed(&lesson).unwrap_err(),
+            LessonValidationError::InvalidLanguage
+        );
         assert!(validate_json_lesson(&lesson).unwrap_err().contains("язык"));
+    }
+
+    #[test]
+    fn typed_validation_reports_each_invalid_field_code() {
+        let mut lesson = json_lesson("id", "body");
+        let cases = [
+            (
+                JsonLesson {
+                    id: " ".into(),
+                    ..lesson.clone()
+                },
+                LessonValidationError::EmptyId,
+            ),
+            (
+                JsonLesson {
+                    title: "\t".into(),
+                    ..lesson.clone()
+                },
+                LessonValidationError::EmptyTitle,
+            ),
+            (
+                JsonLesson {
+                    text: "\n".into(),
+                    ..lesson.clone()
+                },
+                LessonValidationError::EmptyText,
+            ),
+            (
+                JsonLesson {
+                    language: "ru_RU".into(),
+                    ..lesson.clone()
+                },
+                LessonValidationError::InvalidLanguage,
+            ),
+        ];
+        for (invalid, expected) in cases {
+            assert_eq!(validate_json_lesson_typed(&invalid), Err(expected));
+        }
+
+        lesson.version = 0;
+        assert_eq!(
+            validate_json_lesson_typed(&lesson),
+            Err(LessonValidationError::UnsupportedVersion { version: 0 })
+        );
+        // Filename safety is a write constraint, not part of the JSON schema.
+        assert_eq!(
+            validate_json_lesson_typed(&json_lesson("../bad", "body")),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validation_error_keys_are_stable_and_version_payload_is_preserved() {
+        let errors = [
+            (
+                LessonValidationError::UnsupportedVersion { version: 7 },
+                "lesson.validation.unsupported_version",
+            ),
+            (LessonValidationError::EmptyId, "lesson.validation.empty_id"),
+            (
+                LessonValidationError::EmptyTitle,
+                "lesson.validation.empty_title",
+            ),
+            (
+                LessonValidationError::EmptyText,
+                "lesson.validation.empty_text",
+            ),
+            (
+                LessonValidationError::InvalidLanguage,
+                "lesson.validation.invalid_language",
+            ),
+            (
+                LessonValidationError::InvalidIdCharacters,
+                "lesson.validation.invalid_id_characters",
+            ),
+        ];
+        for (error, key) in errors {
+            assert_eq!(error.localization_key(), key);
+            assert!(!error.to_string().is_empty());
+        }
+        assert_eq!(
+            LessonValidationError::UnsupportedVersion { version: 7 },
+            LessonValidationError::UnsupportedVersion { version: 7 }
+        );
     }
 
     #[test]
@@ -737,7 +997,10 @@ mod tests {
         assert_eq!(read_json_lesson(&created).unwrap().text, "hello");
         let bad_root = root.join("file");
         fs::write(&bad_root, "keep").unwrap();
-        assert!(create_user_lesson(&bad_root, &roots, &json_lesson("another", "text")).is_err());
+        let error =
+            create_user_lesson(&bad_root, &roots, &json_lesson("another", "text")).unwrap_err();
+        assert_eq!(error.localization_key(), "lesson.write.io_error");
+        assert!(matches!(error, LessonWriteError::Io { path, .. } if path == bad_root));
         assert_eq!(fs::read_to_string(&bad_root).unwrap(), "keep");
         fs::remove_dir_all(root).unwrap();
     }
@@ -754,7 +1017,9 @@ mod tests {
                 &[built_in.clone(), user.clone()],
                 &json_lesson("../escape", "x")
             ),
-            Err(LessonWriteError::Invalid(_))
+            Err(LessonWriteError::InvalidLesson(
+                LessonValidationError::InvalidIdCharacters
+            ))
         ));
         assert!(matches!(
             create_user_lesson(
@@ -806,7 +1071,9 @@ mod tests {
         };
         assert!(matches!(
             edit_user_lesson(&user, &target, &roots, &invalid),
-            Err(LessonWriteError::Invalid(_))
+            Err(LessonWriteError::InvalidLesson(
+                LessonValidationError::EmptyText
+            ))
         ));
         assert_eq!(read_json_lesson(&target).unwrap().text, "original");
 
@@ -879,11 +1146,201 @@ mod tests {
                 "{name}"
             );
         }
+        assert!(catalog.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path.ends_with("encoding.json")
+                && diagnostic.code.localization_key() == "lesson.catalog.invalid_utf8"
+        }));
+        assert!(catalog.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path.ends_with("id.json")
+                && matches!(
+                    diagnostic.code,
+                    CatalogDiagnosticCode::InvalidLesson(LessonValidationError::EmptyId)
+                )
+        }));
+        assert!(catalog.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path.ends_with("plain-file")
+                && diagnostic.code.localization_key() == "lesson.catalog.root_not_directory"
+        }));
         assert!(!catalog
             .diagnostics
             .iter()
             .any(|d| d.path.ends_with("absent")));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_diagnostics_expose_localization_codes_and_dynamic_context() {
+        let root = temp_dir("typed-diagnostics");
+        fs::write(root.join("broken.json"), "{").unwrap();
+        let catalog = load_lesson_catalog(std::slice::from_ref(&root));
+        let diagnostic = catalog
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.path.ends_with("broken.json"))
+            .unwrap();
+        assert_eq!(
+            diagnostic.code.localization_key(),
+            "lesson.catalog.invalid_json"
+        );
+        assert!(matches!(
+            &diagnostic.code,
+            CatalogDiagnosticCode::InvalidJson { reason } if !reason.is_empty()
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_reports_root_filesystem_failure_as_typed_io_diagnostic() {
+        let invalid_path = PathBuf::from("invalid\0lesson-root");
+        let catalog = load_lesson_catalog(std::slice::from_ref(&invalid_path));
+        assert_eq!(catalog.diagnostics.len(), 1);
+        let diagnostic = &catalog.diagnostics[0];
+        assert_eq!(diagnostic.path, invalid_path);
+        assert_eq!(
+            diagnostic.code.localization_key(),
+            "lesson.catalog.io_error"
+        );
+        assert!(matches!(
+            &diagnostic.code,
+            CatalogDiagnosticCode::Io { reason } if !reason.is_empty()
+        ));
+    }
+
+    #[test]
+    fn data_read_error_keeps_path_and_source_for_localized_display() {
+        let error = read_text(&temp_file("missing-data-error")).unwrap_err();
+        assert_eq!(error.localization_key(), "lesson.data.read_error");
+        assert!(matches!(
+            &error,
+            DataError::Io { path, .. } if path.contains("missing-data-error")
+        ));
+        assert!(Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn catalog_error_code_keys_and_payloads_cover_failure_kinds() {
+        let cases = [
+            (
+                CatalogDiagnosticCode::RootIsSymlink,
+                "lesson.catalog.root_symlink",
+            ),
+            (
+                CatalogDiagnosticCode::RootNotDirectory,
+                "lesson.catalog.root_not_directory",
+            ),
+            (
+                CatalogDiagnosticCode::Io {
+                    reason: "denied".into(),
+                },
+                "lesson.catalog.io_error",
+            ),
+            (
+                CatalogDiagnosticCode::InvalidUtf8 {
+                    reason: "byte 4".into(),
+                },
+                "lesson.catalog.invalid_utf8",
+            ),
+            (
+                CatalogDiagnosticCode::InvalidJson {
+                    reason: "line 1".into(),
+                },
+                "lesson.catalog.invalid_json",
+            ),
+            (
+                CatalogDiagnosticCode::InvalidLesson(LessonValidationError::EmptyTitle),
+                "lesson.validation.empty_title",
+            ),
+            (
+                CatalogDiagnosticCode::DuplicateId {
+                    id: "same".into(),
+                    paths: vec![PathBuf::from("a.json"), PathBuf::from("b.json")],
+                },
+                "lesson.catalog.duplicate_id",
+            ),
+        ];
+        for (code, key) in cases {
+            assert_eq!(code.localization_key(), key);
+        }
+
+        let duplicate = CatalogDiagnosticCode::DuplicateId {
+            id: "same".into(),
+            paths: vec![PathBuf::from("a.json"), PathBuf::from("b.json")],
+        };
+        assert!(matches!(
+            duplicate,
+            CatalogDiagnosticCode::DuplicateId { id, paths }
+                if id == "same" && paths == [PathBuf::from("a.json"), PathBuf::from("b.json")]
+        ));
+        let io = CatalogDiagnosticCode::Io {
+            reason: "denied".into(),
+        };
+        assert!(matches!(io, CatalogDiagnosticCode::Io { reason } if reason == "denied"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lesson_catalog_reports_root_symlinks_with_a_typed_code() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("root-symlink");
+        let target = temp_dir("root-symlink-target");
+        let link = root.with_extension("link");
+        symlink(&target, &link).unwrap();
+
+        let catalog = load_lesson_catalog(std::slice::from_ref(&link));
+        assert_eq!(catalog.diagnostics.len(), 1);
+        assert_eq!(catalog.diagnostics[0].path, link);
+        assert_eq!(
+            catalog.diagnostics[0].code,
+            CatalogDiagnosticCode::RootIsSymlink
+        );
+        assert_eq!(
+            catalog.diagnostics[0].code.localization_key(),
+            "lesson.catalog.root_symlink"
+        );
+
+        fs::remove_file(link).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(target).unwrap();
+    }
+
+    #[test]
+    fn lesson_write_errors_expose_localization_keys_without_display_matching() {
+        let error = LessonWriteError::InvalidLesson(LessonValidationError::EmptyId);
+        assert_eq!(error.localization_key(), "lesson.validation.empty_id");
+        let error = LessonWriteError::DuplicateId("same".into());
+        assert_eq!(error.localization_key(), "lesson.write.duplicate_id");
+        let error = LessonWriteError::UnsafePath;
+        assert_eq!(error.localization_key(), "lesson.write.unsafe_path");
+        let errors = [
+            (
+                LessonWriteError::Invalid("detail".into()),
+                "lesson.write.invalid",
+            ),
+            (
+                LessonWriteError::InvalidLesson(LessonValidationError::EmptyId),
+                "lesson.validation.empty_id",
+            ),
+            (
+                LessonWriteError::AlreadyExists(PathBuf::from("lesson.json")),
+                "lesson.write.already_exists",
+            ),
+            (
+                LessonWriteError::DuplicateId("same".into()),
+                "lesson.write.duplicate_id",
+            ),
+            (
+                LessonWriteError::Io {
+                    path: PathBuf::from("lesson.json"),
+                    source: std::io::Error::other("denied"),
+                },
+                "lesson.write.io_error",
+            ),
+        ];
+        for (error, expected_key) in errors {
+            assert_eq!(error.localization_key(), expected_key);
+            assert!(!error.to_string().is_empty());
+        }
     }
 
     #[test]
@@ -1052,11 +1509,24 @@ mod tests {
         let catalog = load_lesson_catalog(std::slice::from_ref(&root));
         assert!(catalog.lessons.is_empty());
         assert_eq!(catalog.diagnostics.len(), 6);
+        let duplicates = catalog
+            .diagnostics
+            .iter()
+            .filter_map(|diagnostic| match &diagnostic.code {
+                CatalogDiagnosticCode::DuplicateId { id, paths } => Some((id, paths)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(duplicates.len(), 2);
+        assert!(duplicates.iter().all(|(id, paths)| {
+            id.as_str() == "same"
+                && paths.as_slice() == [root.join("one.json"), root.join("sub/two.json")]
+        }));
         assert_eq!(
             catalog
                 .diagnostics
                 .iter()
-                .filter(|item| item.message.contains("повторяется ID урока"))
+                .filter(|item| matches!(item.code, CatalogDiagnosticCode::DuplicateId { .. }))
                 .count(),
             2
         );
@@ -1064,17 +1534,28 @@ mod tests {
             .diagnostics
             .iter()
             .any(|item| item.path.ends_with("version.json")
-                && item.message.contains("неподдерживаемая версия урока")));
+                && matches!(
+                    item.code,
+                    CatalogDiagnosticCode::InvalidLesson(
+                        LessonValidationError::UnsupportedVersion { version: 2 }
+                    )
+                )));
         assert!(catalog
             .diagnostics
             .iter()
             .any(|item| item.path.ends_with("blank.json")
-                && item.message.contains("текст не должен быть пустым")));
+                && matches!(
+                    item.code,
+                    CatalogDiagnosticCode::InvalidLesson(LessonValidationError::EmptyText)
+                )));
         assert!(catalog
             .diagnostics
             .iter()
             .any(|item| item.path.ends_with("bad-language.json")
-                && item.message.contains("поддерживаемому синтаксису BCP 47")));
+                && matches!(
+                    item.code,
+                    CatalogDiagnosticCode::InvalidLesson(LessonValidationError::InvalidLanguage)
+                )));
 
         fs::remove_dir_all(root).unwrap();
     }

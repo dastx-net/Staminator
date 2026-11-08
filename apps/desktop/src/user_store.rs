@@ -1,5 +1,6 @@
 //! Local profile and lesson result persistence.
 
+use crate::localization;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::fs;
@@ -7,7 +8,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DEFAULT_PROFILE_NAME: &str = "Пользователь";
 const MAX_RESULTS_PER_PROFILE: usize = 10_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -50,6 +50,8 @@ pub struct Profile {
     pub external_text: Option<ExternalProgress>,
     #[serde(default = "default_content_language")]
     pub content_language: String,
+    #[serde(default = "default_content_language")]
+    pub interface_language: String,
 }
 
 fn default_content_language() -> String {
@@ -84,7 +86,7 @@ impl UserStore {
         if self.database {
             stamina_data::storage::Database::open(&self.path)
                 .map(Some)
-                .map_err(invalid_data)
+                .map_err(storage_io_error)
         } else {
             Ok(None)
         }
@@ -92,18 +94,21 @@ impl UserStore {
 
     /// Restore a checked backup and retain a copy of the previous database.
     pub fn restore_backup(&mut self, source: &Path) -> io::Result<PathBuf> {
-        let mut database = self
-            .database()?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "База данных недоступна"))?;
+        let mut database = self.database()?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                localization::tr("profile.database_unavailable"),
+            )
+        })?;
         let safety_path = self
             .path
             .with_file_name(format!("pre-restore-{}.sqlite3", fresh_id()));
         database
             .restore_from(source, self.revision.get(), &safety_path)
-            .map_err(invalid_data)?;
+            .map_err(storage_io_error)?;
         let loaded = database
             .load_snapshot_with_revision()
-            .map_err(invalid_data)?;
+            .map_err(storage_io_error)?;
         let mut restored: Self =
             serde_json::from_value(serde_json::to_value(loaded.snapshot).map_err(invalid_data)?)
                 .map_err(invalid_data)?;
@@ -125,7 +130,8 @@ impl UserStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut database = stamina_data::storage::Database::open(&path).map_err(invalid_data)?;
+        let mut database =
+            stamina_data::storage::Database::open(&path).map_err(storage_io_error)?;
         let backup = sibling_path(legacy, "bak");
         let source = if legacy.exists() {
             Some(legacy)
@@ -137,11 +143,11 @@ impl UserStore {
         if let Some(source) = source {
             database
                 .import_profiles_json(source)
-                .map_err(invalid_data)?;
+                .map_err(storage_io_error)?;
         }
         let loaded = database
             .load_snapshot_with_revision()
-            .map_err(invalid_data)?;
+            .map_err(storage_io_error)?;
         let before = serde_json::to_value(&loaded.snapshot).map_err(invalid_data)?;
         let mut store: Self =
             serde_json::from_value(serde_json::to_value(loaded.snapshot).map_err(invalid_data)?)
@@ -210,13 +216,7 @@ impl UserStore {
                 .and_then(|mut database| {
                     database.save_snapshot_if_revision(&snapshot, self.revision.get())
                 })
-                .map_err(|error| match error {
-                    stamina_data::storage::StorageError::RevisionConflict { .. } => io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "Данные изменены в другом экземпляре приложения; перезапустите приложение",
-                    ),
-                    error => invalid_data(error),
-                })?;
+                .map_err(storage_io_error)?;
             self.revision.set(revision);
             return Ok(());
         }
@@ -227,7 +227,7 @@ impl UserStore {
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "profile path has no parent directory",
+                    localization::tr("profile.path_no_parent"),
                 )
             })?;
         fs::create_dir_all(parent)?;
@@ -264,7 +264,7 @@ impl UserStore {
         if profile.id.trim().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "profile id cannot be empty",
+                localization::tr("profile.id_empty"),
             ));
         }
         if profile.results.len() > MAX_RESULTS_PER_PROFILE
@@ -272,7 +272,7 @@ impl UserStore {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "invalid profile contents",
+                localization::tr("profile.invalid_contents"),
             ));
         }
         valid_name(&profile.name)?;
@@ -284,7 +284,7 @@ impl UserStore {
         {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "profile id already exists",
+                localization::tr("profile.id_duplicate"),
             ));
         }
         let original = self.clone();
@@ -300,7 +300,7 @@ impl UserStore {
     pub fn active_name(&self) -> &str {
         self.active_profile()
             .map(|p| p.name.as_str())
-            .unwrap_or(DEFAULT_PROFILE_NAME)
+            .unwrap_or("Пользователь")
     }
 
     pub fn active_profile(&self) -> Option<&Profile> {
@@ -313,7 +313,7 @@ impl UserStore {
         if !matches!(language, "RU" | "EN") {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "invalid content language",
+                localization::tr("profile.invalid_content_language"),
             ));
         }
         let original = self.clone();
@@ -321,14 +321,45 @@ impl UserStore {
             .profiles
             .iter_mut()
             .find(|p| p.id == self.active_profile_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "profile not found"))?;
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    localization::tr("profile.not_found"),
+                )
+            })?;
         profile.content_language = language.into();
+        self.commit_or_restore(original)
+    }
+
+    /// Set the interface language for the active profile.
+    pub fn set_interface_language(&mut self, language: &str) -> io::Result<()> {
+        if !matches!(language, "RU" | "EN") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                localization::tr("profile.invalid_interface_language"),
+            ));
+        }
+        let original = self.clone();
+        let profile = self
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == self.active_profile_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    localization::tr("profile.not_found"),
+                )
+            })?;
+        profile.interface_language = language.into();
         self.commit_or_restore(original)
     }
 
     pub fn select(&mut self, id: &str) -> io::Result<()> {
         if !self.profiles.iter().any(|p| p.id == id) {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "profile not found"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                localization::tr("profile.not_found"),
+            ));
         }
         let original = self.clone();
         self.active_profile_id = id.to_owned();
@@ -346,6 +377,7 @@ impl UserStore {
             results: Vec::new(),
             external_text: None,
             content_language: default_content_language(),
+            interface_language: default_content_language(),
         });
         self.active_profile_id = id;
         self.commit_or_restore(original)?;
@@ -358,7 +390,12 @@ impl UserStore {
             .profiles
             .iter()
             .position(|p| p.id == id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "profile not found"))?;
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    localization::tr("profile.not_found"),
+                )
+            })?;
         ensure_unique(&self.profiles, &name, Some(id))?;
         let original = self.clone();
         self.profiles[index].name = name;
@@ -369,14 +406,19 @@ impl UserStore {
         if self.profiles.len() <= 1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "cannot delete the final profile",
+                localization::tr("profile.cannot_delete_last"),
             ));
         }
         let index = self
             .profiles
             .iter()
             .position(|p| p.id == id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "profile not found"))?;
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    localization::tr("profile.not_found"),
+                )
+            })?;
         let original = self.clone();
         self.profiles.remove(index);
         if self.active_profile_id == id {
@@ -408,7 +450,12 @@ impl UserStore {
             .profiles
             .iter_mut()
             .find(|p| p.id == self.active_profile_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "active profile not found"))?;
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    localization::tr("profile.active_not_found"),
+                )
+            })?;
         profile.results.push(ResultRecord {
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -456,7 +503,10 @@ impl UserStore {
                 .iter_mut()
                 .find(|p| p.id == self.active_profile_id)
                 .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "active profile not found")
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        localization::tr("profile.active_not_found"),
+                    )
                 })?;
             profile.external_text = Some(progress);
         }
@@ -479,7 +529,12 @@ impl UserStore {
             .profiles
             .iter_mut()
             .find(|p| p.id == self.active_profile_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "active profile not found"))?;
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    localization::tr("profile.active_not_found"),
+                )
+            })?;
         profile.external_text = Some(progress);
         if let Err(error) = self.save() {
             *self = original;
@@ -532,10 +587,11 @@ impl UserStore {
             let id = fresh_id();
             self.profiles.push(Profile {
                 id: id.clone(),
-                name: DEFAULT_PROFILE_NAME.into(),
+                name: "Пользователь".into(),
                 results: Vec::new(),
                 external_text: None,
                 content_language: default_content_language(),
+                interface_language: "RU".into(),
             });
             self.active_profile_id = id;
         } else if !self.profiles.iter().any(|p| p.id == self.active_profile_id) {
@@ -555,7 +611,7 @@ fn valid_name(value: &str) -> io::Result<String> {
     if name.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "profile name cannot be empty",
+            localization::tr("profile.name_empty"),
         ));
     }
     Ok(name.to_owned())
@@ -568,7 +624,7 @@ fn ensure_unique(profiles: &[Profile], name: &str, except_id: Option<&str>) -> i
     {
         Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            "profile name already exists",
+            localization::tr("profile.name_duplicate"),
         ))
     } else {
         Ok(())
@@ -607,11 +663,66 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
+fn storage_io_error(error: stamina_data::storage::StorageError) -> io::Error {
+    let kind = if matches!(
+        &error,
+        stamina_data::storage::StorageError::RevisionConflict { .. }
+    ) {
+        io::ErrorKind::WouldBlock
+    } else {
+        io::ErrorKind::InvalidData
+    };
+    io::Error::new(kind, localization::StorageErrorMessage(error))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     type FailureOperation = (&'static str, Box<dyn Fn(&mut UserStore) -> io::Result<()>>);
+
+    #[test]
+    fn storage_revision_conflict_keeps_kind_and_typed_source_with_localized_text() {
+        let error = storage_io_error(stamina_data::storage::StorageError::RevisionConflict {
+            expected: 3,
+            actual: 5,
+        });
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            error.to_string(),
+            "Данные профиля изменились в другом окне (ожидалась версия 3, текущая версия 5)."
+        );
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|wrapper| wrapper.source())
+                .and_then(|source| source.downcast_ref::<stamina_data::storage::StorageError>()),
+            Some(stamina_data::storage::StorageError::RevisionConflict {
+                expected: 3,
+                actual: 5
+            })
+        ));
+    }
+
+    #[test]
+    fn future_schema_error_retains_kind_source_and_selected_language() {
+        localization::set_language("EN");
+        let error = storage_io_error(stamina_data::storage::StorageError::FutureSchema(99));
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "Database schema version 99 is newer than supported."
+        );
+        assert!(
+            error
+                .get_ref()
+                .unwrap()
+                .source()
+                .unwrap()
+                .is::<stamina_data::storage::StorageError>()
+        );
+        localization::set_language("RU");
+    }
 
     #[test]
     fn imported_profile_keeps_id_and_rejects_conflicts() {
@@ -623,6 +734,7 @@ mod tests {
             results: Vec::new(),
             external_text: None,
             content_language: "EN".into(),
+            interface_language: "RU".into(),
         };
         store.import_profile(profile.clone()).unwrap();
         assert_eq!(store.active_profile(), Some(&profile));
@@ -633,6 +745,74 @@ mod tests {
         let reloaded = UserStore::load_from(&path).unwrap();
         assert_eq!(reloaded.active_profile_id(), "portable-id");
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn profile_validation_errors_use_selected_locale_without_mutating_store() {
+        let path = test_path();
+        let mut store = UserStore::new_at(&path);
+        let active_id = store.active_profile_id().to_owned();
+
+        localization::set_language("RU");
+        assert_eq!(
+            store.create("  ").unwrap_err().to_string(),
+            "Введите имя профиля"
+        );
+        assert_eq!(
+            store.create("Пользователь").unwrap_err().to_string(),
+            "Профиль с таким именем уже существует"
+        );
+        assert_eq!(
+            store.delete(&active_id).unwrap_err().to_string(),
+            "Нельзя удалить последний профиль"
+        );
+        assert_eq!(
+            store.set_content_language("XX").unwrap_err().to_string(),
+            "В профиле указан неверный язык текста"
+        );
+        assert_eq!(
+            store.set_interface_language("XX").unwrap_err().to_string(),
+            "В профиле указан неверный язык интерфейса"
+        );
+
+        localization::set_language("EN");
+        assert_eq!(
+            store.select("missing").unwrap_err().to_string(),
+            "The profile was not found"
+        );
+        let duplicate = Profile {
+            id: active_id.clone(),
+            name: "Another name".into(),
+            results: Vec::new(),
+            external_text: None,
+            content_language: "RU".into(),
+            interface_language: "RU".into(),
+        };
+        assert_eq!(
+            store.import_profile(duplicate).unwrap_err().to_string(),
+            "A profile with this ID already exists"
+        );
+        assert_eq!(store.profiles().len(), 1);
+        assert_eq!(store.active_profile_id(), active_id);
+
+        localization::set_language("RU");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn saving_profile_without_parent_reports_localized_error_and_rolls_back() {
+        for (locale, expected) in [
+            ("RU", "У пути к профилю нет родительской папки"),
+            ("EN", "The profile path has no parent directory"),
+        ] {
+            localization::set_language(locale);
+            let mut store = UserStore::new_at(PathBuf::from("profiles.json"));
+            let error = store.create("Alice").unwrap_err();
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(store.profiles().len(), 1);
+            assert_eq!(store.active_name(), "Пользователь");
+        }
+        localization::set_language("RU");
     }
 
     #[test]
@@ -1033,6 +1213,38 @@ mod tests {
                 .profiles()
                 .iter()
                 .find(|p| p.id == "english")
+                .unwrap()
+                .content_language,
+            "EN"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn interface_language_is_profile_scoped_and_persists_across_switches() {
+        let path = test_path().with_extension("sqlite3");
+        let legacy = path.with_extension("json");
+        let mut store = UserStore::load_database(path.clone(), &legacy).unwrap();
+        let first = store.active_profile_id().to_owned();
+        store.set_content_language("EN").unwrap();
+        store.set_interface_language("EN").unwrap();
+        let second = store.create("Second").unwrap().id.clone();
+        assert_eq!(store.active_profile().unwrap().interface_language, "RU");
+        store.set_interface_language("EN").unwrap();
+        store.select(&first).unwrap();
+        assert_eq!(store.active_profile().unwrap().content_language, "EN");
+        assert_eq!(store.active_profile().unwrap().interface_language, "EN");
+        store.select(&second).unwrap();
+        assert_eq!(store.active_profile().unwrap().interface_language, "EN");
+
+        let reopened = UserStore::load_database(path.clone(), &legacy).unwrap();
+        assert_eq!(reopened.active_profile_id(), second);
+        assert_eq!(reopened.active_profile().unwrap().interface_language, "EN");
+        assert_eq!(
+            reopened
+                .profiles()
+                .iter()
+                .find(|p| p.id == first)
                 .unwrap()
                 .content_language,
             "EN"

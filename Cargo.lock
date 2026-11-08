@@ -3185,6 +3185,7 @@ dependencies = [
 name = "staminator-core"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "stamina-data",
 ]
 
@@ -3202,6 +3203,7 @@ dependencies = [
  "serde_json",
  "stamina-data",
  "staminator-core",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

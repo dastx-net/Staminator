@@ -1,6 +1,8 @@
 use egui::{Align, Context, Grid, RichText, Window};
 use staminator_core::SessionStats;
 
+use crate::localization::tr;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultAction {
     Stay,
@@ -21,7 +23,7 @@ pub fn show(
 ) -> ResultAction {
     let mut action = ResultAction::Stay;
 
-    Window::new("Результат занятия")
+    Window::new(tr("result.title"))
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -30,9 +32,9 @@ pub fn show(
             ui.label(RichText::new(title).strong());
             ui.add_space(8.0);
             ui.label(if completed {
-                "Упражнение завершено"
+                tr("result.completed")
             } else {
-                "Занятие остановлено"
+                tr("result.stopped")
             });
             ui.add_space(8.0);
 
@@ -40,26 +42,37 @@ pub fn show(
                 .num_columns(2)
                 .spacing([24.0, 6.0])
                 .show(ui, |ui| {
-                    metric(ui, "Время", format_duration(stats.elapsed_ms));
-                    metric(ui, "Правильно", stats.correct.to_string());
-                    metric(ui, "Ошибки", stats.errors.to_string());
-                    metric(ui, "Точность", format!("{:.1}%", accuracy(stats)));
-                    metric(ui, "Скорость", format!("{} зн./мин", stats.cpm));
+                    metric(ui, &tr("result.time"), format_duration(stats.elapsed_ms));
+                    metric(ui, &tr("result.correct"), stats.correct.to_string());
+                    metric(ui, &tr("result.errors"), stats.errors.to_string());
+                    metric(
+                        ui,
+                        &tr("result.accuracy"),
+                        format!("{:.1}%", accuracy(stats)),
+                    );
+                    metric(
+                        ui,
+                        &tr("result.speed"),
+                        crate::localization::format(
+                            "unit.characters_per_minute",
+                            &staminator_core::FormatArgs::new().insert("value", stats.cpm),
+                        ),
+                    );
                 });
 
             ui.add_space(14.0);
             ui.horizontal(|ui| {
-                if can_continue && ui.button("Продолжить").clicked() {
+                if can_continue && ui.button(tr("result.continue")).clicked() {
                     action = ResultAction::Continue;
                 }
-                if ui.button("Повторить").clicked() {
+                if ui.button(tr("result.retry")).clicked() {
                     action = ResultAction::Retry;
                 }
-                if has_next && ui.button("Далее").clicked() {
+                if has_next && ui.button(tr("result.next")).clicked() {
                     action = ResultAction::Next;
                 }
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Закрыть").clicked() {
+                    if ui.button(tr("common.close")).clicked() {
                         action = ResultAction::Close;
                     }
                 });

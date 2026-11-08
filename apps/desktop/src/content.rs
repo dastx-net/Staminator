@@ -1,5 +1,7 @@
 //! Read-only lesson and phrase catalog backed by the original Stamina data files.
 
+use crate::localization;
+use staminator_core::FormatArgs;
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +24,7 @@ pub struct ContentCatalog {
     english_lesson_ids: Vec<String>,
     lesson_groups: std::collections::HashMap<String, String>,
     lesson_roots: Vec<PathBuf>,
+    data_dir: Option<PathBuf>,
     lesson_diagnostics: String,
     user_phrase_root: Option<PathBuf>,
     english_lessons: Vec<Exercise>,
@@ -114,6 +117,7 @@ impl ContentCatalog {
                 .collect(),
             lesson_groups: std::collections::HashMap::new(),
             lesson_roots: Vec::new(),
+            data_dir: Some(data_dir.to_owned()),
             lesson_diagnostics: String::new(),
             user_phrase_root: None,
             russian_lessons,
@@ -136,6 +140,7 @@ impl ContentCatalog {
             english_lesson_ids: vec!["en.1".into(), "en.2".into()],
             lesson_groups: std::collections::HashMap::new(),
             lesson_roots: Vec::new(),
+            data_dir: None,
             lesson_diagnostics: String::new(),
             user_phrase_root: None,
             russian_lessons: vec![
@@ -194,6 +199,7 @@ impl ContentCatalog {
             english_lesson_ids: Vec::new(),
             lesson_groups: std::collections::HashMap::new(),
             lesson_roots: Vec::new(),
+            data_dir: None,
             lesson_diagnostics: String::new(),
             user_phrase_root: None,
             russian_lessons: Vec::new(),
@@ -204,7 +210,7 @@ impl ContentCatalog {
             english_keys: String::new(),
             russian_caps: String::new(),
             english_caps: String::new(),
-            diagnostics: "No training content available".into(),
+            diagnostics: localization::tr("content.no_training_content"),
         }
     }
 
@@ -278,7 +284,36 @@ impl ContentCatalog {
         self.lesson_diagnostics = catalog
             .diagnostics
             .iter()
-            .map(|d| format!("{}: {}", d.path.display(), d.message))
+            .map(localization::lesson_diagnostic)
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
+    /// Re-render startup file diagnostics using the currently selected UI language.
+    /// This reads diagnostic sources again but leaves lessons, phrases, and progress intact.
+    pub fn refresh_diagnostics(&mut self) {
+        if self.data_dir.is_none() && !self.diagnostics.is_empty() {
+            self.diagnostics = localization::tr("content.no_training_content");
+        }
+        if let Some(data_dir) = self.data_dir.as_ref() {
+            let mut diagnostics = Vec::new();
+            let _ = load_phrases(
+                &data_dir.join("phrases.ru"),
+                "Russian phrases",
+                &mut diagnostics,
+            );
+            let _ = load_phrases(
+                &data_dir.join("phrases.en"),
+                "English phrases",
+                &mut diagnostics,
+            );
+            self.diagnostics = diagnostics.join("\n");
+        }
+        let catalog = stamina_data::load_lesson_catalog(&self.lesson_roots);
+        self.lesson_diagnostics = catalog
+            .diagnostics
+            .iter()
+            .map(localization::lesson_diagnostic)
             .collect::<Vec<_>>()
             .join("\n");
     }
@@ -392,7 +427,7 @@ impl ContentCatalog {
         if phrases.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "phrase batch must not be empty",
+                localization::tr("content.phrase_batch_empty"),
             ));
         }
         let normalized: Vec<_> = phrases.iter().map(|phrase| phrase.trim()).collect();
@@ -402,13 +437,13 @@ impl ContentCatalog {
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "phrase batch contains an empty or multiline phrase",
+                localization::tr("content.phrase_batch_invalid"),
             ));
         }
         let root = self.user_phrase_root.as_ref().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "user data directory unavailable",
+                localization::tr("content.user_data_unavailable"),
             )
         })?;
         let language_dir = root.join(match language {
@@ -581,6 +616,11 @@ fn load_phrases(
     label: &str,
     diagnostics: &mut Vec<String>,
 ) -> Vec<Exercise> {
+    let label = match label {
+        "Russian phrases" => localization::tr("content.russian_phrases"),
+        "English phrases" => localization::tr("content.english_phrases"),
+        _ => label.to_owned(),
+    };
     match stamina_data::read_phrases(path) {
         Ok(phrases) => {
             let exercises: Vec<_> = phrases
@@ -593,17 +633,30 @@ fn load_phrases(
                 })
                 .collect();
             if exercises.is_empty() {
-                diagnostics.push(format!(
-                    "{label}: no nonempty phrases in {}",
-                    path.display()
+                diagnostics.push(localization::format(
+                    "content.no_nonempty_phrases",
+                    &FormatArgs::new()
+                        .insert("label", &label)
+                        .insert("path", path.display()),
                 ));
                 Vec::new()
             } else {
                 exercises
             }
         }
-        Err(error) => {
-            diagnostics.push(format!("{label}: {error}; no content available"));
+        Err(stamina_data::DataError::Io { path, source }) => {
+            let error = localization::format(
+                "lesson.data.read_error",
+                &FormatArgs::new()
+                    .insert("path", path)
+                    .insert("reason", source),
+            );
+            diagnostics.push(localization::format(
+                "content.unavailable",
+                &FormatArgs::new()
+                    .insert("label", &label)
+                    .insert("error", error),
+            ));
             Vec::new()
         }
     }
@@ -644,6 +697,20 @@ mod tests {
             std::process::id(),
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn empty_catalog_diagnostic_follows_interface_language() {
+        crate::localization::set_language("RU");
+        let mut catalog = ContentCatalog::fixture_empty();
+        assert_eq!(
+            catalog.diagnostics(),
+            "Нет доступных материалов для тренировки"
+        );
+        crate::localization::set_language("EN");
+        catalog.refresh_diagnostics();
+        assert_eq!(catalog.diagnostics(), "No training content is available");
+        crate::localization::set_language("RU");
     }
 
     #[test]
@@ -928,6 +995,7 @@ mod tests {
 
     #[test]
     fn catalog_loads_available_data_and_reports_missing_files() {
+        crate::localization::set_language("RU");
         let root = temp_file("catalog");
         let data = root.join("Data");
         fs::create_dir_all(&data).unwrap();
@@ -946,7 +1014,7 @@ mod tests {
         assert!(catalog.phrases(ContentLanguage::Russian).is_empty());
         assert_eq!(catalog.keys(ContentLanguage::Russian), "abc");
         assert_eq!(catalog.keys(ContentLanguage::English), "xyz");
-        assert!(catalog.diagnostics().contains("Russian phrases"));
+        assert!(catalog.diagnostics().contains("Русские фразы"));
 
         fs::remove_file(data.join("lessons.ru")).unwrap();
         fs::remove_file(data.join("phrases.en")).unwrap();
@@ -1031,6 +1099,7 @@ mod tests {
 
     #[test]
     fn load_phrases_returns_empty_and_diagnostic_for_missing_or_empty_file() {
+        crate::localization::set_language("RU");
         let missing = temp_file("phrases-missing");
         let empty = temp_file("phrases-empty");
         fs::write(&empty, " \r\n\t\n").unwrap();
@@ -1040,14 +1109,14 @@ mod tests {
             load_phrases(&missing, "test phrases", &mut missing_diagnostics,),
             []
         );
-        assert!(missing_diagnostics[0].contains("no content available"));
+        assert!(missing_diagnostics[0].contains("материалы недоступны"));
 
         let mut empty_diagnostics = Vec::new();
         assert_eq!(
             load_phrases(&empty, "test phrases", &mut empty_diagnostics,),
             []
         );
-        assert!(empty_diagnostics[0].contains("no nonempty phrases"));
+        assert!(empty_diagnostics[0].contains("нет непустых фраз"));
         fs::remove_file(empty).unwrap();
     }
 

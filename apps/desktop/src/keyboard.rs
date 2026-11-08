@@ -275,11 +275,11 @@ pub fn draw_keyboard(ui: &mut Ui, layout: KeyboardLayout, active: Option<char>) 
                     Color32::from_rgb(236, 239, 241),
                 );
             } else {
-                let label = if top.is_empty() { "Space" } else { top };
+                let label = special_key_label(top, row_index, key_index);
                 painter.text(
                     key_rect.center(),
                     Align2::CENTER_CENTER,
-                    label,
+                    &label,
                     FontId::proportional(
                         (key_h * if key_units > 1.5 { 0.31 } else { 0.36 }).clamp(8.0, 21.0),
                     ),
@@ -292,16 +292,16 @@ pub fn draw_keyboard(ui: &mut Ui, layout: KeyboardLayout, active: Option<char>) 
 
     let legend_y = y0 + 5.0 * key_h + 4.0 * gap + 1.0;
     let legend = [
-        ("Л миз.", 0),
-        ("Л без.", 1),
-        ("Л сред.", 2),
-        ("Л указ.", 3),
-        ("П указ.", 4),
-        ("П сред.", 5),
-        ("П без.", 6),
-        ("П миз.", 7),
-        ("Л больш.", 8),
-        ("П больш.", 9),
+        ("keyboard.finger.left_little", 0),
+        ("keyboard.finger.left_ring", 1),
+        ("keyboard.finger.left_middle", 2),
+        ("keyboard.finger.left_index", 3),
+        ("keyboard.finger.right_index", 4),
+        ("keyboard.finger.right_middle", 5),
+        ("keyboard.finger.right_ring", 6),
+        ("keyboard.finger.right_little", 7),
+        ("keyboard.finger.left_thumb", 8),
+        ("keyboard.finger.right_thumb", 9),
     ];
     let item_w = (width - 2.0 * pad_x) / legend.len() as f32;
     for (i, (label, color_index)) in legend.into_iter().enumerate() {
@@ -311,11 +311,52 @@ pub fn draw_keyboard(ui: &mut Ui, layout: KeyboardLayout, active: Option<char>) 
         painter.text(
             Pos2::new(left + 10.0, legend_y + 6.5),
             Align2::LEFT_CENTER,
-            label,
+            crate::localization::tr(label),
             FontId::proportional((height * 0.055).clamp(8.0, 11.0)),
             Color32::from_rgb(201, 208, 214),
         );
     }
+}
+
+fn special_key_label(top: &str, row: usize, column: usize) -> String {
+    let (scan, fallback) = match top {
+        "Backspace" => (0x0e, "Backspace"),
+        "Tab" => (0x0f, "Tab"),
+        "Caps" => (0x3a, "Caps Lock"),
+        "Enter" => (0x1c, "Enter"),
+        "Shift" if row == 3 && column > 0 => (0x36, "Shift"),
+        "Shift" => (0x2a, "Shift"),
+        "Ctrl" if column > 3 => (0x11d, "Ctrl"),
+        "Ctrl" => (0x1d, "Ctrl"),
+        "Alt" if column > 3 => (0x138, "Alt"),
+        "Alt" => (0x38, "Alt"),
+        "Win" if column > 3 => (0x15c, "Win"),
+        "Win" => (0x15b, "Win"),
+        "Menu" => (0x15d, "Menu"),
+        "" => (0x39, "Space"),
+        _ => return top.to_owned(),
+    };
+    system_key_name(scan).unwrap_or_else(|| fallback.to_owned())
+}
+
+#[cfg(windows)]
+fn system_key_name(scan: i32) -> Option<String> {
+    let mut buffer = [0u16; 128];
+    // SAFETY: the buffer is writable for the length supplied, and the scan code is a value.
+    // Bit 8 of scan marks extended keys; shifting places it in Windows bit 24.
+    let len = unsafe {
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::GetKeyNameTextW(
+            scan << 16,
+            buffer.as_mut_ptr(),
+            buffer.len() as i32,
+        )
+    };
+    (len > 0).then(|| String::from_utf16_lossy(&buffer[..len as usize]))
+}
+
+#[cfg(not(windows))]
+fn system_key_name(_scan: i32) -> Option<String> {
+    None
 }
 
 fn key_matches_character(ch: char, top: &str, bottom: &str) -> bool {
@@ -445,6 +486,13 @@ mod tests {
             paint(KeyboardLayout::English, Some('A')),
             paint(KeyboardLayout::English, Some('a'))
         );
+    }
+
+    #[test]
+    fn special_keys_have_names_and_character_labels_are_preserved() {
+        assert_eq!(super::special_key_label("Й", 1, 1), "Й");
+        assert!(!super::special_key_label("Backspace", 0, 13).is_empty());
+        assert!(!super::special_key_label("", 4, 3).is_empty());
     }
 
     #[test]

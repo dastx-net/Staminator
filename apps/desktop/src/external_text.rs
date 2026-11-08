@@ -1,5 +1,7 @@
 //! Loading and indexing user supplied text files.
 
+use crate::localization;
+use staminator_core::FormatArgs;
 use std::io::{BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 
@@ -57,7 +59,7 @@ impl ExternalFile {
         if index > self.char_count {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "индекс за концом файла",
+                localization::tr("external_text.index_past_end"),
             ));
         }
         let offset = if index == 0 {
@@ -109,7 +111,7 @@ impl ExternalFile {
         if !valid {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "смещение не соответствует нормализованному символу",
+                localization::tr("external_text.invalid_offset"),
             ));
         }
         self.fresh_stream_at(offset)
@@ -134,7 +136,7 @@ impl ExternalFile {
         }
         Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "смещение не соответствует нормализованному символу",
+            localization::tr("external_text.invalid_offset"),
         ))
     }
 
@@ -201,13 +203,16 @@ impl ExternalText {
         let decoded = std::str::from_utf8(bytes).map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("файл должен быть в кодировке UTF-8: {error}"),
+                localization::format(
+                    "external_text.invalid_utf8_detail",
+                    &FormatArgs::new().insert("error", error),
+                ),
             )
         })?;
         if decoded.contains('\0') {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "файл должен быть текстом UTF-8 без нулевых байтов",
+                localization::tr("external_text.nul_byte"),
             ));
         }
         let (decoded, offset) = decoded
@@ -263,7 +268,7 @@ impl<R: Read> ExternalTextStream<R> {
         if max_chars == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "размер фрагмента должен быть больше нуля",
+                localization::tr("external_text.zero_fragment_size"),
             ));
         }
         let mut text = String::new();
@@ -283,7 +288,7 @@ impl<R: Read> ExternalTextStream<R> {
             if ch == '\0' {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "файл должен быть текстом UTF-8 без нулевых байтов",
+                    localization::tr("external_text.nul_byte"),
                 ));
             }
             if ch.is_whitespace() {
@@ -363,7 +368,10 @@ impl<R: Read> ExternalTextStream<R> {
 fn invalid_utf8(offset: usize) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidData,
-        format!("файл должен быть в кодировке UTF-8 (байт {offset})"),
+        localization::format(
+            "external_text.invalid_utf8",
+            &FormatArgs::new().insert("offset", offset),
+        ),
     )
 }
 

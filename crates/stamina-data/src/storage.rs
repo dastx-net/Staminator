@@ -7,17 +7,22 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 /// Ordered migrations. Entry `n` upgrades schema version `n` to `n + 1`.
 const MIGRATIONS: &[fn(&rusqlite::Transaction<'_>) -> rusqlite::Result<()>] =
-    &[migrate_0_to_1, migrate_1_to_2];
+    &[migrate_0_to_1, migrate_1_to_2, migrate_2_to_3];
 
 fn migrate_0_to_1(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
     tx.execute_batch("CREATE TABLE profiles(id TEXT PRIMARY KEY,name TEXT NOT NULL,content_language TEXT NOT NULL,external_text TEXT); CREATE TABLE sessions(id INTEGER PRIMARY KEY,profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,timestamp INTEGER NOT NULL,mode TEXT NOT NULL,layout TEXT NOT NULL,exercise TEXT NOT NULL,correct INTEGER NOT NULL,errors INTEGER NOT NULL,elapsed_ms INTEGER NOT NULL,cpm REAL NOT NULL,error_percent REAL NOT NULL); CREATE INDEX sessions_profile_time ON sessions(profile_id,timestamp); CREATE TABLE settings(profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,key TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(profile_id,key)); CREATE TABLE book_positions(profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,identity TEXT NOT NULL,encoding TEXT NOT NULL,offset INTEGER NOT NULL,PRIMARY KEY(profile_id,identity)); CREATE TABLE lessons(id TEXT PRIMARY KEY,document TEXT NOT NULL,built_in INTEGER NOT NULL); CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);")
 }
 fn migrate_1_to_2(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
     tx.execute_batch("ALTER TABLE sessions ADD COLUMN stop_reason TEXT NOT NULL DEFAULT 'unknown';")
+}
+fn migrate_2_to_3(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "ALTER TABLE profiles ADD COLUMN interface_language TEXT NOT NULL DEFAULT 'RU';",
+    )
 }
 
 #[derive(Debug)]
@@ -116,6 +121,8 @@ pub struct Profile {
     pub external_text: Option<ExternalProgress>,
     #[serde(default = "default_language")]
     pub content_language: String,
+    #[serde(default = "default_language")]
+    pub interface_language: String,
 }
 fn default_language() -> String {
     "RU".into()
@@ -410,8 +417,8 @@ impl Database {
                 .map(serde_json::to_string)
                 .transpose()?;
             tx.execute(
-                "INSERT INTO profiles(id,name,content_language,external_text) VALUES(?1,?2,?3,?4)",
-                params![p.id, p.name, p.content_language, ext],
+                "INSERT INTO profiles(id,name,content_language,external_text,interface_language) VALUES(?1,?2,?3,?4,?5)",
+                params![p.id, p.name, p.content_language, ext, p.interface_language],
             )?;
             for r in &p.results {
                 insert_result(&tx, &p.id, r)?;
@@ -656,7 +663,7 @@ fn save_snapshot_tx(tx: &rusqlite::Transaction<'_>, s: &Snapshot) -> Result<(), 
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        tx.execute("INSERT INTO profiles(id,name,content_language,external_text) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET name=excluded.name,content_language=excluded.content_language,external_text=excluded.external_text", params![p.id,p.name,p.content_language,ext])?;
+        tx.execute("INSERT INTO profiles(id,name,content_language,external_text,interface_language) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET name=excluded.name,content_language=excluded.content_language,external_text=excluded.external_text,interface_language=excluded.interface_language", params![p.id,p.name,p.content_language,ext,p.interface_language])?;
         let old_results = load_results(tx, &p.id)?;
         if p.results.starts_with(&old_results) {
             for r in &p.results[old_results.len()..] {
@@ -704,23 +711,25 @@ fn load_results(c: &Connection, id: &str) -> Result<Vec<ResultRecord>, StorageEr
 
 fn load_snapshot_conn(c: &Connection) -> Result<Snapshot, StorageError> {
     let mut stmt =
-        c.prepare("SELECT id,name,content_language,external_text FROM profiles ORDER BY rowid")?;
+        c.prepare("SELECT id,name,content_language,external_text,interface_language FROM profiles ORDER BY rowid")?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
             r.get::<_, Option<String>>(3)?,
+            r.get::<_, String>(4)?,
         ))
     })?;
     let mut profiles = Vec::new();
     for row in rows {
-        let (id, name, content_language, ext) = row?;
+        let (id, name, content_language, ext, interface_language) = row?;
         profiles.push(Profile {
             results: load_results(c, &id)?,
             id,
             name,
             content_language,
+            interface_language,
             external_text: ext.map(|x| serde_json::from_str(&x)).transpose()?,
         });
     }
@@ -761,6 +770,7 @@ mod tests {
                 results: vec![],
                 external_text: None,
                 content_language: "RU".into(),
+                interface_language: "RU".into(),
             }],
             active_profile_id: "p".into(),
         };
@@ -782,6 +792,7 @@ mod tests {
                     id: "current".into(),
                     name: "Current".into(),
                     content_language: "RU".into(),
+                    interface_language: "RU".into(),
                     external_text: None,
                     results: vec![],
                 }],
@@ -796,6 +807,7 @@ mod tests {
                     id: "restored".into(),
                     name: "Restored".into(),
                     content_language: "RU".into(),
+                    interface_language: "RU".into(),
                     external_text: None,
                     results: vec![],
                 }],
@@ -857,6 +869,7 @@ mod tests {
                     id: "keep".into(),
                     name: "Keep".into(),
                     content_language: "RU".into(),
+                    interface_language: "RU".into(),
                     external_text: None,
                     results: vec![],
                 }],
@@ -894,6 +907,7 @@ mod tests {
                     id: "keep".into(),
                     name: "Keep".into(),
                     content_language: "RU".into(),
+                    interface_language: "RU".into(),
                     external_text: None,
                     results: vec![],
                 }],
@@ -933,6 +947,7 @@ mod tests {
                     id: "keep".into(),
                     name: "Keep".into(),
                     content_language: "RU".into(),
+                    interface_language: "RU".into(),
                     external_text: None,
                     results: vec![],
                 }],
@@ -972,6 +987,7 @@ mod tests {
                     id: "old-current".into(),
                     name: "Current".into(),
                     content_language: "RU".into(),
+                    interface_language: "RU".into(),
                     external_text: None,
                     results: vec![],
                 }],
@@ -1026,6 +1042,7 @@ mod tests {
                 results: vec![],
                 external_text: None,
                 content_language: "RU".into(),
+                interface_language: "RU".into(),
             }],
             active_profile_id: "p".into(),
         };
@@ -1070,6 +1087,7 @@ mod tests {
                 id: "p".into(),
                 name: "Alice".into(),
                 content_language: "RU".into(),
+                interface_language: "RU".into(),
                 external_text: None,
                 results: vec![ResultRecord {
                     timestamp: 7,
@@ -1101,6 +1119,7 @@ mod tests {
                 id: "p".into(),
                 name: "first".into(),
                 content_language: "RU".into(),
+                interface_language: "RU".into(),
                 external_text: None,
                 results: vec![],
             }],
@@ -1117,6 +1136,7 @@ mod tests {
                 id: "p".into(),
                 name: "stale".into(),
                 content_language: "RU".into(),
+                interface_language: "RU".into(),
                 external_text: None,
                 results: vec![],
             }],
@@ -1155,6 +1175,7 @@ mod tests {
                 id: "p".into(),
                 name: "P".into(),
                 content_language: "RU".into(),
+                interface_language: "RU".into(),
                 external_text: None,
                 results: vec![ResultRecord {
                     timestamp: 1,
@@ -1195,7 +1216,7 @@ mod tests {
     }
 
     #[test]
-    fn version_one_database_migrates_to_v2_with_legacy_stop_reason() {
+    fn version_one_database_migrates_with_legacy_defaults() {
         let path = std::env::temp_dir().join(format!("stamina-v1-{}.db", std::process::id()));
         let c = Connection::open(&path).unwrap();
         let tx = c.unchecked_transaction().unwrap();
@@ -1210,6 +1231,10 @@ mod tests {
         tx.commit().unwrap();
         drop(c);
         let d = Database::open(&path).unwrap();
+        assert_eq!(
+            d.load_snapshot().unwrap().profiles[0].interface_language,
+            "RU"
+        );
         assert_eq!(
             d.load_snapshot().unwrap().profiles[0].results[0].stop_reason,
             "unknown"
@@ -1285,6 +1310,7 @@ mod tests {
             id: "p".into(),
             name: "P".into(),
             content_language: "RU".into(),
+            interface_language: "RU".into(),
             external_text: None,
             results: vec![],
         };
@@ -1381,6 +1407,7 @@ mod tests {
                 id: "p".into(),
                 name: "Original".into(),
                 content_language: "RU".into(),
+                interface_language: "RU".into(),
                 external_text: None,
                 results: vec![],
             }],
@@ -1393,6 +1420,7 @@ mod tests {
                 id: "p".into(),
                 name: "Changed".into(),
                 content_language: "RU".into(),
+                interface_language: "RU".into(),
                 external_text: None,
                 results: vec![ResultRecord {
                     timestamp: 1,
@@ -1425,6 +1453,7 @@ mod tests {
                 id: "existing".into(),
                 name: "Existing".into(),
                 content_language: "RU".into(),
+                interface_language: "RU".into(),
                 external_text: None,
                 results: vec![],
             }],
@@ -1495,6 +1524,7 @@ mod tests {
                 id: "p".into(),
                 name: "P".into(),
                 content_language: "RU".into(),
+                interface_language: "RU".into(),
                 external_text: None,
                 results: vec![],
             }],
@@ -1547,6 +1577,7 @@ mod tests {
                 id: "p".into(),
                 name: "Backup".into(),
                 content_language: "RU".into(),
+                interface_language: "RU".into(),
                 external_text: None,
                 results: vec![],
             }],
@@ -1575,6 +1606,7 @@ mod tests {
                 id: "p".into(),
                 name: "P".into(),
                 content_language: "RU".into(),
+                interface_language: "RU".into(),
                 external_text: None,
                 results: vec![],
             }],
@@ -1712,6 +1744,7 @@ mod tests {
                 results: vec![result],
                 external_text: Some(external_text),
                 content_language: "RU".into(),
+                interface_language: "RU".into(),
             }],
             active_profile_id: "p".into(),
         };
@@ -1755,6 +1788,7 @@ mod tests {
                                 results: vec![],
                                 external_text: None,
                                 content_language: "RU".into(),
+                                interface_language: "RU".into(),
                             }],
                             active_profile_id: "p".into(),
                         })

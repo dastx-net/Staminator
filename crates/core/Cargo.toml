@@ -9,5 +9,8 @@ workspace = true
 [lib]
 path = "src/lib.rs"
 
+[dependencies]
+serde_json = "1"
+
 [dev-dependencies]
 stamina-data = { path = "../stamina-data" }

@@ -1,6 +1,8 @@
 use chrono::TimeZone;
 use egui::{Align, Color32, Context, FontId, Grid, Pos2, Rect, RichText, Stroke, Vec2, Window};
 
+use crate::localization::tr;
+
 /// Shows saved results for the selected profile. Records are expected in save order;
 /// the newest 100 are plotted from oldest to newest.
 pub fn show(
@@ -9,26 +11,29 @@ pub fn show(
     records: &[crate::user_store::ResultRecord],
     open: &mut bool,
 ) {
-    Window::new("Прогресс")
+    Window::new(tr("progress.title"))
         .open(open)
         .default_width(620.0)
         .default_height(540.0)
         .resizable(true)
         .show(ctx, |ui| {
-            ui.heading(format!("Результаты профиля: {profile}"));
+            ui.heading(crate::localization::format(
+                "progress.profile_results",
+                &staminator_core::FormatArgs::new().insert("profile", profile),
+            ));
             ui.add_space(6.0);
 
             let recent: Vec<_> = records.iter().rev().take(100).collect();
             if recent.is_empty() {
                 ui.centered_and_justified(|ui| {
-                    ui.label("Для этого профиля пока нет сохранённых занятий.");
+                    ui.label(tr("progress.empty"));
                 });
                 return;
             }
 
             let mut chronological = recent;
             chronological.reverse();
-            ui.label(RichText::new("Скорость по занятиям (знаков в минуту)").strong());
+            ui.label(RichText::new(tr("progress.speed_chart_title")).strong());
             draw_chart(
                 ui,
                 &chronological
@@ -37,7 +42,7 @@ pub fn show(
                     .collect::<Vec<_>>(),
             );
             ui.add_space(8.0);
-            ui.label(RichText::new("Последние занятия").strong());
+            ui.label(RichText::new(tr("progress.recent_sessions")).strong());
             ui.add_space(4.0);
 
             egui::ScrollArea::vertical()
@@ -49,27 +54,26 @@ pub fn show(
                         .spacing([10.0, 5.0])
                         .show(ui, |ui| {
                             for title in [
-                                "Дата",
-                                "Режим",
-                                "Раскладка",
-                                "Упражнение",
-                                "Скорость",
-                                "Ошибки",
+                                tr("progress.column.date"),
+                                tr("progress.column.mode"),
+                                tr("progress.column.layout"),
+                                tr("progress.column.exercise"),
+                                tr("progress.column.speed"),
+                                tr("progress.column.errors"),
                             ] {
                                 ui.label(RichText::new(title).strong());
                             }
                             ui.end_row();
                             for record in chronological.iter().rev() {
-                                let date = chrono::Local
-                                    .timestamp_opt(record.timestamp as i64, 0)
-                                    .single()
-                                    .map(|date| date.format("%d.%m.%Y %H:%M").to_string())
-                                    .unwrap_or_else(|| "—".into());
+                                let date = format_timestamp(record.timestamp);
                                 ui.label(date);
-                                ui.label(record.mode.to_string());
-                                ui.label(record.layout.to_string());
+                                ui.label(display_mode(&record.mode));
+                                ui.label(display_layout(&record.layout));
                                 ui.label(record.exercise.chars().take(42).collect::<String>());
-                                ui.label(format!("{} зн./мин", record.cpm));
+                                ui.label(crate::localization::format(
+                                    "unit.characters_per_minute",
+                                    &staminator_core::FormatArgs::new().insert("value", record.cpm),
+                                ));
                                 ui.label(format!(
                                     "{} ({:.1}%)",
                                     record.errors, record.error_percent
@@ -79,6 +83,92 @@ pub fn show(
                         });
                 });
         });
+}
+
+fn display_mode(value: &str) -> String {
+    let key = match value {
+        "Уроки" | "mode.lessons" => "mode.lessons",
+        "Фразы" | "mode.phrases" => "mode.phrases",
+        "Буквы из фраз" | "mode.letters" => "mode.letters",
+        "Все клавиши" | "mode.all-keys" => "mode.all-keys",
+        "Внешний текст" | "mode.external" => "mode.external",
+        _ => return value.to_owned(),
+    };
+    tr(key)
+}
+
+fn display_layout(value: &str) -> String {
+    match value {
+        "Русская" | "layout.ru" => tr("layout-russian"),
+        "English" | "layout.en" => "English".to_owned(),
+        _ => value.to_owned(),
+    }
+}
+
+fn format_timestamp(timestamp: u64) -> String {
+    let Ok(timestamp) = i64::try_from(timestamp) else {
+        return "—".into();
+    };
+    let Some(date) = chrono::Local.timestamp_opt(timestamp, 0).single() else {
+        return "—".into();
+    };
+    localized_datetime(&date).unwrap_or_else(|| date.format("%Y-%m-%d %H:%M").to_string())
+}
+
+#[cfg(windows)]
+fn localized_datetime(date: &chrono::DateTime<chrono::Local>) -> Option<String> {
+    use chrono::{Datelike, Timelike};
+    use windows_sys::Win32::{
+        Foundation::SYSTEMTIME,
+        Globalization::{GetDateFormatEx, GetTimeFormatEx, TIME_NOSECONDS},
+    };
+    let time = SYSTEMTIME {
+        wYear: date.year().try_into().ok()?,
+        wMonth: date.month() as u16,
+        wDayOfWeek: date.weekday().num_days_from_sunday() as u16,
+        wDay: date.day() as u16,
+        wHour: date.hour() as u16,
+        wMinute: date.minute() as u16,
+        wSecond: date.second() as u16,
+        wMilliseconds: 0,
+    };
+    let mut day = [0u16; 128];
+    let mut clock = [0u16; 128];
+    // SAFETY: SYSTEMTIME and output buffers are valid for the stated lengths; null selects user defaults.
+    let (day_len, clock_len) = unsafe {
+        (
+            GetDateFormatEx(
+                std::ptr::null(),
+                0,
+                &time,
+                std::ptr::null(),
+                day.as_mut_ptr(),
+                day.len() as i32,
+                std::ptr::null(),
+            ),
+            GetTimeFormatEx(
+                std::ptr::null(),
+                TIME_NOSECONDS,
+                &time,
+                std::ptr::null(),
+                clock.as_mut_ptr(),
+                clock.len() as i32,
+            ),
+        )
+    };
+    if day_len <= 1 || clock_len <= 1 {
+        return None;
+    }
+    Some(format!(
+        "{} {}",
+        String::from_utf16_lossy(&day[..day_len as usize - 1]),
+        String::from_utf16_lossy(&clock[..clock_len as usize - 1])
+    ))
+}
+
+#[cfg(not(windows))]
+fn localized_datetime(_date: &chrono::DateTime<chrono::Local>) -> Option<String> {
+    None
 }
 
 fn draw_chart(ui: &mut egui::Ui, values: &[f32]) {
@@ -134,13 +224,38 @@ fn draw_chart(ui: &mut egui::Ui, values: &[f32]) {
     );
     ui.with_layout(egui::Layout::left_to_right(Align::Min), |ui| {
         ui.add_space(plot.left() - rect.left());
-        ui.label(RichText::new(format!("{} занятий", values.len())).small());
+        ui.label(
+            RichText::new(crate::localization::format(
+                "progress.chart_session_count",
+                &staminator_core::FormatArgs::new().count(values.len() as i64),
+            ))
+            .small(),
+        );
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamp_handles_out_of_range_and_uses_local_time() {
+        assert_eq!(format_timestamp(u64::MAX), "—");
+        let rendered = format_timestamp(1_700_000_000);
+        assert_ne!(rendered, "—");
+        assert!(rendered.chars().any(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn history_translates_known_values_and_preserves_custom_values() {
+        crate::localization::set_language("EN");
+        assert_eq!(display_mode("Фразы"), "Phrases");
+        assert_eq!(display_mode("mode.lessons"), "Lessons");
+        assert_eq!(display_mode("custom"), "custom");
+        assert_eq!(display_layout("Русская"), "Russian");
+        assert_eq!(display_layout("custom"), "custom");
+        crate::localization::set_language("RU");
+    }
 
     fn render(records: &[crate::user_store::ResultRecord]) -> String {
         let ctx = Context::default();

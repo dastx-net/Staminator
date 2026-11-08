@@ -5,10 +5,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::localization;
 use stamina_data::{
     JsonLesson,
     storage::{Database, Profile},
 };
+use staminator_core::FormatArgs;
 
 #[derive(Debug)]
 pub enum TransferError {
@@ -23,50 +25,81 @@ pub enum TransferError {
 impl fmt::Display for TransferError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(e) => write!(f, "file transfer: {e}"),
-            Self::Storage(e) => write!(f, "database transfer: {e}"),
-            Self::Json(e) => write!(f, "lesson JSON: {e}"),
-            Self::InvalidLesson(e) => write!(f, "invalid lesson: {e}"),
-            Self::InvalidBackup(e) => write!(f, "invalid database backup: {e}"),
-            Self::InvalidProfile(e) => write!(f, "invalid profile: {e}"),
+            Self::Io(e) => write!(
+                f,
+                "{}",
+                localization::format("transfer.file_error", &FormatArgs::new().insert("error", e))
+            ),
+            Self::Storage(e) => f.write_str(&localization::storage_error(e)),
+            Self::Json(e) => write!(
+                f,
+                "{}",
+                localization::format("transfer.json_error", &FormatArgs::new().insert("error", e))
+            ),
+            Self::InvalidLesson(e) => write!(
+                f,
+                "{}",
+                localization::format(
+                    "transfer.invalid_lesson",
+                    &FormatArgs::new().insert("error", e)
+                )
+            ),
+            Self::InvalidBackup(e) => write!(
+                f,
+                "{}",
+                localization::format(
+                    "transfer.invalid_backup",
+                    &FormatArgs::new().insert("error", e)
+                )
+            ),
+            Self::InvalidProfile(e) => write!(
+                f,
+                "{}",
+                localization::format(
+                    "transfer.invalid_profile",
+                    &FormatArgs::new().insert("error", e)
+                )
+            ),
         }
     }
 }
 
 fn validate_profile(profile: &Profile) -> Result<(), TransferError> {
     if profile.id.trim().is_empty() {
-        return Err(TransferError::InvalidProfile("ID must not be empty".into()));
+        return Err(TransferError::InvalidProfile(localization::tr(
+            "transfer.profile_id_empty",
+        )));
     }
     if profile.name.trim().is_empty() {
-        return Err(TransferError::InvalidProfile(
-            "name must not be empty".into(),
-        ));
+        return Err(TransferError::InvalidProfile(localization::tr(
+            "transfer.profile_name_empty",
+        )));
     }
     if profile.content_language.trim().is_empty() {
-        return Err(TransferError::InvalidProfile(
-            "content language must not be empty".into(),
-        ));
+        return Err(TransferError::InvalidProfile(localization::tr(
+            "transfer.profile_language_empty",
+        )));
     }
     for (index, result) in profile.results.iter().enumerate() {
         if result.mode.trim().is_empty()
             || result.layout.trim().is_empty()
             || result.exercise.trim().is_empty()
         {
-            return Err(TransferError::InvalidProfile(format!(
-                "result {} has an empty mode, layout, or exercise",
-                index + 1
+            return Err(TransferError::InvalidProfile(localization::format(
+                "transfer.result_fields_empty",
+                &FormatArgs::new().insert("index", index + 1),
             )));
         }
         if !result.cpm.is_finite() || result.cpm < 0.0 {
-            return Err(TransferError::InvalidProfile(format!(
-                "result {} has invalid CPM",
-                index + 1
+            return Err(TransferError::InvalidProfile(localization::format(
+                "transfer.result_cpm_invalid",
+                &FormatArgs::new().insert("index", index + 1),
             )));
         }
         if !result.error_percent.is_finite() || !(0.0..=100.0).contains(&result.error_percent) {
-            return Err(TransferError::InvalidProfile(format!(
-                "result {} has invalid error percentage",
-                index + 1
+            return Err(TransferError::InvalidProfile(localization::format(
+                "transfer.result_error_percent_invalid",
+                &FormatArgs::new().insert("index", index + 1),
             )));
         }
     }
@@ -76,8 +109,12 @@ fn validate_profile(profile: &Profile) -> Result<(), TransferError> {
 /// Import one UTF-8 JSON profile while retaining its ID and complete result history.
 pub fn import_profile_json(path: impl AsRef<Path>) -> Result<Profile, TransferError> {
     let bytes = fs::read(path)?;
-    let source = std::str::from_utf8(&bytes)
-        .map_err(|e| TransferError::InvalidProfile(format!("file is not UTF-8: {e}")))?;
+    let source = std::str::from_utf8(&bytes).map_err(|error| {
+        TransferError::InvalidProfile(localization::format(
+            "transfer.invalid_utf8",
+            &FormatArgs::new().insert("offset", error.valid_up_to()),
+        ))
+    })?;
     let profile: Profile = serde_json::from_str(source)?;
     validate_profile(&profile)?;
     Ok(profile)
@@ -103,7 +140,16 @@ pub fn export_profile_json(
     }
     Ok(path.to_owned())
 }
-impl Error for TransferError {}
+impl Error for TransferError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Storage(error) => Some(error),
+            Self::Json(error) => Some(error),
+            Self::InvalidLesson(_) | Self::InvalidBackup(_) | Self::InvalidProfile(_) => None,
+        }
+    }
+}
 impl From<io::Error> for TransferError {
     fn from(e: io::Error) -> Self {
         Self::Io(e)
@@ -145,18 +191,28 @@ pub fn export_database_backup(
 pub fn prepare_database_restore(path: impl AsRef<Path>) -> Result<(), TransferError> {
     let path = path.as_ref();
     if !path.is_file() {
-        return Err(TransferError::InvalidBackup("file does not exist".into()));
+        return Err(TransferError::InvalidBackup(localization::tr(
+            "transfer.backup_missing",
+        )));
     }
-    Database::validate_backup(path).map_err(|e| TransferError::InvalidBackup(e.to_string()))
+    Database::validate_backup(path).map_err(|error| {
+        eprintln!("Backup validation: {error}");
+        TransferError::InvalidBackup(localization::tr("transfer.backup_invalid"))
+    })
 }
 
 /// Import one UTF-8 JSON lesson and apply the data crate's lesson validation.
 pub fn import_json_lesson(path: impl AsRef<Path>) -> Result<JsonLesson, TransferError> {
     let bytes = fs::read(path)?;
-    let source = std::str::from_utf8(&bytes)
-        .map_err(|e| TransferError::InvalidLesson(format!("file is not UTF-8: {e}")))?;
+    let source = std::str::from_utf8(&bytes).map_err(|error| {
+        TransferError::InvalidLesson(localization::format(
+            "transfer.invalid_utf8",
+            &FormatArgs::new().insert("offset", error.valid_up_to()),
+        ))
+    })?;
     let lesson: JsonLesson = serde_json::from_str(source)?;
-    stamina_data::validate_json_lesson(&lesson).map_err(TransferError::InvalidLesson)?;
+    stamina_data::validate_json_lesson_typed(&lesson)
+        .map_err(|error| TransferError::InvalidLesson(localization::lesson_validation(&error)))?;
     Ok(lesson)
 }
 
@@ -165,7 +221,8 @@ pub fn export_json_lesson(
     lesson: &JsonLesson,
     destination: impl AsRef<Path>,
 ) -> Result<PathBuf, TransferError> {
-    stamina_data::validate_json_lesson(lesson).map_err(TransferError::InvalidLesson)?;
+    stamina_data::validate_json_lesson_typed(lesson)
+        .map_err(|error| TransferError::InvalidLesson(localization::lesson_validation(&error)))?;
     let bytes = serde_json::to_vec_pretty(lesson)?;
     let path = destination.as_ref();
     let mut file = fs::OpenOptions::new()
@@ -187,6 +244,28 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn storage_transfer_error_keeps_storage_source_and_translates() {
+        let error = TransferError::from(stamina_data::storage::StorageError::FutureSchema(12));
+        localization::set_language("EN");
+        assert_eq!(
+            error.to_string(),
+            "Database schema version 12 is newer than supported."
+        );
+        assert!(matches!(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<stamina_data::storage::StorageError>()),
+            Some(stamina_data::storage::StorageError::FutureSchema(12))
+        ));
+        localization::set_language("RU");
+        assert_eq!(
+            error.to_string(),
+            "Версия базы данных 12 новее поддерживаемой."
+        );
+    }
+
     fn dir() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "staminator-transfer-{}-{}",
@@ -224,6 +303,7 @@ mod tests {
             }],
             external_text: None,
             content_language: "RU".into(),
+            interface_language: "RU".into(),
         }
     }
 
@@ -326,6 +406,114 @@ mod tests {
             import_profile_json(&path),
             Err(TransferError::InvalidProfile(_))
         ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn profile_validation_errors_are_localized_in_both_languages() {
+        let root = dir();
+        let mut cases = Vec::new();
+        let mut value = profile();
+        value.id.clear();
+        cases.push((
+            value,
+            "Некорректный профиль: В профиле не указан ID",
+            "Invalid profile: The profile ID is missing",
+        ));
+        let mut value = profile();
+        value.name.clear();
+        cases.push((
+            value,
+            "Некорректный профиль: В профиле не указано имя",
+            "Invalid profile: The profile name is missing",
+        ));
+        let mut value = profile();
+        value.content_language.clear();
+        cases.push((
+            value,
+            "Некорректный профиль: В профиле не указан язык текста",
+            "Invalid profile: The profile text language is missing",
+        ));
+        let mut value = profile();
+        value.results[0].mode.clear();
+        cases.push((
+            value,
+            "Некорректный профиль: В результате №1 не заполнены режим, раскладка или упражнение",
+            "Invalid profile: Result 1 is missing its mode, layout, or exercise",
+        ));
+        let mut value = profile();
+        value.results[0].cpm = f64::NAN;
+        cases.push((
+            value,
+            "Некорректный профиль: В результате №1 неверная скорость",
+            "Invalid profile: Result 1 has an invalid speed",
+        ));
+        let mut value = profile();
+        value.results[0].error_percent = 101.0;
+        cases.push((
+            value,
+            "Некорректный профиль: В результате №1 неверный процент ошибок",
+            "Invalid profile: Result 1 has an invalid error percentage",
+        ));
+
+        for (index, (invalid, expected_ru, expected_en)) in cases.iter().enumerate() {
+            localization::set_language("RU");
+            let error =
+                export_profile_json(invalid, root.join(format!("ru-{index}.json"))).unwrap_err();
+            assert_eq!(error.to_string(), *expected_ru);
+            localization::set_language("EN");
+            let error =
+                export_profile_json(invalid, root.join(format!("en-{index}.json"))).unwrap_err();
+            assert_eq!(error.to_string(), *expected_en);
+        }
+
+        localization::set_language("RU");
+        let utf8 = root.join("bad-utf8.json");
+        fs::write(&utf8, [0xff]).unwrap();
+        let error = import_profile_json(&utf8).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Некорректный профиль: Файл должен быть в кодировке UTF-8 (байт 0)"
+        );
+        localization::set_language("EN");
+        let error = import_profile_json(&utf8).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Invalid profile: The file must use UTF-8 encoding (byte 0)"
+        );
+        localization::set_language("RU");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_and_missing_backups_report_localized_reasons() {
+        let root = dir();
+        let missing = root.join("missing.db");
+        let invalid = root.join("invalid.db");
+        fs::write(&invalid, b"not sqlite").unwrap();
+        for (locale, expected_missing, expected_invalid) in [
+            (
+                "RU",
+                "Некорректная резервная копия базы данных: Файл резервной копии не найден",
+                "Некорректная резервная копия базы данных: Файл не является корректной резервной копией базы данных",
+            ),
+            (
+                "EN",
+                "Invalid database backup: The backup file was not found",
+                "Invalid database backup: The file is not a valid database backup",
+            ),
+        ] {
+            localization::set_language(locale);
+            assert_eq!(
+                prepare_database_restore(&missing).unwrap_err().to_string(),
+                expected_missing
+            );
+            assert_eq!(
+                prepare_database_restore(&invalid).unwrap_err().to_string(),
+                expected_invalid
+            );
+        }
+        localization::set_language("RU");
         let _ = fs::remove_dir_all(root);
     }
 

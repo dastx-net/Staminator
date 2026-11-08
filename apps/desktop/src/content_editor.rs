@@ -2,6 +2,8 @@ use eframe::egui;
 use stamina_data::JsonLesson;
 use std::path::PathBuf;
 
+use crate::localization::tr;
+
 pub struct LessonEditor {
     pub lesson: JsonLesson,
     pub path: Option<PathBuf>,
@@ -33,7 +35,7 @@ impl LessonEditor {
             crate::lesson_generator::generate_lesson_text(&self.symbols)
         };
         if generated.is_empty() {
-            self.error = "Укажите от 1 до 4 символов без пробелов".into();
+            self.error = tr("content_editor.generated_symbols_error");
             return false;
         }
         if !self.lesson.text.is_empty() && !self.lesson.text.ends_with(char::is_whitespace) {
@@ -46,35 +48,35 @@ impl LessonEditor {
 
     pub fn show(&mut self, ctx: &egui::Context, open: &mut bool) -> bool {
         let mut save = false;
-        egui::Window::new("Редактор урока")
+        egui::Window::new(tr("content_editor.lesson_title"))
             .open(open)
             .default_size([600.0, 500.0])
             .show(ctx, |ui| {
-                ui.label("ID урока (для нового: латинские буквы, цифры, - или _)");
+                ui.label(tr("content_editor.lesson_id"));
                 ui.text_edit_singleline(&mut self.lesson.id);
-                ui.label("Название");
+                ui.label(tr("content_editor.lesson_name"));
                 ui.text_edit_singleline(&mut self.lesson.title);
-                ui.label("Язык (ru или en)");
+                ui.label(tr("content_editor.language"));
                 ui.text_edit_singleline(&mut self.lesson.language);
-                ui.label("Описание");
+                ui.label(tr("content_editor.description"));
                 ui.text_edit_singleline(self.lesson.description.get_or_insert_with(String::new));
-                ui.label("Текст упражнения");
+                ui.label(tr("content_editor.exercise_text"));
                 ui.add(
                     egui::TextEdit::multiline(&mut self.lesson.text)
                         .desired_rows(10)
                         .desired_width(f32::INFINITY),
                 );
                 ui.horizontal(|ui| {
-                    ui.label("Символы для генерации (1–4)");
+                    ui.label(tr("content_editor.generated_symbols"));
                     ui.text_edit_singleline(&mut self.symbols);
-                    if ui.button("Добавить упражнение").clicked() {
+                    if ui.button(tr("content_editor.add_exercise")).clicked() {
                         self.add_generated_exercise();
                     }
                 });
                 if !self.error.is_empty() {
                     ui.colored_label(egui::Color32::RED, &self.error);
                 }
-                save = ui.button("Сохранить урок").clicked();
+                save = ui.button(tr("content_editor.save_lesson")).clicked();
             });
         save
     }
@@ -98,13 +100,11 @@ impl PhraseEditor {
 
     pub fn show(&mut self, ctx: &egui::Context, open: &mut bool) -> bool {
         let mut save = false;
-        egui::Window::new("Добавить фразы")
+        egui::Window::new(tr("content_editor.phrases_title"))
             .open(open)
             .default_size([550.0, 350.0])
             .show(ctx, |ui| {
-                ui.label(
-                    "Введите фразы: каждая непустая строка станет фразой для выбранного языка.",
-                );
+                ui.label(tr("content_editor.phrases_instructions"));
                 ui.add(
                     egui::TextEdit::multiline(&mut self.text)
                         .desired_rows(10)
@@ -113,7 +113,7 @@ impl PhraseEditor {
                 if !self.error.is_empty() {
                     ui.colored_label(egui::Color32::RED, &self.error);
                 }
-                save = ui.button("Сохранить фразы").clicked();
+                save = ui.button(tr("content_editor.save_phrases")).clicked();
             });
         save
     }

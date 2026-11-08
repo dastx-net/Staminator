@@ -4,6 +4,7 @@ mod external_text;
 mod generated_modes;
 mod keyboard;
 mod lesson_generator;
+mod localization;
 mod progress_view;
 mod result_view;
 mod sound;
@@ -15,9 +16,13 @@ use content::{ContentCatalog, ContentLanguage, Exercise};
 use eframe::egui;
 use result_view::ResultAction;
 use sound::SoundEvent;
-use staminator_core::{Keystroke, Session, SessionState, StopReason};
+use staminator_core::{FormatArgs, Keystroke, Session, SessionState, StopReason};
 use std::{collections::VecDeque, fs, path::PathBuf, time::Instant};
 use user_store::UserStore;
+
+fn localized_error(key: &str, error: impl std::fmt::Display) -> String {
+    localization::format(key, &FormatArgs::new().insert("error", error))
+}
 
 fn keyboard_setting_path() -> Option<PathBuf> {
     std::env::var_os("APPDATA")
@@ -138,13 +143,23 @@ enum TrainingMode {
 }
 
 impl TrainingMode {
-    const ALL: [(Self, &'static str); 5] = [
-        (Self::Lessons, "Уроки"),
-        (Self::Phrases, "Фразы"),
-        (Self::Letters, "Буквы из фраз"),
-        (Self::AllKeys, "Все клавиши"),
-        (Self::ExternalText, "Внешний текст"),
+    const ALL: [Self; 5] = [
+        Self::Lessons,
+        Self::Phrases,
+        Self::Letters,
+        Self::AllKeys,
+        Self::ExternalText,
     ];
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Lessons => "mode.lessons",
+            Self::Phrases => "mode.phrases",
+            Self::Letters => "mode.letters",
+            Self::AllKeys => "mode.all-keys",
+            Self::ExternalText => "mode.external",
+        }
+    }
 }
 
 struct StaminatorApp {
@@ -162,6 +177,7 @@ struct StaminatorApp {
     external_path: Option<PathBuf>,
     external_text: String,
     external_error: String,
+    external_file_changed: bool,
     external_source: Option<external_text::ExternalFile>,
     external_reader: Option<external_text::ExternalTextStream<fs::File>>,
     external_positions: VecDeque<std::ops::Range<usize>>,
@@ -189,6 +205,12 @@ struct StaminatorApp {
 
 impl StaminatorApp {
     fn sync_profile_language(&mut self) {
+        localization::set_language(
+            self.users
+                .active_profile()
+                .map_or("RU", |profile| profile.interface_language.as_str()),
+        );
+        self.catalog.refresh_diagnostics();
         self.content_language = if self
             .users
             .active_profile()
@@ -201,7 +223,6 @@ impl StaminatorApp {
     }
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         training_view::install_text_font(&cc.egui_ctx);
-        let mut catalog = ContentCatalog::load();
         let background_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../src/stamina_setup/Skins/Field.jpg");
         let background = image::open(background_path).ok().map(|image| {
@@ -216,8 +237,8 @@ impl StaminatorApp {
         });
         let keyboard_setting_path = keyboard_setting_path();
         let mut show_keyboard = load_keyboard_setting_from(keyboard_setting_path.as_deref());
-        let (users, mut profile_error) = match UserStore::load() {
-            Ok(users) => (users, String::new()),
+        let (users, load_error) = match UserStore::load() {
+            Ok(users) => (users, None),
             Err(error) => {
                 let recovered_path = std::env::var_os("APPDATA")
                     .map(PathBuf::from)
@@ -229,9 +250,18 @@ impl StaminatorApp {
                         .with_file_name(format!("profiles-recovered-{}.json", std::process::id()));
                     UserStore::new_at(unique)
                 });
-                (users, format!("Не удалось загрузить профили: {error}"))
+                (users, Some(error.to_string()))
             }
         };
+        localization::set_language(
+            users
+                .active_profile()
+                .map_or("RU", |profile| profile.interface_language.as_str()),
+        );
+        let mut profile_error = load_error
+            .map(|error| localized_error("profile.load_error", error))
+            .unwrap_or_default();
+        let mut catalog = ContentCatalog::load();
         match users.database() {
             Ok(Some(mut database)) => {
                 match database.get_app_setting("show_keyboard") {
@@ -240,19 +270,26 @@ impl StaminatorApp {
                         if let Err(error) =
                             database.set_app_setting("show_keyboard", &show_keyboard.to_string())
                         {
-                            profile_error = format!("Не удалось сохранить настройки: {error}");
+                            profile_error = localized_error(
+                                "settings.save_error",
+                                localization::storage_error(&error),
+                            );
                         }
                     }
                     Err(error) => {
-                        profile_error = format!("Не удалось загрузить настройки: {error}")
+                        profile_error = localized_error(
+                            "settings.load_error",
+                            localization::storage_error(&error),
+                        )
                     }
                 }
                 if let Err(error) = sync_catalog_with_database(&mut catalog, &mut database) {
-                    profile_error = format!("Не удалось загрузить уроки: {error}");
+                    profile_error =
+                        localized_error("lessons.load_error", localization::storage_error(&error));
                 }
             }
             Ok(None) => {}
-            Err(error) => profile_error = format!("Не удалось открыть базу уроков: {error}"),
+            Err(error) => profile_error = localized_error("database.open_error", error),
         }
         let mut app = Self::from_parts(
             catalog,
@@ -299,6 +336,7 @@ impl StaminatorApp {
             external_path: None,
             external_text: String::new(),
             external_error: String::new(),
+            external_file_changed: false,
             external_source: None,
             external_reader: None,
             external_positions: VecDeque::new(),
@@ -331,13 +369,14 @@ impl StaminatorApp {
                 if let Err(error) =
                     database.set_app_setting("show_keyboard", &self.show_keyboard.to_string())
                 {
-                    self.profile_error = format!("Не удалось сохранить настройки: {error}");
+                    self.profile_error =
+                        localized_error("settings.save_error", localization::storage_error(&error));
                 }
             }
             Ok(None) => {
                 save_keyboard_setting_to(self.keyboard_setting_path.as_deref(), self.show_keyboard)
             }
-            Err(error) => self.profile_error = format!("Не удалось сохранить настройки: {error}"),
+            Err(error) => self.profile_error = localized_error("settings.save_error", error),
         }
     }
 
@@ -393,23 +432,23 @@ impl StaminatorApp {
     fn current_label(&self) -> String {
         match self.selected_mode {
             TrainingMode::Lessons | TrainingMode::Phrases => self.current_exercise().map_or_else(
-                || "Нет текста для выбранного языка".into(),
+                || localization::tr("mode.empty_text"),
                 |item| item.name.clone(),
             ),
             TrainingMode::Letters if self.catalog.phrases(self.language()).is_empty() => {
-                "Нет фраз для выбранного языка".into()
+                localization::tr("mode.empty_phrases")
             }
-            TrainingMode::Letters => "Буквы из фраз".into(),
+            TrainingMode::Letters => localization::tr("mode.letters"),
             TrainingMode::AllKeys if self.catalog.all_keys(self.english_layout).is_empty() => {
-                "Нет клавиш для выбранной раскладки".into()
+                localization::tr("mode.empty_keys")
             }
-            TrainingMode::AllKeys => "Все клавиши".into(),
+            TrainingMode::AllKeys => localization::tr("mode.all-keys"),
             TrainingMode::ExternalText => self
                 .external_path
                 .as_ref()
                 .and_then(|path| path.file_name())
                 .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Внешний текст не выбран".into()),
+                .unwrap_or_else(|| localization::tr("mode.external_unselected")),
         }
     }
 
@@ -439,7 +478,7 @@ impl StaminatorApp {
 
     fn choose_external_text(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
-            .set_title("Открыть текст для тренировки")
+            .set_title(localization::tr("file.open_training_text"))
             .pick_file()
         {
             self.load_external_text(path);
@@ -447,27 +486,29 @@ impl StaminatorApp {
     }
 
     fn load_external_text(&mut self, path: PathBuf) {
+        self.external_file_changed = false;
         match external_text::ExternalFile::open(&path) {
             Ok(source) => {
                 if source.char_count() == 0 {
-                    self.external_error = "В выбранном файле нет текста для набора".into();
+                    self.external_error = localization::tr("file.no_training_text");
                 } else {
                     self.external_path = Some(path);
                     self.external_source = Some(source);
                     self.external_start = 0;
                     self.external_error.clear();
+                    self.external_file_changed = false;
                     self.session = None;
                     self.last_result = None;
                     self.result_open = false;
                     match self.prepare_external() {
                         Ok(()) => self.save_external_progress(),
                         Err(error) => {
-                            self.external_error = format!("Не удалось прочитать файл: {error}")
+                            self.external_error = localized_error("file.read_error", error)
                         }
                     }
                 }
             }
-            Err(error) => self.external_error = format!("Не удалось открыть файл: {error}"),
+            Err(error) => self.external_error = localized_error("file.open_error", error),
         }
     }
 
@@ -488,6 +529,7 @@ impl StaminatorApp {
         self.external_positions.clear();
         self.external_start = 0;
         self.external_error.clear();
+        self.external_file_changed = false;
         let Some(saved) = self
             .users
             .active_profile()
@@ -506,17 +548,17 @@ impl StaminatorApp {
                     self.external_path = Some(saved.path);
                     self.external_source = Some(source);
                     if let Err(error) = self.prepare_external() {
-                        self.external_error = format!("Не удалось прочитать файл: {error}");
+                        self.external_error = localized_error("file.read_error", error);
                     }
                 } else {
-                    self.external_error =
-                        "Позиция файла недействительна; выберите файл заново".into();
+                    self.external_error = localization::tr("file.invalid_position");
                 }
             }
-            Ok(_) => self.external_error = "Файл изменился; выберите его заново".into(),
-            Err(error) => {
-                self.external_error = format!("Не удалось открыть сохранённый файл: {error}")
+            Ok(_) => {
+                self.external_error = localization::tr("file.changed");
+                self.external_file_changed = true;
             }
+            Err(error) => self.external_error = localized_error("file.saved_open_error", error),
         }
     }
 
@@ -525,9 +567,9 @@ impl StaminatorApp {
             return;
         };
         if let Err(error) = self.users.set_external_progress(progress) {
-            self.external_error = format!("Не удалось сохранить позицию: {error}");
+            self.external_error = localized_error("file.save_position_error", error);
         } else if let Err(error) = self.prepare_external() {
-            self.external_error = format!("Не удалось прочитать файл: {error}");
+            self.external_error = localized_error("file.read_error", error);
         }
     }
 
@@ -546,11 +588,12 @@ impl StaminatorApp {
         match external_text::ExternalFile::open(id.path()) {
             Ok(current) if current.file_id() == id => {}
             Ok(_) => {
-                self.external_error = "Файл изменился; выберите его заново".into();
+                self.external_error = localization::tr("file.changed");
+                self.external_file_changed = true;
                 return None;
             }
             Err(error) => {
-                self.external_error = format!("Не удалось проверить файл: {error}");
+                self.external_error = localized_error("file.validate_error", error);
                 return None;
             }
         }
@@ -573,7 +616,7 @@ impl StaminatorApp {
         self.result_open = false;
         match self.prepare_external() {
             Ok(()) => self.save_external_progress(),
-            Err(error) => self.external_error = format!("Не удалось прочитать файл: {error}"),
+            Err(error) => self.external_error = localized_error("file.read_error", error),
         }
     }
 
@@ -703,7 +746,7 @@ impl StaminatorApp {
             return false;
         }
         if refresh_external && let Err(error) = self.prepare_external() {
-            self.external_error = format!("Не удалось прочитать файл: {error}");
+            self.external_error = localized_error("file.read_error", error);
         }
         self.result_open = false;
         true
@@ -720,21 +763,17 @@ impl StaminatorApp {
             if let Some(progress) = progress
                 && let Err(error) = self.users.set_external_progress(progress)
             {
-                self.profile_error = format!("Не удалось сохранить позицию: {error}");
+                self.profile_error = localized_error("file.save_position_error", error);
                 return;
             }
             self.result_recorded = true;
             return;
         }
-        let mode = TrainingMode::ALL
-            .iter()
-            .find(|(kind, _)| *kind == self.selected_mode)
-            .map(|(_, label)| *label)
-            .unwrap_or("Занятие");
+        let mode = self.selected_mode.key();
         let layout = if self.english_layout {
-            "English"
+            "layout.en"
         } else {
-            "Русская"
+            "layout.ru"
         };
         if let Err(error) = self.users.record_with_progress(
             user_store::ResultInput {
@@ -755,7 +794,7 @@ impl StaminatorApp {
                 None => "unknown",
             },
         ) {
-            self.profile_error = format!("Не удалось сохранить результат: {error}");
+            self.profile_error = localized_error("result.save_error", error);
         } else {
             self.result_recorded = true;
         }
@@ -763,7 +802,7 @@ impl StaminatorApp {
 
     fn session_result_title(&self) -> String {
         if self.selected_mode == TrainingMode::Phrases {
-            "Фразы".into()
+            localization::tr("mode.phrases")
         } else {
             self.current_label()
         }
@@ -821,7 +860,7 @@ impl StaminatorApp {
                     }
                 }
                 Ok(None) => {}
-                Err(error) => self.external_error = format!("Не удалось прочитать файл: {error}"),
+                Err(error) => self.external_error = localized_error("file.read_error", error),
             }
         }
         if let Some(session) = &mut self.session {
@@ -967,7 +1006,7 @@ impl StaminatorApp {
             .lesson_id(self.language(), index)
             .and_then(|id| self.catalog.lesson_document(id))
             .map(|(lesson, _)| lesson)
-            .ok_or_else(|| "Урок не выбран".to_owned())?;
+            .ok_or_else(|| localization::tr("lesson.unselected"))?;
         storage_transfer::export_json_lesson(lesson, path).map_err(|error| error.to_string())?;
         Ok(())
     }
@@ -977,7 +1016,7 @@ impl StaminatorApp {
             .users
             .database()
             .map_err(|error| error.to_string())?
-            .ok_or_else(|| "База данных недоступна".to_owned())?;
+            .ok_or_else(|| localization::tr("database.unavailable"))?;
         storage_transfer::export_database_backup(&database, path)
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -995,9 +1034,9 @@ impl StaminatorApp {
         let mut clear_error = false;
         let current = self.current_index();
         egui::Window::new(if self.selected_mode == TrainingMode::Lessons {
-            "Выбор урока"
+            localization::tr("chooser.lessons_title")
         } else {
-            "Выбор фразы"
+            localization::tr("chooser.phrases_title")
         })
         .open(&mut open)
         .default_size([620.0, 470.0])
@@ -1005,26 +1044,29 @@ impl StaminatorApp {
             if self.selected_mode == TrainingMode::Lessons {
                 if !self.lesson_transfer_error.is_empty() {
                     ui.colored_label(egui::Color32::RED, &self.lesson_transfer_error);
-                    clear_error = ui.button("Очистить сообщение").clicked();
+                    clear_error = ui.button(localization::tr("clear-message")).clicked();
                 }
                 ui.horizontal(|ui| {
-                    refresh = ui.button("Обновить список уроков").clicked();
-                    create = ui.button("Создать урок").clicked();
-                    edit = ui.button("Изменить выбранный урок").clicked();
+                    refresh = ui.button(localization::tr("refresh-lessons")).clicked();
+                    create = ui.button(localization::tr("create-lesson")).clicked();
+                    edit = ui.button(localization::tr("edit-lesson")).clicked();
                 });
                 ui.horizontal(|ui| {
-                    import_lesson = ui.button("Импорт урока…").clicked();
-                    export_lesson = ui.button("Экспорт урока…").clicked();
+                    import_lesson = ui.button(localization::tr("lesson-import")).clicked();
+                    export_lesson = ui.button(localization::tr("lesson-export")).clicked();
                 });
                 if let Some(path) = self.catalog.user_lesson_path() {
-                    ui.label(format!("Папка ваших уроков: {}", path.display()));
+                    ui.label(localization::format(
+                        "chooser.user_folder",
+                        &FormatArgs::new().insert("path", path.display()),
+                    ));
                 }
                 if !self.catalog.lesson_diagnostics().is_empty() {
                     ui.colored_label(egui::Color32::RED, self.catalog.lesson_diagnostics());
                 }
             }
             if self.selected_mode == TrainingMode::Phrases {
-                add_phrases = ui.button("Добавить фразы").clicked();
+                add_phrases = ui.button(localization::tr("add-phrases")).clicked();
             }
             ui.text_edit_singleline(&mut self.chooser_filter);
             let filter = self.chooser_filter.trim().to_lowercase();
@@ -1035,7 +1077,10 @@ impl StaminatorApp {
                 .filter(|(_, item)| filter.is_empty() || item.name.to_lowercase().contains(&filter))
                 .map(|(index, item)| (index, item.name.chars().take(85).collect::<String>()))
                 .collect();
-            ui.label(format!("Найдено: {}", matches.len()));
+            ui.label(localization::format(
+                "chooser.matches",
+                &FormatArgs::new().insert("count", matches.len()),
+            ));
             egui::ScrollArea::vertical().max_height(385.0).show_rows(
                 ui,
                 24.0,
@@ -1064,7 +1109,7 @@ impl StaminatorApp {
             match self.import_lesson_from(&path) {
                 Ok(()) => self.lesson_transfer_error.clear(),
                 Err(error) => {
-                    self.lesson_transfer_error = format!("Не удалось импортировать урок: {error}")
+                    self.lesson_transfer_error = localized_error("lesson.import_error", error)
                 }
             }
         }
@@ -1077,7 +1122,7 @@ impl StaminatorApp {
             match self.export_lesson_to(current, &path) {
                 Ok(()) => self.lesson_transfer_error.clear(),
                 Err(error) => {
-                    self.lesson_transfer_error = format!("Не удалось экспортировать урок: {error}")
+                    self.lesson_transfer_error = localized_error("lesson.export_error", error)
                 }
             }
         }
@@ -1106,10 +1151,8 @@ impl StaminatorApp {
                         editor.lesson = lesson.clone();
                         editor.path = Some(PathBuf::from(&lesson.id));
                     }
-                    Some(_) => {
-                        editor.error = "Встроенный урок нельзя изменить; создайте свой урок".into()
-                    }
-                    None => editor.error = "Выберите урок".into(),
+                    Some(_) => editor.error = localization::tr("lesson.builtin_edit"),
+                    None => editor.error = localization::tr("lesson.choose_first"),
                 }
                 self.lesson_editor = Some(editor);
                 self.chooser_open = false;
@@ -1134,10 +1177,10 @@ impl StaminatorApp {
                     editor.lesson = item.lesson;
                     editor.path = Some(item.path);
                 } else {
-                    editor.error = "Встроенный урок нельзя изменить; создайте свой урок".into();
+                    editor.error = localization::tr("lesson.builtin_edit");
                 }
             } else {
-                editor.error = "Выберите урок".into();
+                editor.error = localization::tr("lesson.choose_first");
             }
             self.lesson_editor = Some(editor);
             self.chooser_open = false;
@@ -1166,8 +1209,10 @@ impl StaminatorApp {
                             self.lesson_transfer_error.clear();
                         }
                         Err(error) => {
-                            self.lesson_transfer_error =
-                                format!("Не удалось загрузить уроки: {error}");
+                            self.lesson_transfer_error = localized_error(
+                                "lessons.load_error",
+                                localization::storage_error(&error),
+                            );
                         }
                     }
                 }
@@ -1176,7 +1221,7 @@ impl StaminatorApp {
                     self.lesson_transfer_error.clear();
                 }
                 Err(error) => {
-                    self.lesson_transfer_error = format!("Не удалось открыть базу уроков: {error}");
+                    self.lesson_transfer_error = localized_error("database.open_error", error);
                 }
             }
             self.session = None;
@@ -1202,53 +1247,53 @@ impl StaminatorApp {
                         .next()
                         .is_some_and(|value| value.eq_ignore_ascii_case(lang))
                 }) {
-                    editor.error = "Доступны только уроки на русском или английском языке".into();
+                    editor.error = localization::tr("lesson.language_error");
                     self.lesson_editor = Some(editor);
                     return;
                 }
                 let database = match self.users.database() {
                     Ok(database) => database,
                     Err(error) => {
-                        editor.error = format!("Не удалось открыть базу уроков: {error}");
+                        editor.error = localized_error("database.open_error", error);
                         self.lesson_editor = Some(editor);
                         return;
                     }
                 };
                 let result = if let Some(mut database) = database {
-                    stamina_data::validate_json_lesson(&editor.lesson)
-                        .map_err(|e| e.to_string())
+                    stamina_data::validate_json_lesson_typed(&editor.lesson)
+                        .map_err(|e| localization::lesson_validation(&e))
                         .and_then(|()| {
                             let old_id = editor.path.as_ref().and_then(|p| p.to_str());
                             if old_id.is_some_and(|id| id != editor.lesson.id) {
-                                return Err("Изменение ID урока не поддерживается".into());
+                                return Err(localization::tr("lesson.id_change_error"));
                             }
                             match database
                                 .lesson(&editor.lesson.id)
-                                .map_err(|e| e.to_string())?
+                                .map_err(|e| localization::storage_error(&e))?
                             {
                                 Some((_, true)) => {
-                                    return Err("Встроенный урок нельзя изменить".into());
+                                    return Err(localization::tr("lesson.builtin_error"));
                                 }
                                 Some(_) if old_id.is_none() => {
-                                    return Err("Урок с таким ID уже существует".into());
+                                    return Err(localization::tr("lesson.id_exists"));
                                 }
-                                None if old_id.is_some() => return Err("Урок не найден".into()),
+                                None if old_id.is_some() => {
+                                    return Err(localization::tr("lesson.not_found"));
+                                }
                                 _ => {}
                             }
                             if let Some(id) = old_id {
                                 if !database
                                     .update_user_lesson(id, &editor.lesson)
-                                    .map_err(|e| e.to_string())?
+                                    .map_err(|e| localization::storage_error(&e))?
                                 {
-                                    return Err(
-                                        "Урок не найден или недоступен для изменения".into()
-                                    );
+                                    return Err(localization::tr("lesson.not_editable"));
                                 }
                                 Ok(())
                             } else {
                                 database
                                     .create_user_lesson(&editor.lesson)
-                                    .map_err(|e| e.to_string())
+                                    .map_err(|e| localization::storage_error(&e))
                             }
                         })
                         .map(|()| PathBuf::new())
@@ -1260,17 +1305,17 @@ impl StaminatorApp {
                             self.catalog.lesson_roots(),
                             &editor.lesson,
                         )
-                        .map_err(|e| e.to_string())
+                        .map_err(|e| localization::lesson_write_error(&e))
                     } else {
                         stamina_data::create_user_lesson(
                             root,
                             self.catalog.lesson_roots(),
                             &editor.lesson,
                         )
-                        .map_err(|e| e.to_string())
+                        .map_err(|e| localization::lesson_write_error(&e))
                     }
                 } else {
-                    editor.error = "Не найден пользовательский каталог уроков".into();
+                    editor.error = localization::tr("lesson.user_folder_missing");
                     self.lesson_editor = Some(editor);
                     return;
                 };
@@ -1291,8 +1336,10 @@ impl StaminatorApp {
                             match database.list_lessons() {
                                 Ok(lessons) => self.catalog.set_stored_lessons(lessons),
                                 Err(error) => {
-                                    self.profile_error =
-                                        format!("Не удалось загрузить уроки: {error}")
+                                    self.profile_error = localized_error(
+                                        "lessons.load_error",
+                                        localization::storage_error(&error),
+                                    )
                                 }
                             }
                         } else {
@@ -1306,7 +1353,7 @@ impl StaminatorApp {
                         self.last_result = None;
                         open = false;
                     }
-                    Err(error) => editor.error = format!("Не удалось сохранить урок: {error}"),
+                    Err(error) => editor.error = localized_error("lesson.save_error", error),
                 }
             }
             if open {
@@ -1323,7 +1370,7 @@ impl StaminatorApp {
                         self.last_result = None;
                         open = false;
                     }
-                    Err(error) => editor.error = format!("Не удалось сохранить фразы: {error}"),
+                    Err(error) => editor.error = localized_error("phrases.save_error", error),
                 }
             }
             if open {
@@ -1348,7 +1395,7 @@ impl StaminatorApp {
         let profile = self
             .users
             .active_profile()
-            .ok_or_else(|| "Профиль не выбран".to_string())?;
+            .ok_or_else(|| localization::tr("profile.unselected"))?;
         let value = serde_json::to_value(profile).map_err(|e| e.to_string())?;
         let profile = serde_json::from_value(value).map_err(|e| e.to_string())?;
         storage_transfer::export_profile_json(&profile, path).map_err(|e| e.to_string())?;
@@ -1366,13 +1413,15 @@ impl StaminatorApp {
             .users
             .database()
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| "База данных недоступна".to_string())?;
-        let lessons = database.list_lessons().map_err(|e| e.to_string())?;
+            .ok_or_else(|| localization::tr("database.unavailable"))?;
+        let lessons = database
+            .list_lessons()
+            .map_err(|e| localization::storage_error(&e))?;
         let mut groups = std::collections::HashMap::new();
         for (lesson, _) in &lessons {
             if let Some(group) = database
                 .get_app_setting(&format!("lesson_group:{}", lesson.id))
-                .map_err(|e| e.to_string())?
+                .map_err(|e| localization::storage_error(&e))?
             {
                 groups.insert(lesson.id.clone(), group);
             }
@@ -1381,18 +1430,18 @@ impl StaminatorApp {
         self.catalog.set_stored_lessons(lessons);
         self.show_keyboard = database
             .get_app_setting("show_keyboard")
-            .map_err(|e| e.to_string())?
+            .map_err(|e| localization::storage_error(&e))?
             .is_none_or(|value| value != "false");
         Ok(safety)
     }
 
     fn show_profiles(&mut self, ctx: &egui::Context) {
         let mut open = self.profiles_open;
-        egui::Window::new("Пользователи")
+        egui::Window::new(localization::tr("users"))
             .open(&mut open)
             .default_width(380.0)
             .show(ctx, |ui| {
-                ui.heading("Профили");
+                ui.heading(localization::tr("profiles"));
                 let profiles: Vec<_> = self
                     .users
                     .profiles()
@@ -1419,29 +1468,29 @@ impl StaminatorApp {
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Импорт профиля…").clicked()
+                    if ui.button(localization::tr("profile-import")).clicked()
                         && let Some(path) = rfd::FileDialog::new()
                             .add_filter("JSON", &["json"])
                             .pick_file()
                         && let Err(error) = self.import_profile_from(&path)
                     {
-                        self.profile_error = format!("Не удалось импортировать профиль: {error}");
+                        self.profile_error = localized_error("profile.import_error", error);
                     }
-                    if ui.button("Экспорт профиля…").clicked()
+                    if ui.button(localization::tr("profile-export")).clicked()
                         && let Some(path) = rfd::FileDialog::new()
                             .add_filter("JSON", &["json"])
                             .set_file_name("profile.json")
                             .save_file()
                         && let Err(error) = self.export_profile_to(&path)
                     {
-                        self.profile_error = format!("Не удалось экспортировать профиль: {error}");
+                        self.profile_error = localized_error("profile.export_error", error);
                     }
                 });
                 ui.separator();
-                ui.label("Имя профиля");
+                ui.label(localization::tr("profile-name"));
                 ui.text_edit_singleline(&mut self.profile_name_input);
                 ui.horizontal(|ui| {
-                    if ui.button("Создать").clicked() {
+                    if ui.button(localization::tr("create")).clicked() {
                         match self.users.create(&self.profile_name_input) {
                             Ok(_) => {
                                 self.profile_name_input.clear();
@@ -1453,7 +1502,7 @@ impl StaminatorApp {
                             Err(error) => self.profile_error = error.to_string(),
                         }
                     }
-                    if ui.button("Переименовать").clicked() {
+                    if ui.button(localization::tr("rename")).clicked() {
                         let id = self.users.active_profile_id().to_owned();
                         match self.users.rename(&id, &self.profile_name_input) {
                             Ok(()) => {
@@ -1466,7 +1515,7 @@ impl StaminatorApp {
                     if ui
                         .add_enabled(
                             self.users.profiles().len() > 1,
-                            egui::Button::new("Удалить текущий"),
+                            egui::Button::new(localization::tr("delete-current")),
                         )
                         .clicked()
                     {
@@ -1492,6 +1541,11 @@ impl StaminatorApp {
 
 impl StaminatorApp {
     fn draw(&mut self, root: &mut egui::Ui) {
+        localization::set_language(
+            self.users
+                .active_profile()
+                .map_or("RU", |p| p.interface_language.as_str()),
+        );
         self.handle_input(root.ctx());
         let now = self.now_ms();
         let snapshot = self.session.as_ref().map(|s| s.snapshot(now));
@@ -1530,18 +1584,24 @@ impl StaminatorApp {
 
         egui::Panel::top("menu").show(root, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                if ui.button(if active { "СТОП" } else { "СТАРТ" }).clicked() {
+                if ui
+                    .button(localization::tr(if active { "stop" } else { "start" }))
+                    .clicked()
+                {
                     if active {
                         self.stop();
                     } else {
                         self.start();
                     }
                 }
-                ui.menu_button("Режим", |ui| {
+                ui.menu_button(localization::tr("mode"), |ui| {
                     ui.add_enabled_ui(!active, |ui| {
-                        for (mode, label) in TrainingMode::ALL {
+                        for mode in TrainingMode::ALL {
                             if ui
-                                .add(egui::Button::new(label).selected(self.selected_mode == mode))
+                                .add(
+                                    egui::Button::new(localization::tr(mode.key()))
+                                        .selected(self.selected_mode == mode),
+                                )
                                 .clicked()
                             {
                                 self.selected_mode = mode;
@@ -1558,12 +1618,12 @@ impl StaminatorApp {
                             }
                         }
                         ui.separator();
-                        ui.menu_button("Язык текста", |ui| {
+                        ui.menu_button(localization::tr("content-language"), |ui| {
                             let russian = ui
                                 .selectable_value(
                                     &mut self.content_language,
                                     ContentLanguage::Russian,
-                                    "Русский",
+                                    localization::tr("language.russian"),
                                 )
                                 .clicked();
                             let english = ui
@@ -1588,9 +1648,13 @@ impl StaminatorApp {
                                 ui.close();
                             }
                         });
-                        ui.menu_button("Раскладка", |ui| {
+                        ui.menu_button(localization::tr("layout"), |ui| {
                             let russian = ui
-                                .selectable_value(&mut self.english_layout, false, "Русская")
+                                .selectable_value(
+                                    &mut self.english_layout,
+                                    false,
+                                    localization::tr("layout.russian"),
+                                )
                                 .clicked();
                             let english = ui
                                 .selectable_value(&mut self.english_layout, true, "English")
@@ -1604,16 +1668,19 @@ impl StaminatorApp {
                         });
                     });
                 });
-                ui.menu_button("Занятие", |ui| {
+                ui.menu_button(localization::tr("exercise"), |ui| {
                     ui.add_enabled_ui(!active, |ui| {
                         if self.content_mode() {
-                            if ui.button("Выбрать…").clicked() {
+                            if ui.button(localization::tr("choose")).clicked() {
                                 self.chooser_open = true;
                                 self.chooser_filter.clear();
                                 ui.close();
                             }
                             if ui
-                                .add_enabled(current_index > 0, egui::Button::new("Предыдущее"))
+                                .add_enabled(
+                                    current_index > 0,
+                                    egui::Button::new(localization::tr("previous")),
+                                )
                                 .clicked()
                             {
                                 self.select_content(current_index - 1);
@@ -1622,7 +1689,7 @@ impl StaminatorApp {
                             if ui
                                 .add_enabled(
                                     current_index + 1 < content_count,
-                                    egui::Button::new("Следующее"),
+                                    egui::Button::new(localization::tr("next")),
                                 )
                                 .clicked()
                             {
@@ -1630,23 +1697,28 @@ impl StaminatorApp {
                                 ui.close();
                             }
                             ui.separator();
-                            ui.label(format!(
-                                "{} из {}",
-                                if content_count == 0 {
-                                    0
-                                } else {
-                                    current_index + 1
-                                },
-                                content_count
+                            ui.label(localization::format(
+                                "chooser.counter",
+                                &FormatArgs::new()
+                                    .insert(
+                                        "current",
+                                        if content_count == 0 {
+                                            0
+                                        } else {
+                                            current_index + 1
+                                        },
+                                    )
+                                    .insert("total", content_count),
                             ));
                         } else if self.selected_mode == TrainingMode::ExternalText {
-                            if ui.button("Открыть текстовый файл…").clicked()
-                            {
+                            if ui.button(localization::tr("open-text")).clicked() {
                                 self.choose_external_text();
                                 ui.close();
                             }
-                            if self.external_error.starts_with("Файл изменился") {
-                                if ui.button("Начать изменённый файл заново").clicked()
+                            if self.external_file_changed {
+                                if ui
+                                    .button(localization::tr("file.restart_changed"))
+                                    .clicked()
                                     && let Some(path) = self
                                         .users
                                         .active_profile()
@@ -1662,7 +1734,7 @@ impl StaminatorApp {
                                 if ui
                                     .add(
                                         egui::Slider::new(&mut position, 0..=length)
-                                            .text("Позиция"),
+                                            .text(localization::tr("position")),
                                     )
                                     .changed()
                                 {
@@ -1673,76 +1745,130 @@ impl StaminatorApp {
                                 ui.colored_label(egui::Color32::RED, &self.external_error);
                             }
                         } else {
-                            ui.label("Новый текст создаётся при старте");
+                            ui.label(localization::tr("generated-on-start"));
                         }
                     });
                 });
-                if ui.button("Прогресс").clicked() {
+                if ui.button(localization::tr("progress")).clicked() {
                     self.progress_open = true;
                 }
-                ui.menu_button("Опции", |ui| {
-                    if ui.button("Создать резервную копию…").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().add_filter("SQLite", &["sqlite3"]).set_file_name("staminator-backup.sqlite3").save_file()
-                            && let Err(error) = self.export_backup_to(&path) {
-                            self.profile_error = format!("Не удалось создать копию: {error}");
-                        }
-                        ui.close();
-                    }
-                    if ui.button("Проверить резервную копию…").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().add_filter("SQLite", &["sqlite3"]).pick_file() {
-                            match storage_transfer::prepare_database_restore(path) {
-                                Ok(()) => self.profile_error = "Резервная копия проверена".into(),
-                                Err(error) => self.profile_error = format!("Ошибка резервной копии: {error}"),
+                ui.menu_button(localization::tr("options"), |ui| {
+                    ui.menu_button(localization::tr("interface-language"), |ui| {
+                        let language = self
+                            .users
+                            .active_profile()
+                            .map_or("RU", |p| p.interface_language.as_str())
+                            .to_owned();
+                        for (code, name) in [
+                            ("RU", localization::tr("language.russian")),
+                            ("EN", "English".to_owned()),
+                        ] {
+                            if ui.selectable_label(language == code, name).clicked() {
+                                match self.users.set_interface_language(code) {
+                                    Ok(()) => {
+                                        localization::set_language(code);
+                                        self.catalog.refresh_diagnostics();
+                                    }
+                                    Err(error) => self.profile_error = error.to_string(),
+                                }
+                                ui.close();
                             }
                         }
+                    });
+                    if ui.button(localization::tr("backup-create")).clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("SQLite", &["sqlite3"])
+                            .set_file_name("staminator-backup.sqlite3")
+                            .save_file()
+                            && let Err(error) = self.export_backup_to(&path)
+                        {
+                            self.profile_error = localized_error("backup.create_error", error);
+                        }
                         ui.close();
                     }
-                    if ui.add_enabled(!active, egui::Button::new("Восстановить резервную копию…")).clicked() {
-                        if let Some(path) = rfd::FileDialog::new().add_filter("SQLite", &["sqlite3"]).pick_file() {
-                            let confirmed = storage_transfer::prepare_database_restore(&path).map(|()| {
-                                let answer = rfd::MessageDialog::new().set_title("Восстановить данные")
-                                    .set_description("Текущие данные будут заменены. Перед восстановлением приложение сохранит их резервную копию.")
-                                    .set_buttons(rfd::MessageButtons::YesNo).show();
-                                answer == rfd::MessageDialogResult::Yes
-                            });
-                            match confirmed {
-                                Ok(true) => match self.restore_backup_from(&path) {
-                                    Ok(safety) => {
-                                        self.profile_error = format!("Данные восстановлены. Предыдущая база: {}", safety.display());
-                                    }
-                                    Err(error) => self.profile_error = format!("Не удалось восстановить данные: {error}"),
-                                },
-                                Ok(false) => {}
-                                Err(error) => self.profile_error = format!("Ошибка резервной копии: {error}"),
+                    if ui.button(localization::tr("backup-check")).clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("SQLite", &["sqlite3"])
+                            .pick_file()
+                        {
+                            match storage_transfer::prepare_database_restore(path) {
+                                Ok(()) => self.profile_error = localization::tr("backup.checked"),
+                                Err(error) => {
+                                    self.profile_error = localized_error("backup.error", error)
+                                }
                             }
                         }
                         ui.close();
                     }
                     if ui
-                        .checkbox(&mut self.show_keyboard, "Показывать клавиатуру")
+                        .add_enabled(
+                            !active,
+                            egui::Button::new(localization::tr("backup-restore")),
+                        )
+                        .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("SQLite", &["sqlite3"])
+                            .pick_file()
+                        {
+                            let confirmed =
+                                storage_transfer::prepare_database_restore(&path).map(|()| {
+                                    let answer = rfd::MessageDialog::new()
+                                        .set_title(localization::tr("backup.restore_title"))
+                                        .set_description(localization::tr("backup.restore_confirm"))
+                                        .set_buttons(rfd::MessageButtons::YesNo)
+                                        .show();
+                                    answer == rfd::MessageDialogResult::Yes
+                                });
+                            match confirmed {
+                                Ok(true) => match self.restore_backup_from(&path) {
+                                    Ok(safety) => {
+                                        self.profile_error = localization::format(
+                                            "backup.restored",
+                                            &FormatArgs::new().insert("path", safety.display()),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        self.profile_error =
+                                            localized_error("backup.restore_error", error)
+                                    }
+                                },
+                                Ok(false) => {}
+                                Err(error) => {
+                                    self.profile_error = localized_error("backup.error", error)
+                                }
+                            }
+                        }
+                        ui.close();
+                    }
+                    if ui
+                        .checkbox(&mut self.show_keyboard, localization::tr("show-keyboard"))
                         .changed()
                     {
                         self.persist_keyboard_setting();
                     }
                     ui.separator();
-                    ui.label(format!("Занятие: {current_label}"));
-                    ui.small(if self.catalog.diagnostics().is_empty() {
-                        "Данные загружены"
+                    ui.label(localization::format(
+                        "content.label",
+                        &FormatArgs::new().insert("label", &current_label),
+                    ));
+                    if self.catalog.diagnostics().is_empty() {
+                        ui.small(localization::tr("data.loaded"));
                     } else {
-                        self.catalog.diagnostics()
-                    });
+                        ui.small(self.catalog.diagnostics());
+                    }
                     if !self.profile_error.is_empty() {
                         ui.colored_label(egui::Color32::RED, &self.profile_error);
                     }
                 });
                 if ui
-                    .add_enabled(!active, egui::Button::new("Пользователи"))
+                    .add_enabled(!active, egui::Button::new(localization::tr("users")))
                     .clicked()
                 {
                     self.profiles_open = true;
                 }
-                ui.menu_button("Справка", |ui| {
-                    ui.label("Staminator · клавиатурный тренажёр");
+                ui.menu_button(localization::tr("help"), |ui| {
+                    ui.label(localization::tr("app-description"));
                 });
                 ui.separator();
                 ui.label(format!(
@@ -1765,31 +1891,37 @@ impl StaminatorApp {
                         .as_ref()
                         .is_some_and(|s| s.state == SessionState::Paused)
                     {
-                        "Пауза"
+                        localization::tr("status.paused")
                     } else {
-                        "Набор"
+                        localization::tr("status.typing")
                     }
                 } else if snapshot.is_some() {
-                    "Завершено"
+                    localization::tr("status.completed")
                 } else {
-                    "Ожидание"
+                    localization::tr("status.waiting")
                 });
                 ui.separator();
                 if let Some(stats) = &stats {
-                    ui.label(format!("Скорость: {} зн./мин", stats.cpm));
-                    ui.separator();
-                    ui.label(format!(
-                        "Ошибки: {} ({:.1}%)",
-                        stats.errors, stats.error_percent
+                    ui.label(localization::format(
+                        "metric.speed",
+                        &FormatArgs::new().insert("value", stats.cpm),
                     ));
                     ui.separator();
-                    ui.label(format!(
-                        "Время: {}:{:02}",
-                        stats.elapsed_ms / 60_000,
-                        (stats.elapsed_ms / 1_000) % 60
+                    ui.label(localization::format(
+                        "metric.errors",
+                        &FormatArgs::new()
+                            .insert("count", stats.errors)
+                            .insert("percent", format!("{:.1}", stats.error_percent)),
+                    ));
+                    ui.separator();
+                    ui.label(localization::format(
+                        "metric.time",
+                        &FormatArgs::new()
+                            .insert("minutes", stats.elapsed_ms / 60_000)
+                            .insert("seconds", format!("{:02}", (stats.elapsed_ms / 1_000) % 60)),
                     ));
                 } else {
-                    ui.label("Скорость: — · Ошибки: — · Время: —");
+                    ui.label(localization::tr("metric.empty"));
                 }
             });
         });
@@ -1811,25 +1943,24 @@ impl StaminatorApp {
                     elapsed,
                     self.users.active_name(),
                     match snapshot.as_ref().map(|s| s.state) {
-                        Some(SessionState::Paused) => {
-                            Some("Пауза · символ — продолжить · Esc — завершить")
-                        }
-                        Some(SessionState::Stopped) => Some("Занятие завершено · пробел — заново"),
+                        Some(SessionState::Paused) => Some(localization::tr("hint.paused")),
+                        Some(SessionState::Stopped) => Some(localization::tr("hint.finished")),
                         None if self.selected_mode == TrainingMode::ExternalText
                             && self.external_text.is_empty() =>
                         {
-                            Some("Занятие → Открыть текстовый файл")
+                            Some(localization::tr("hint.open-text"))
                         }
-                        None => Some("Пробел — начать занятие"),
+                        None => Some(localization::tr("hint.start")),
                         _ => None,
-                    },
+                    }
+                    .as_deref(),
                 );
             });
 
         if self.show_keyboard {
             let viewport_id = egui::ViewportId::from_hash_of("keyboard-window");
             let builder = egui::ViewportBuilder::default()
-                .with_title("Клавиатура")
+                .with_title(localization::tr("keyboard"))
                 .with_inner_size([1100.0, 420.0])
                 .with_min_inner_size([640.0, 250.0]);
             root.ctx()
@@ -2461,6 +2592,40 @@ mod tests {
     }
 
     #[test]
+    fn english_lesson_validation_error_is_localized_and_preserves_editor_content() {
+        let root = test_path().with_extension("english-validation");
+        let mut app = database_test_app(root.join("profiles.sqlite3"));
+        app.users.set_interface_language("EN").unwrap();
+        app.sync_profile_language();
+        let mut editor = content_editor::LessonEditor::new("en");
+        editor.lesson.version = 2;
+        editor.lesson.id = "valid-id".into();
+        editor.lesson.title = "Valid title".into();
+        editor.lesson.text = "Keep this text".into();
+        app.lesson_editor = Some(editor);
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let save = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Save lesson"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(save)]);
+
+        let editor = app.lesson_editor.as_ref().unwrap();
+        assert_eq!(
+            editor.error,
+            "Could not save lesson: unsupported lesson version 2"
+        );
+        assert_eq!(editor.lesson.text, "Keep this text");
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn editor_reports_invalid_lesson_and_phrase_storage_errors() {
         let mut app = test_app(test_path());
         app.lesson_editor = Some(content_editor::LessonEditor::new("ru"));
@@ -3027,7 +3192,7 @@ mod tests {
         let result = &records.active_records()[0];
         assert_eq!((result.correct, result.errors), (1, 1));
         assert_eq!(result.exercise, "example.txt");
-        assert_eq!(result.layout, "English");
+        assert_eq!(result.layout, "layout.en");
         assert_eq!(result.stop_reason, "manual");
         std::fs::remove_file(path).unwrap();
     }
@@ -3270,8 +3435,11 @@ mod tests {
         app.selected_mode = TrainingMode::Lessons;
         app.content_language = ContentLanguage::English;
         app.users.set_content_language("EN").unwrap();
+        app.users.set_interface_language("EN").unwrap();
+        app.sync_profile_language();
         app.english_layout = false;
         assert_eq!(app.current_label(), "EN home row");
+        assert_eq!(localization::tr("options"), "Options");
         let english_id = app.users.active_profile_id().to_owned();
         let russian_id = app.users.create("Русский профиль").unwrap().id.clone();
         assert_eq!(app.users.active_profile().unwrap().content_language, "RU");
@@ -3284,6 +3452,7 @@ mod tests {
         app.users.select(&russian_id).unwrap();
         app.sync_profile_language();
         assert_eq!(app.content_language, ContentLanguage::Russian);
+        assert_eq!(localization::tr("options"), "Опции");
         assert_eq!(app.users.active_profile().unwrap().content_language, "RU");
         fs::remove_file(path).unwrap();
     }
@@ -3397,20 +3566,22 @@ mod tests {
         fs::write(&text_path, "новый текст").unwrap();
         app.restore_external_text();
         assert!(app.external_error.contains("изменился"));
+        app.users.set_interface_language("EN").unwrap();
+        app.sync_profile_language();
 
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let nodes = draw_accessible(&mut app, &ctx, vec![]);
         let menu = nodes
             .iter()
-            .find(|(_, node)| node.label() == Some("Занятие"))
+            .find(|(_, node)| node.label() == Some("Exercise"))
             .unwrap()
             .0;
         draw_accessible(&mut app, &ctx, vec![accessible_click(menu)]);
         let nodes = draw_accessible(&mut app, &ctx, vec![]);
         let restart = nodes
             .iter()
-            .find(|(_, node)| node.label() == Some("Начать изменённый файл заново"))
+            .find(|(_, node)| node.label() == Some("Restart from the changed file"))
             .unwrap()
             .0;
         draw_accessible(&mut app, &ctx, vec![accessible_click(restart)]);
@@ -3970,6 +4141,52 @@ mod tests {
         draw_accessible(&mut app, &ctx, vec![accessible_click(russian)]);
         assert_eq!(app.current_label(), "Cats nap.");
         assert!(!app.english_layout);
+    }
+
+    #[test]
+    fn interface_language_menu_preserves_session_and_reloads_profile() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.show_keyboard = false;
+        app.start();
+        let before = app.session_text.clone();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let options = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Опции"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(options)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let language = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Язык интерфейса"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(language)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let english = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("English"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(english)]);
+        assert_eq!(app.session_text, before);
+        assert!(app.session.is_some());
+        assert!(app.english_layout);
+        assert_eq!(app.content_language, ContentLanguage::Russian);
+        assert_eq!(
+            UserStore::load_from(path)
+                .unwrap()
+                .active_profile()
+                .unwrap()
+                .interface_language,
+            "EN"
+        );
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        assert!(nodes.iter().any(|(_, n)| n.label() == Some("Options")));
     }
 
     #[test]
