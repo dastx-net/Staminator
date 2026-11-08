@@ -409,6 +409,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn eof_position_can_be_restored_but_out_of_range_is_rejected() {
+        let path = std::env::temp_dir().join(format!("staminator-eof-{}.txt", std::process::id()));
+        std::fs::write(&path, "я b").unwrap();
+        let file = ExternalFile::open(&path).unwrap();
+        let mut by_index = file.stream_at_index(file.char_count()).unwrap();
+        assert!(by_index.next_fragment(4).unwrap().is_none());
+        let mut by_byte = file.stream_at_byte(file.file_id().size as usize).unwrap();
+        assert!(by_byte.next_fragment(4).unwrap().is_none());
+        assert_eq!(
+            file.index_at_byte(file.file_id().size as usize).unwrap(),
+            file.char_count()
+        );
+        assert_eq!(
+            file.stream_at_index(file.char_count() + 1)
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            file.stream_at_byte(file.file_id().size as usize + 1)
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn external_file_indexes_and_streams_without_loading_the_document() {
         let path =
             std::env::temp_dir().join(format!("staminator-stream-{}.txt", std::process::id()));
@@ -441,6 +471,10 @@ mod tests {
         let part = at_boundary.next_fragment(2).unwrap().unwrap();
         assert_eq!(part.text, "яz");
         assert_eq!(part.byte_positions, vec![4096..4098, 4098..4099]);
+        let mut after_boundary = file.stream_at_index(4097).unwrap();
+        let tail = after_boundary.next_fragment(2).unwrap().unwrap();
+        assert_eq!(tail.text, "z");
+        assert_eq!(tail.byte_positions, vec![4098..4099]);
         assert_eq!(
             file.index_at_byte(4097).unwrap_err().kind(),
             std::io::ErrorKind::InvalidInput

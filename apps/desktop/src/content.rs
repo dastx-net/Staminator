@@ -16,9 +16,11 @@ pub struct Exercise {
 
 #[derive(Clone, Debug)]
 pub struct ContentCatalog {
+    lesson_documents: Vec<(stamina_data::storage::LessonDocument, bool)>,
     russian_lessons: Vec<Exercise>,
     russian_lesson_ids: Vec<String>,
     english_lesson_ids: Vec<String>,
+    lesson_groups: std::collections::HashMap<String, String>,
     lesson_roots: Vec<PathBuf>,
     lesson_diagnostics: String,
     user_phrase_root: Option<PathBuf>,
@@ -103,12 +105,14 @@ impl ContentCatalog {
         let english_caps = caps.get("en").cloned().unwrap_or_default();
 
         Self {
+            lesson_documents: Vec::new(),
             russian_lesson_ids: (0..russian_lessons.len())
                 .map(|i| format!("legacy.ru.{i}"))
                 .collect(),
             english_lesson_ids: (0..english_lessons.len())
                 .map(|i| format!("legacy.en.{i}"))
                 .collect(),
+            lesson_groups: std::collections::HashMap::new(),
             lesson_roots: Vec::new(),
             lesson_diagnostics: String::new(),
             user_phrase_root: None,
@@ -127,8 +131,10 @@ impl ContentCatalog {
     #[cfg(test)]
     pub(crate) fn fixture() -> Self {
         Self {
+            lesson_documents: Vec::new(),
             russian_lesson_ids: vec!["ru.1".into(), "ru.2".into()],
             english_lesson_ids: vec!["en.1".into(), "en.2".into()],
+            lesson_groups: std::collections::HashMap::new(),
             lesson_roots: Vec::new(),
             lesson_diagnostics: String::new(),
             user_phrase_root: None,
@@ -183,8 +189,10 @@ impl ContentCatalog {
     #[cfg(test)]
     pub(crate) fn fixture_empty() -> Self {
         Self {
+            lesson_documents: Vec::new(),
             russian_lesson_ids: Vec::new(),
             english_lesson_ids: Vec::new(),
+            lesson_groups: std::collections::HashMap::new(),
             lesson_roots: Vec::new(),
             lesson_diagnostics: String::new(),
             user_phrase_root: None,
@@ -214,10 +222,12 @@ impl ContentCatalog {
 
     pub fn refresh_lessons(&mut self) {
         let catalog = stamina_data::load_lesson_catalog(&self.lesson_roots);
+        self.lesson_documents.clear();
         self.russian_lessons.clear();
         self.english_lessons.clear();
         self.russian_lesson_ids.clear();
         self.english_lesson_ids.clear();
+        self.lesson_groups.clear();
         for entry in catalog.lessons {
             let group = self
                 .lesson_roots
@@ -227,6 +237,27 @@ impl ContentCatalog {
                 .filter(|path| !path.as_os_str().is_empty())
                 .map(|path| path.display().to_string());
             let lesson = entry.lesson;
+            if let Some(group) = group.as_ref() {
+                self.lesson_groups.insert(lesson.id.clone(), group.clone());
+            }
+            let document = stamina_data::storage::LessonDocument {
+                version: lesson.version,
+                id: lesson.id.clone(),
+                title: lesson.title.clone(),
+                language: lesson.language.clone(),
+                description: lesson.description.clone(),
+                text: lesson.text.clone(),
+            };
+            let built_in = self
+                .lesson_roots
+                .first()
+                .is_some_and(|root| entry.path.starts_with(root))
+                && !self
+                    .lesson_roots
+                    .iter()
+                    .skip(1)
+                    .any(|root| entry.path.starts_with(root));
+            self.lesson_documents.push((document, built_in));
             let language = lesson.language.split('-').next().unwrap_or("");
             let (items, ids) = if language.eq_ignore_ascii_case("ru") {
                 (&mut self.russian_lessons, &mut self.russian_lesson_ids)
@@ -250,6 +281,64 @@ impl ContentCatalog {
             .map(|d| format!("{}: {}", d.path.display(), d.message))
             .collect::<Vec<_>>()
             .join("\n");
+    }
+
+    /// Replace the displayed lesson catalog with documents loaded from persistent storage.
+    /// The boolean marks built-in documents, which the editor must not overwrite.
+    pub fn set_stored_lessons(
+        &mut self,
+        lessons: Vec<(stamina_data::storage::LessonDocument, bool)>,
+    ) {
+        self.lesson_documents = lessons;
+        self.russian_lessons.clear();
+        self.english_lessons.clear();
+        self.russian_lesson_ids.clear();
+        self.english_lesson_ids.clear();
+        for (lesson, _) in &self.lesson_documents {
+            let language = lesson.language.split('-').next().unwrap_or("");
+            let (items, ids) = if language.eq_ignore_ascii_case("ru") {
+                (&mut self.russian_lessons, &mut self.russian_lesson_ids)
+            } else if language.eq_ignore_ascii_case("en") {
+                (&mut self.english_lessons, &mut self.english_lesson_ids)
+            } else {
+                continue;
+            };
+            ids.push(lesson.id.clone());
+            let name = self.lesson_groups.get(&lesson.id).map_or_else(
+                || lesson.title.clone(),
+                |group| format!("{group} / {}", lesson.title),
+            );
+            items.push(Exercise {
+                name,
+                text: lesson.text.clone(),
+            });
+        }
+        self.lesson_diagnostics.clear();
+    }
+
+    pub fn stored_lessons(&self) -> &[(stamina_data::storage::LessonDocument, bool)] {
+        &self.lesson_documents
+    }
+
+    /// Return lesson group paths keyed by lesson ID.
+    pub fn lesson_groups(&self) -> &std::collections::HashMap<String, String> {
+        &self.lesson_groups
+    }
+
+    /// Replace the known lesson group paths keyed by lesson ID.
+    pub fn set_lesson_groups(&mut self, groups: std::collections::HashMap<String, String>) {
+        self.lesson_groups = groups;
+    }
+
+    /// Look up the complete stored document and whether it is built in.
+    pub fn lesson_document(
+        &self,
+        id: &str,
+    ) -> Option<(&stamina_data::storage::LessonDocument, bool)> {
+        self.lesson_documents
+            .iter()
+            .find(|(lesson, _)| lesson.id == id)
+            .map(|(lesson, built_in)| (lesson, *built_in))
     }
 
     pub fn lesson_id(&self, language: ContentLanguage, index: usize) -> Option<&str> {
@@ -693,12 +782,117 @@ mod tests {
             Some(0)
         );
         assert_eq!(catalog.lessons(ContentLanguage::English).len(), 1);
+        assert!(catalog.lesson_document("english").unwrap().1);
+        assert!(!catalog.lesson_document("russian").unwrap().1);
         fs::write(user.join("duplicate.json"), json("english", "en")).unwrap();
         catalog.refresh_lessons();
         assert!(catalog.lessons(ContentLanguage::English).is_empty());
         assert!(catalog.lesson_diagnostics().contains("duplicate.json"));
         assert_eq!(catalog.lessons(ContentLanguage::Russian).len(), 1);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stored_lessons_update_catalog_and_keep_documents_and_origin() {
+        let mut catalog = ContentCatalog::fixture();
+        let user = stamina_data::storage::LessonDocument {
+            version: 1,
+            id: "db-user".into(),
+            title: "DB lesson".into(),
+            language: "ru-RU".into(),
+            description: Some("description".into()),
+            text: "фыва".into(),
+        };
+        let built_in = stamina_data::storage::LessonDocument {
+            version: 1,
+            id: "db-built-in".into(),
+            title: "Built in".into(),
+            language: "en".into(),
+            description: None,
+            text: "asdf".into(),
+        };
+        catalog.set_stored_lessons(vec![(user.clone(), false), (built_in, true)]);
+        assert_eq!(catalog.lessons(ContentLanguage::Russian)[0].text, "фыва");
+        assert_eq!(
+            catalog.lessons(ContentLanguage::English)[0].name,
+            "Built in"
+        );
+        assert_eq!(catalog.lesson_document("db-user"), Some((&user, false)));
+        assert_eq!(
+            catalog.lesson_id(ContentLanguage::English, 0),
+            Some("db-built-in")
+        );
+    }
+
+    #[test]
+    fn lesson_groups_are_loaded_by_id_and_used_for_stored_lessons() {
+        let root = temp_file("lesson-groups");
+        let builtin = root.join("builtin");
+        let grouped = builtin.join("Basics").join("Home row");
+        fs::create_dir_all(&grouped).unwrap();
+        fs::write(
+            grouped.join("lesson.json"),
+            r#"{"version":1,"id":"grouped.lesson","title":"First","language":"en","text":"asdf"}"#,
+        )
+        .unwrap();
+
+        let mut catalog = ContentCatalog::fixture();
+        catalog.set_lesson_roots(vec![builtin]);
+        let expected_group = PathBuf::from("Basics")
+            .join("Home row")
+            .display()
+            .to_string();
+        assert_eq!(
+            catalog
+                .lesson_groups()
+                .get("grouped.lesson")
+                .map(String::as_str),
+            Some(expected_group.as_str())
+        );
+        assert_eq!(
+            catalog.lessons(ContentLanguage::English)[0].name,
+            format!("{expected_group} / First")
+        );
+
+        let lesson = stamina_data::storage::LessonDocument {
+            version: 1,
+            id: "grouped.lesson".into(),
+            title: "First updated".into(),
+            language: "en".into(),
+            description: None,
+            text: "asdf".into(),
+        };
+        catalog.set_stored_lessons(vec![(lesson, true)]);
+        assert_eq!(
+            catalog.lessons(ContentLanguage::English)[0].name,
+            format!("{expected_group} / First updated")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn set_lesson_groups_replaces_map_and_refreshes_stored_names() {
+        let mut catalog = ContentCatalog::fixture();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert("db-user".into(), "Imported".into());
+        catalog.set_lesson_groups(groups);
+        let lesson = stamina_data::storage::LessonDocument {
+            version: 1,
+            id: "db-user".into(),
+            title: "Stored lesson".into(),
+            language: "ru".into(),
+            description: None,
+            text: "фыва".into(),
+        };
+        catalog.set_stored_lessons(vec![(lesson, false)]);
+        assert_eq!(
+            catalog.lessons(ContentLanguage::Russian)[0].name,
+            "Imported / Stored lesson"
+        );
+        assert_eq!(
+            catalog.lesson_groups().get("db-user").map(String::as_str),
+            Some("Imported")
+        );
     }
 
     #[test]

@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod storage;
+
 use encoding_rs::WINDOWS_1251;
 use std::{
     collections::BTreeMap,

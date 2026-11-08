@@ -1,6 +1,7 @@
 //! Local profile and lesson result persistence.
 
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,12 @@ pub struct ResultRecord {
     pub elapsed_ms: u64,
     pub cpm: f64,
     pub error_percent: f64,
+    #[serde(default = "unknown_reason")]
+    pub stop_reason: String,
+}
+
+fn unknown_reason() -> String {
+    "unknown".into()
 }
 
 pub struct ResultInput<'a> {
@@ -66,13 +73,87 @@ pub struct UserStore {
     active_profile_id: String,
     #[serde(skip)]
     path: PathBuf,
+    #[serde(skip)]
+    database: bool,
+    #[serde(skip)]
+    revision: Cell<u64>,
 }
 
 impl UserStore {
-    /// Load the store from `%APPDATA%/Staminator/profiles.json` on Windows,
-    /// or the platform's conventional config directory elsewhere.
+    pub fn database(&self) -> io::Result<Option<stamina_data::storage::Database>> {
+        if self.database {
+            stamina_data::storage::Database::open(&self.path)
+                .map(Some)
+                .map_err(invalid_data)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Restore a checked backup and retain a copy of the previous database.
+    pub fn restore_backup(&mut self, source: &Path) -> io::Result<PathBuf> {
+        let mut database = self
+            .database()?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "База данных недоступна"))?;
+        let safety_path = self
+            .path
+            .with_file_name(format!("pre-restore-{}.sqlite3", fresh_id()));
+        database
+            .restore_from(source, self.revision.get(), &safety_path)
+            .map_err(invalid_data)?;
+        let loaded = database
+            .load_snapshot_with_revision()
+            .map_err(invalid_data)?;
+        let mut restored: Self =
+            serde_json::from_value(serde_json::to_value(loaded.snapshot).map_err(invalid_data)?)
+                .map_err(invalid_data)?;
+        restored.path = self.path.clone();
+        restored.database = true;
+        restored.revision.set(loaded.revision);
+        *self = restored;
+        Ok(safety_path)
+    }
+
+    /// Load SQLite and import the legacy JSON store once when present.
     pub fn load() -> io::Result<Self> {
-        Self::load_from(default_path())
+        let legacy = default_path();
+        let path = legacy.with_file_name("staminator.sqlite3");
+        Self::load_database(path, &legacy)
+    }
+
+    pub(crate) fn load_database(path: PathBuf, legacy: &Path) -> io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut database = stamina_data::storage::Database::open(&path).map_err(invalid_data)?;
+        let backup = sibling_path(legacy, "bak");
+        let source = if legacy.exists() {
+            Some(legacy)
+        } else if backup.exists() {
+            Some(backup.as_path())
+        } else {
+            None
+        };
+        if let Some(source) = source {
+            database
+                .import_profiles_json(source)
+                .map_err(invalid_data)?;
+        }
+        let loaded = database
+            .load_snapshot_with_revision()
+            .map_err(invalid_data)?;
+        let before = serde_json::to_value(&loaded.snapshot).map_err(invalid_data)?;
+        let mut store: Self =
+            serde_json::from_value(serde_json::to_value(loaded.snapshot).map_err(invalid_data)?)
+                .map_err(invalid_data)?;
+        store.path = path;
+        store.database = true;
+        store.revision.set(loaded.revision);
+        store.normalize();
+        if serde_json::to_value(&store).map_err(invalid_data)? != before {
+            store.save()?;
+        }
+        Ok(store)
     }
 
     /// Load from an explicit path; useful for isolated tests and portable setups.
@@ -94,6 +175,8 @@ impl UserStore {
                 profiles: Vec::new(),
                 active_profile_id: String::new(),
                 path: path.clone(),
+                database: false,
+                revision: Cell::new(0),
             }
         };
         store.path = path;
@@ -111,12 +194,32 @@ impl UserStore {
             profiles: Vec::new(),
             active_profile_id: String::new(),
             path: path.into(),
+            database: false,
+            revision: Cell::new(0),
         };
         store.normalize();
         store
     }
 
     pub fn save(&self) -> io::Result<()> {
+        if self.database {
+            let snapshot =
+                serde_json::from_value(serde_json::to_value(self).map_err(invalid_data)?)
+                    .map_err(invalid_data)?;
+            let revision = stamina_data::storage::Database::open(&self.path)
+                .and_then(|mut database| {
+                    database.save_snapshot_if_revision(&snapshot, self.revision.get())
+                })
+                .map_err(|error| match error {
+                    stamina_data::storage::StorageError::RevisionConflict { .. } => io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "Данные изменены в другом экземпляре приложения; перезапустите приложение",
+                    ),
+                    error => invalid_data(error),
+                })?;
+            self.revision.set(revision);
+            return Ok(());
+        }
         let parent = self
             .path
             .parent()
@@ -157,6 +260,39 @@ impl UserStore {
         &self.profiles
     }
 
+    pub fn import_profile(&mut self, profile: Profile) -> io::Result<()> {
+        if profile.id.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "profile id cannot be empty",
+            ));
+        }
+        if profile.results.len() > MAX_RESULTS_PER_PROFILE
+            || !matches!(profile.content_language.as_str(), "RU" | "EN")
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid profile contents",
+            ));
+        }
+        valid_name(&profile.name)?;
+        ensure_unique(&self.profiles, &profile.name, None)?;
+        if self
+            .profiles
+            .iter()
+            .any(|existing| existing.id == profile.id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "profile id already exists",
+            ));
+        }
+        let original = self.clone();
+        self.active_profile_id = profile.id.clone();
+        self.profiles.push(profile);
+        self.commit_or_restore(original)
+    }
+
     pub fn active_profile_id(&self) -> &str {
         &self.active_profile_id
     }
@@ -180,26 +316,29 @@ impl UserStore {
                 "invalid content language",
             ));
         }
+        let original = self.clone();
         let profile = self
             .profiles
             .iter_mut()
             .find(|p| p.id == self.active_profile_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "profile not found"))?;
         profile.content_language = language.into();
-        self.save()
+        self.commit_or_restore(original)
     }
 
     pub fn select(&mut self, id: &str) -> io::Result<()> {
         if !self.profiles.iter().any(|p| p.id == id) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "profile not found"));
         }
+        let original = self.clone();
         self.active_profile_id = id.to_owned();
-        self.save()
+        self.commit_or_restore(original)
     }
 
     pub fn create(&mut self, name: &str) -> io::Result<&Profile> {
         let name = valid_name(name)?;
         ensure_unique(&self.profiles, &name, None)?;
+        let original = self.clone();
         let id = fresh_id();
         self.profiles.push(Profile {
             id: id.clone(),
@@ -209,7 +348,7 @@ impl UserStore {
             content_language: default_content_language(),
         });
         self.active_profile_id = id;
-        self.save()?;
+        self.commit_or_restore(original)?;
         Ok(self.profiles.last().expect("profile was just inserted"))
     }
 
@@ -221,8 +360,9 @@ impl UserStore {
             .position(|p| p.id == id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "profile not found"))?;
         ensure_unique(&self.profiles, &name, Some(id))?;
+        let original = self.clone();
         self.profiles[index].name = name;
-        self.save()
+        self.commit_or_restore(original)
     }
 
     pub fn delete(&mut self, id: &str) -> io::Result<()> {
@@ -237,14 +377,33 @@ impl UserStore {
             .iter()
             .position(|p| p.id == id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "profile not found"))?;
+        let original = self.clone();
         self.profiles.remove(index);
         if self.active_profile_id == id {
             self.active_profile_id = self.profiles[0].id.clone();
         }
-        self.save()
+        self.commit_or_restore(original)
     }
 
+    fn commit_or_restore(&mut self, original: Self) -> io::Result<()> {
+        if let Err(error) = self.save() {
+            *self = original;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn record(&mut self, input: ResultInput<'_>) -> io::Result<&ResultRecord> {
+        self.record_with_reason(input, "unknown")
+    }
+
+    fn record_with_reason(
+        &mut self,
+        input: ResultInput<'_>,
+        reason: &str,
+    ) -> io::Result<&ResultRecord> {
+        let original = self.clone();
         let profile = self
             .profiles
             .iter_mut()
@@ -263,13 +422,17 @@ impl UserStore {
             elapsed_ms: input.elapsed_ms,
             cpm: input.cpm,
             error_percent: input.error_percent,
+            stop_reason: reason.to_owned(),
         });
         if profile.results.len() > MAX_RESULTS_PER_PROFILE {
             profile
                 .results
                 .drain(..profile.results.len() - MAX_RESULTS_PER_PROFILE);
         }
-        self.save()?;
+        if let Err(error) = self.save() {
+            *self = original;
+            return Err(error);
+        }
         Ok(self
             .profiles
             .iter()
@@ -280,6 +443,30 @@ impl UserStore {
             .unwrap())
     }
 
+    pub fn record_with_progress(
+        &mut self,
+        input: ResultInput<'_>,
+        progress: Option<ExternalProgress>,
+        reason: &str,
+    ) -> io::Result<()> {
+        let original = self.clone();
+        if let Some(progress) = progress {
+            let profile = self
+                .profiles
+                .iter_mut()
+                .find(|p| p.id == self.active_profile_id)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "active profile not found")
+                })?;
+            profile.external_text = Some(progress);
+        }
+        if let Err(error) = self.record_with_reason(input, reason) {
+            *self = original;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn active_records(&self) -> &[ResultRecord] {
         self.active_profile()
             .map(|p| p.results.as_slice())
@@ -287,13 +474,18 @@ impl UserStore {
     }
 
     pub fn set_external_progress(&mut self, progress: ExternalProgress) -> io::Result<()> {
+        let original = self.clone();
         let profile = self
             .profiles
             .iter_mut()
             .find(|p| p.id == self.active_profile_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "active profile not found"))?;
         profile.external_text = Some(progress);
-        self.save()
+        if let Err(error) = self.save() {
+            *self = original;
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn normalize(&mut self) {
@@ -419,6 +611,367 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    type FailureOperation = (&'static str, Box<dyn Fn(&mut UserStore) -> io::Result<()>>);
+
+    #[test]
+    fn imported_profile_keeps_id_and_rejects_conflicts() {
+        let path = test_path();
+        let mut store = UserStore::new_at(&path);
+        let profile = Profile {
+            id: "portable-id".into(),
+            name: "Portable".into(),
+            results: Vec::new(),
+            external_text: None,
+            content_language: "EN".into(),
+        };
+        store.import_profile(profile.clone()).unwrap();
+        assert_eq!(store.active_profile(), Some(&profile));
+        assert_eq!(
+            store.import_profile(profile).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        let reloaded = UserStore::load_from(&path).unwrap();
+        assert_eq!(reloaded.active_profile_id(), "portable-id");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn concurrent_profile_stores_reject_stale_writes_without_losing_data() {
+        let legacy = test_path();
+        let database = legacy.with_extension("sqlite3");
+        let mut first = UserStore::load_database(database.clone(), &legacy).unwrap();
+        let mut second = UserStore::load_database(database.clone(), &legacy).unwrap();
+        first.create("Alice").unwrap();
+        assert!(second.create("Bob").is_err());
+        assert_eq!(second.profiles().len(), 1);
+        let reloaded = UserStore::load_database(database.clone(), &legacy).unwrap();
+        assert!(
+            reloaded
+                .profiles()
+                .iter()
+                .any(|profile| profile.name == "Alice")
+        );
+        assert!(
+            !reloaded
+                .profiles()
+                .iter()
+                .any(|profile| profile.name == "Bob")
+        );
+        fs::remove_file(database).unwrap();
+    }
+
+    #[test]
+    fn restore_reloads_data_and_preserves_previous_database() {
+        let legacy = test_path();
+        let database_path = legacy.with_extension("sqlite3");
+        let backup_path = legacy.with_extension("backup.sqlite3");
+        let mut store = UserStore::load_database(database_path.clone(), &legacy).unwrap();
+        store.create("Before backup").unwrap();
+        store
+            .database()
+            .unwrap()
+            .unwrap()
+            .backup_to(&backup_path)
+            .unwrap();
+        store.create("After backup").unwrap();
+        let safety = store.restore_backup(&backup_path).unwrap();
+        assert_eq!(store.active_name(), "Before backup");
+        let saved = stamina_data::storage::Database::open(&safety)
+            .unwrap()
+            .load_snapshot()
+            .unwrap();
+        assert!(
+            saved
+                .profiles
+                .iter()
+                .any(|profile| profile.name == "After backup")
+        );
+        store.create("New profile").unwrap();
+        let reopened = UserStore::load_database(database_path.clone(), &legacy).unwrap();
+        assert_eq!(reopened.active_name(), "New profile");
+        fs::remove_file(safety).unwrap();
+        fs::remove_file(backup_path).unwrap();
+        fs::remove_file(database_path).unwrap();
+    }
+
+    #[test]
+    fn sqlite_import_and_profile_changes_survive_restart() {
+        let legacy = test_path();
+        let database = legacy.with_extension("sqlite3");
+        let mut old = UserStore::new_at(&legacy);
+        let id = old.create("Alice").unwrap().id.clone();
+        old.record(ResultInput {
+            mode: "lesson",
+            layout: "ru",
+            exercise: "one",
+            correct: 3,
+            errors: 1,
+            elapsed_ms: 1000,
+            cpm: 180.0,
+            error_percent: 25.0,
+        })
+        .unwrap();
+        let source = fs::read(&legacy).unwrap();
+        let mut store = UserStore::load_database(database.clone(), &legacy).unwrap();
+        assert_eq!(store.active_profile_id(), id);
+        assert_eq!(store.active_records().len(), 1);
+        store.rename(&id, "Bob").unwrap();
+        let progress = ExternalProgress {
+            path: PathBuf::from("book.txt"),
+            size: 20,
+            hash: 12,
+            encoding: "Utf8".into(),
+            position: 7,
+        };
+        store
+            .record_with_progress(
+                ResultInput {
+                    mode: "file",
+                    layout: "ru",
+                    exercise: "book",
+                    correct: 5,
+                    errors: 0,
+                    elapsed_ms: 1000,
+                    cpm: 300.0,
+                    error_percent: 0.0,
+                },
+                Some(progress.clone()),
+                "manual",
+            )
+            .unwrap();
+        let reopened = UserStore::load_database(database.clone(), &legacy).unwrap();
+        assert_eq!(reopened.active_name(), "Bob");
+        assert_eq!(reopened.active_records().len(), 2);
+        assert_eq!(
+            reopened.active_profile().unwrap().external_text,
+            Some(progress)
+        );
+        assert_eq!(fs::read(&legacy).unwrap(), source);
+        fs::remove_file(legacy).unwrap();
+        fs::remove_file(database).unwrap();
+    }
+
+    #[test]
+    fn database_load_imports_backup_when_legacy_primary_is_missing() {
+        let legacy = test_path();
+        let backup = sibling_path(&legacy, "bak");
+        let database = legacy.with_extension("sqlite3");
+        let mut old = UserStore::new_at(&legacy);
+        let id = old.create("Recovered backup profile").unwrap().id.clone();
+        let source_bytes = fs::read(&legacy).unwrap();
+        fs::rename(&legacy, &backup).unwrap();
+
+        let recovered = UserStore::load_database(database.clone(), &legacy).unwrap();
+
+        assert_eq!(recovered.active_profile_id(), id);
+        assert_eq!(recovered.active_name(), "Recovered backup profile");
+        assert_eq!(fs::read(&backup).unwrap(), source_bytes);
+        let reopened = UserStore::load_database(database.clone(), &legacy).unwrap();
+        assert_eq!(reopened.active_name(), "Recovered backup profile");
+        assert_eq!(reopened.profiles().len(), 2);
+
+        let _ = fs::remove_file(backup);
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
+    fn failed_legacy_import_preserves_corrupt_source_and_can_be_retried() {
+        let legacy = test_path();
+        let database = legacy.with_extension("sqlite3");
+        let corrupt = b"{ broken legacy JSON";
+        fs::write(&legacy, corrupt).unwrap();
+
+        let error = UserStore::load_database(database.clone(), &legacy).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&legacy).unwrap(), corrupt);
+        let valid = br#"{"active_profile_id":"restored","profiles":[{"id":"restored","name":"Restored profile","results":[]}] }"#;
+        fs::write(&legacy, valid).unwrap();
+
+        let imported = UserStore::load_database(database.clone(), &legacy).unwrap();
+
+        assert_eq!(imported.active_profile_id(), "restored");
+        assert_eq!(imported.active_name(), "Restored profile");
+        assert_eq!(imported.profiles().len(), 1);
+        assert_eq!(fs::read(&legacy).unwrap(), valid);
+        let reopened = UserStore::load_database(database.clone(), &legacy).unwrap();
+        assert_eq!(reopened.active_name(), "Restored profile");
+
+        let _ = fs::remove_file(legacy);
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
+    fn failed_profile_mutations_restore_json_memory_and_file() {
+        let path = test_path();
+        let mut store = UserStore::load_from(&path).unwrap();
+        let alice = store.create("Alice").unwrap().id.clone();
+        let bob = store.create("Bob").unwrap().id.clone();
+        store.select(&bob).unwrap();
+        let before_memory = serde_json::to_value(&store).unwrap();
+        let before_file = fs::read(&path).unwrap();
+        let temp_blocker = sibling_path(&path, "tmp");
+        fs::create_dir(&temp_blocker).unwrap();
+
+        let failures: [FailureOperation; 4] = [
+            (
+                "select",
+                Box::new({
+                    let alice = alice.clone();
+                    move |s| s.select(&alice)
+                }),
+            ),
+            (
+                "rename",
+                Box::new({
+                    let alice = alice.clone();
+                    move |s| s.rename(&alice, "Alicia")
+                }),
+            ),
+            (
+                "delete",
+                Box::new({
+                    let alice = alice.clone();
+                    move |s| s.delete(&alice)
+                }),
+            ),
+            (
+                "set_content_language",
+                Box::new(|s| s.set_content_language("EN")),
+            ),
+        ];
+        for (operation, mutate) in failures {
+            let error = mutate(&mut store).expect_err(operation);
+            assert_ne!(error.kind(), io::ErrorKind::NotFound, "{operation}");
+            assert_eq!(
+                serde_json::to_value(&store).unwrap(),
+                before_memory,
+                "{operation} memory rollback"
+            );
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                before_file,
+                "{operation} file preservation"
+            );
+        }
+
+        fs::remove_dir(temp_blocker).unwrap();
+        let reloaded = UserStore::load_from(&path).unwrap();
+        assert_eq!(reloaded.active_profile_id(), bob);
+        assert!(
+            reloaded
+                .profiles()
+                .iter()
+                .any(|p| p.id == alice && p.name == "Alice")
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_database_profile_mutations_restore_memory_and_preserve_database() {
+        let legacy = test_path();
+        let database = legacy.with_extension("sqlite3");
+        let preserved = legacy.with_extension("sqlite3.preserved");
+        let mut initial = UserStore::new_at(&legacy);
+        let alice = initial.create("Alice").unwrap().id.clone();
+        let bob = initial.create("Bob").unwrap().id.clone();
+        drop(initial);
+        let mut store = UserStore::load_database(database.clone(), &legacy).unwrap();
+        store.select(&bob).unwrap();
+        drop(store);
+        let mut store = UserStore::load_database(database.clone(), &legacy).unwrap();
+        let before_memory = serde_json::to_value(&store).unwrap();
+        fs::copy(&database, &preserved).unwrap();
+        let failures: [FailureOperation; 4] = [
+            (
+                "select",
+                Box::new({
+                    let alice = alice.clone();
+                    move |s| s.select(&alice)
+                }),
+            ),
+            (
+                "rename",
+                Box::new({
+                    let alice = alice.clone();
+                    move |s| s.rename(&alice, "Alicia")
+                }),
+            ),
+            (
+                "delete",
+                Box::new({
+                    let alice = alice.clone();
+                    move |s| s.delete(&alice)
+                }),
+            ),
+            (
+                "set_content_language",
+                Box::new(|s| s.set_content_language("EN")),
+            ),
+        ];
+        for (operation, mutate) in failures {
+            fs::remove_file(&database).unwrap();
+            fs::create_dir(&database).unwrap();
+            let error = mutate(&mut store).expect_err(operation);
+            assert_ne!(error.kind(), io::ErrorKind::NotFound, "{operation}");
+            assert_eq!(
+                serde_json::to_value(&store).unwrap(),
+                before_memory,
+                "{operation} memory rollback"
+            );
+            fs::remove_dir(&database).unwrap();
+            fs::copy(&preserved, &database).unwrap();
+            assert_eq!(
+                fs::read(&database).unwrap(),
+                fs::read(&preserved).unwrap(),
+                "{operation} database preservation"
+            );
+        }
+        let reloaded = UserStore::load_database(database.clone(), &legacy).unwrap();
+        assert_eq!(reloaded.active_profile_id(), bob);
+        assert!(
+            reloaded
+                .profiles()
+                .iter()
+                .any(|p| p.id == alice && p.name == "Alice")
+        );
+        drop(store);
+        let _ = fs::remove_file(legacy);
+        let _ = fs::remove_file(database);
+        let _ = fs::remove_file(preserved);
+    }
+
+    #[test]
+    fn failed_result_and_progress_leave_previous_state_for_retry() {
+        let blocker = test_path();
+        fs::write(&blocker, "not a directory").unwrap();
+        let mut store = UserStore::new_at(blocker.join("profiles.json"));
+        let progress = ExternalProgress {
+            path: PathBuf::from("book.txt"),
+            size: 10,
+            hash: 1,
+            encoding: "Utf8".into(),
+            position: 3,
+        };
+        let result = store.record_with_progress(
+            ResultInput {
+                mode: "file",
+                layout: "ru",
+                exercise: "book",
+                correct: 1,
+                errors: 0,
+                elapsed_ms: 100,
+                cpm: 600.0,
+                error_percent: 0.0,
+            },
+            Some(progress),
+            "manual",
+        );
+        assert!(result.is_err());
+        assert!(store.active_records().is_empty());
+        assert!(store.active_profile().unwrap().external_text.is_none());
+        fs::remove_file(blocker).unwrap();
+    }
 
     fn test_path() -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -618,6 +1171,8 @@ mod tests {
                 | io::ErrorKind::PermissionDenied
         ));
         assert!(!path.exists());
+        assert_eq!(store.profiles().len(), 1);
+        assert_ne!(store.active_name(), "Unsaved");
         let _ = fs::remove_file(blocker);
     }
 
@@ -690,6 +1245,7 @@ mod tests {
                 elapsed_ms: 1_000,
                 cpm: 60.0,
                 error_percent: 0.0,
+                stop_reason: "unknown".into(),
             })
             .collect();
         let data = serde_json::json!({

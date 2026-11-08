@@ -7,6 +7,7 @@ mod lesson_generator;
 mod progress_view;
 mod result_view;
 mod sound;
+mod storage_transfer;
 mod training_view;
 mod user_store;
 
@@ -36,6 +37,54 @@ fn save_keyboard_setting_to(path: Option<&std::path::Path>, show: bool) {
     {
         let _ = fs::write(path, show.to_string());
     }
+}
+
+fn sync_catalog_with_database(
+    catalog: &mut ContentCatalog,
+    database: &mut stamina_data::storage::Database,
+) -> Result<(), stamina_data::storage::StorageError> {
+    if !catalog.stored_lessons().is_empty() && catalog.lesson_diagnostics().is_empty() {
+        database.import_lessons_once(catalog.stored_lessons())?;
+        let builtin = catalog
+            .stored_lessons()
+            .iter()
+            .filter(|(_, built_in)| *built_in)
+            .map(|(lesson, _)| lesson.clone())
+            .collect::<Vec<_>>();
+        database.sync_builtin_lessons(&builtin)?;
+    }
+    let lessons = database.list_lessons()?;
+    if lessons.is_empty() && !catalog.lesson_diagnostics().is_empty() {
+        return Ok(());
+    }
+    let mut groups = std::collections::HashMap::new();
+    for (lesson, built_in) in &lessons {
+        let key = format!("lesson_group:{}", lesson.id);
+        let source_group = catalog.lesson_groups().get(&lesson.id).cloned();
+        let saved_group = database.get_app_setting(&key)?;
+        let group = if *built_in && source_group.is_some() {
+            if source_group != saved_group {
+                database.set_app_setting(&key, source_group.as_deref().unwrap_or_default())?;
+            }
+            source_group
+        } else {
+            match saved_group {
+                Some(group) => Some(group),
+                None => {
+                    if let Some(group) = &source_group {
+                        database.set_app_setting(&key, group)?;
+                    }
+                    source_group
+                }
+            }
+        };
+        if let Some(group) = group {
+            groups.insert(lesson.id.clone(), group);
+        }
+    }
+    catalog.set_lesson_groups(groups);
+    catalog.set_stored_lessons(lessons);
+    Ok(())
 }
 
 fn append_next_phrase(
@@ -138,9 +187,20 @@ struct StaminatorApp {
 }
 
 impl StaminatorApp {
+    fn sync_profile_language(&mut self) {
+        self.content_language = if self
+            .users
+            .active_profile()
+            .is_some_and(|profile| profile.content_language == "EN")
+        {
+            ContentLanguage::English
+        } else {
+            ContentLanguage::Russian
+        };
+    }
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         training_view::install_text_font(&cc.egui_ctx);
-        let catalog = ContentCatalog::load();
+        let mut catalog = ContentCatalog::load();
         let background_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../src/stamina_setup/Skins/Field.jpg");
         let background = image::open(background_path).ok().map(|image| {
@@ -154,8 +214,8 @@ impl StaminatorApp {
             )
         });
         let keyboard_setting_path = keyboard_setting_path();
-        let show_keyboard = load_keyboard_setting_from(keyboard_setting_path.as_deref());
-        let (users, profile_error) = match UserStore::load() {
+        let mut show_keyboard = load_keyboard_setting_from(keyboard_setting_path.as_deref());
+        let (users, mut profile_error) = match UserStore::load() {
             Ok(users) => (users, String::new()),
             Err(error) => {
                 let recovered_path = std::env::var_os("APPDATA")
@@ -171,6 +231,28 @@ impl StaminatorApp {
                 (users, format!("Не удалось загрузить профили: {error}"))
             }
         };
+        match users.database() {
+            Ok(Some(mut database)) => {
+                match database.get_app_setting("show_keyboard") {
+                    Ok(Some(value)) => show_keyboard = value != "false",
+                    Ok(None) => {
+                        if let Err(error) =
+                            database.set_app_setting("show_keyboard", &show_keyboard.to_string())
+                        {
+                            profile_error = format!("Не удалось сохранить настройки: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        profile_error = format!("Не удалось загрузить настройки: {error}")
+                    }
+                }
+                if let Err(error) = sync_catalog_with_database(&mut catalog, &mut database) {
+                    profile_error = format!("Не удалось загрузить уроки: {error}");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => profile_error = format!("Не удалось открыть базу уроков: {error}"),
+        }
         let mut app = Self::from_parts(
             catalog,
             background,
@@ -238,6 +320,22 @@ impl StaminatorApp {
             progress_open: false,
             profile_name_input: String::new(),
             profile_error,
+        }
+    }
+
+    fn persist_keyboard_setting(&mut self) {
+        match self.users.database() {
+            Ok(Some(mut database)) => {
+                if let Err(error) =
+                    database.set_app_setting("show_keyboard", &self.show_keyboard.to_string())
+                {
+                    self.profile_error = format!("Не удалось сохранить настройки: {error}");
+                }
+            }
+            Ok(None) => {
+                save_keyboard_setting_to(self.keyboard_setting_path.as_deref(), self.show_keyboard)
+            }
+            Err(error) => self.profile_error = format!("Не удалось сохранить настройки: {error}"),
         }
     }
 
@@ -421,11 +519,22 @@ impl StaminatorApp {
     }
 
     fn save_external_progress(&mut self) {
-        if self.selected_mode != TrainingMode::ExternalText {
+        let Some(progress) = self.current_external_progress() else {
             return;
+        };
+        if let Err(error) = self.users.set_external_progress(progress) {
+            self.external_error = format!("Не удалось сохранить позицию: {error}");
+        } else if let Err(error) = self.prepare_external() {
+            self.external_error = format!("Не удалось прочитать файл: {error}");
+        }
+    }
+
+    fn current_external_progress(&mut self) -> Option<user_store::ExternalProgress> {
+        if self.selected_mode != TrainingMode::ExternalText {
+            return None;
         }
         let Some(source) = &self.external_source else {
-            return;
+            return None;
         };
         let id = source.file_id();
         let position = self
@@ -436,25 +545,20 @@ impl StaminatorApp {
             Ok(current) if current.file_id() == id => {}
             Ok(_) => {
                 self.external_error = "Файл изменился; выберите его заново".into();
-                return;
+                return None;
             }
             Err(error) => {
                 self.external_error = format!("Не удалось проверить файл: {error}");
-                return;
+                return None;
             }
         }
-        let progress = user_store::ExternalProgress {
+        Some(user_store::ExternalProgress {
             path: id.path().to_path_buf(),
             size: id.size,
             hash: id.content_hash,
             encoding: "Utf8".into(),
             position,
-        };
-        if let Err(error) = self.users.set_external_progress(progress) {
-            self.external_error = format!("Не удалось сохранить позицию: {error}");
-        } else if let Err(error) = self.prepare_external() {
-            self.external_error = format!("Не удалось прочитать файл: {error}");
-        }
+        })
     }
 
     fn set_external_position(&mut self, index: usize) {
@@ -585,23 +689,39 @@ impl StaminatorApp {
         self.result_open = true;
     }
 
-    fn accept_result(&mut self) {
+    fn accept_result(&mut self) -> bool {
+        let progress = if !self.result_recorded {
+            self.current_external_progress()
+        } else {
+            None
+        };
+        let refresh_external = progress.is_some();
+        self.record_current_result(progress);
         if !self.result_recorded {
-            self.save_external_progress();
+            return false;
         }
-        self.record_current_result();
+        if refresh_external && let Err(error) = self.prepare_external() {
+            self.external_error = format!("Не удалось прочитать файл: {error}");
+        }
         self.result_open = false;
+        true
     }
 
-    fn record_current_result(&mut self) {
+    fn record_current_result(&mut self, progress: Option<user_store::ExternalProgress>) {
         if self.result_recorded {
             return;
         }
         let Some(stats) = &self.last_result else {
             return;
         };
-        self.result_recorded = true;
         if stats.correct == 0 && stats.errors == 0 {
+            if let Some(progress) = progress
+                && let Err(error) = self.users.set_external_progress(progress)
+            {
+                self.profile_error = format!("Не удалось сохранить позицию: {error}");
+                return;
+            }
+            self.result_recorded = true;
             return;
         }
         let mode = TrainingMode::ALL
@@ -614,17 +734,28 @@ impl StaminatorApp {
         } else {
             "Русская"
         };
-        if let Err(error) = self.users.record(user_store::ResultInput {
-            mode,
-            layout,
-            exercise: &self.result_title,
-            correct: stats.correct as u64,
-            errors: stats.errors as u64,
-            elapsed_ms: stats.elapsed_ms,
-            cpm: stats.cpm as f64,
-            error_percent: stats.error_percent,
-        }) {
+        if let Err(error) = self.users.record_with_progress(
+            user_store::ResultInput {
+                mode,
+                layout,
+                exercise: &self.result_title,
+                correct: stats.correct as u64,
+                errors: stats.errors as u64,
+                elapsed_ms: stats.elapsed_ms,
+                cpm: stats.cpm as f64,
+                error_percent: stats.error_percent,
+            },
+            progress,
+            match self.session.as_ref().and_then(Session::stop_reason) {
+                Some(StopReason::Manual) => "manual",
+                Some(StopReason::TimeLimit) => "time_limit",
+                Some(StopReason::Completed) => "completed",
+                None => "unknown",
+            },
+        ) {
             self.profile_error = format!("Не удалось сохранить результат: {error}");
+        } else {
+            self.result_recorded = true;
         }
     }
 
@@ -817,6 +948,38 @@ impl StaminatorApp {
         }
     }
 
+    fn import_lesson_from(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let lesson =
+            storage_transfer::import_json_lesson(path).map_err(|error| error.to_string())?;
+        let mut editor = content_editor::LessonEditor::new(&lesson.language);
+        editor.lesson = lesson;
+        self.lesson_editor = Some(editor);
+        self.chooser_open = false;
+        Ok(())
+    }
+
+    fn export_lesson_to(&self, index: usize, path: &std::path::Path) -> Result<(), String> {
+        let lesson = self
+            .catalog
+            .lesson_id(self.language(), index)
+            .and_then(|id| self.catalog.lesson_document(id))
+            .map(|(lesson, _)| lesson)
+            .ok_or_else(|| "Урок не выбран".to_owned())?;
+        storage_transfer::export_json_lesson(lesson, path).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn export_backup_to(&self, path: &std::path::Path) -> Result<(), String> {
+        let database = self
+            .users
+            .database()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "База данных недоступна".to_owned())?;
+        storage_transfer::export_database_backup(&database, path)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     fn show_content_chooser(&mut self, ctx: &egui::Context) {
         let mut open = self.chooser_open;
         let mut chosen = None;
@@ -824,6 +987,8 @@ impl StaminatorApp {
         let mut create = false;
         let mut edit = false;
         let mut add_phrases = false;
+        let mut import_lesson = false;
+        let mut export_lesson = false;
         let current = self.current_index();
         egui::Window::new(if self.selected_mode == TrainingMode::Lessons {
             "Выбор урока"
@@ -838,6 +1003,10 @@ impl StaminatorApp {
                     refresh = ui.button("Обновить список уроков").clicked();
                     create = ui.button("Создать урок").clicked();
                     edit = ui.button("Изменить выбранный урок").clicked();
+                });
+                ui.horizontal(|ui| {
+                    import_lesson = ui.button("Импорт урока…").clicked();
+                    export_lesson = ui.button("Экспорт урока…").clicked();
                 });
                 if let Some(path) = self.catalog.user_lesson_path() {
                     ui.label(format!("Папка ваших уроков: {}", path.display()));
@@ -876,6 +1045,23 @@ impl StaminatorApp {
             );
         });
         self.chooser_open = open;
+        if import_lesson
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("JSON", &["json"])
+                .pick_file()
+            && let Err(error) = self.import_lesson_from(&path)
+        {
+            self.profile_error = format!("Не удалось импортировать урок: {error}");
+        }
+        if export_lesson
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("JSON", &["json"])
+                .set_file_name("lesson.json")
+                .save_file()
+            && let Err(error) = self.export_lesson_to(current, &path)
+        {
+            self.profile_error = format!("Не удалось экспортировать урок: {error}");
+        }
         if create {
             self.lesson_editor = Some(content_editor::LessonEditor::new(
                 if self.language() == ContentLanguage::English {
@@ -888,6 +1074,28 @@ impl StaminatorApp {
         }
         if edit {
             let id = self.catalog.lesson_id(self.language(), current);
+            if let Ok(Some(_)) = self.users.database() {
+                let mut editor = content_editor::LessonEditor::new(
+                    if self.language() == ContentLanguage::English {
+                        "en"
+                    } else {
+                        "ru"
+                    },
+                );
+                match id.and_then(|id| self.catalog.lesson_document(id)) {
+                    Some((lesson, false)) => {
+                        editor.lesson = lesson.clone();
+                        editor.path = Some(PathBuf::from(&lesson.id));
+                    }
+                    Some(_) => {
+                        editor.error = "Встроенный урок нельзя изменить; создайте свой урок".into()
+                    }
+                    None => editor.error = "Выберите урок".into(),
+                }
+                self.lesson_editor = Some(editor);
+                self.chooser_open = false;
+                return;
+            }
             let item = stamina_data::load_lesson_catalog(self.catalog.lesson_roots())
                 .lessons
                 .into_iter()
@@ -929,7 +1137,16 @@ impl StaminatorApp {
                         self.catalog.lesson_id(language, 0).map(str::to_owned);
                 }
             }
-            self.catalog.refresh_lessons();
+            if let Ok(Some(database)) = self.users.database() {
+                match database.list_lessons() {
+                    Ok(lessons) => self.catalog.set_stored_lessons(lessons),
+                    Err(error) => {
+                        self.profile_error = format!("Не удалось загрузить уроки: {error}")
+                    }
+                }
+            } else {
+                self.catalog.refresh_lessons();
+            }
             self.session = None;
             self.last_result = None;
             self.result_open = false;
@@ -957,7 +1174,53 @@ impl StaminatorApp {
                     self.lesson_editor = Some(editor);
                     return;
                 }
-                let result = if let Some(root) = self.catalog.user_lesson_path() {
+                let database = match self.users.database() {
+                    Ok(database) => database,
+                    Err(error) => {
+                        editor.error = format!("Не удалось открыть базу уроков: {error}");
+                        self.lesson_editor = Some(editor);
+                        return;
+                    }
+                };
+                let result = if let Some(mut database) = database {
+                    stamina_data::validate_json_lesson(&editor.lesson)
+                        .map_err(|e| e.to_string())
+                        .and_then(|()| {
+                            let old_id = editor.path.as_ref().and_then(|p| p.to_str());
+                            if old_id.is_some_and(|id| id != editor.lesson.id) {
+                                return Err("Изменение ID урока не поддерживается".into());
+                            }
+                            match database
+                                .lesson(&editor.lesson.id)
+                                .map_err(|e| e.to_string())?
+                            {
+                                Some((_, true)) => {
+                                    return Err("Встроенный урок нельзя изменить".into());
+                                }
+                                Some(_) if old_id.is_none() => {
+                                    return Err("Урок с таким ID уже существует".into());
+                                }
+                                None if old_id.is_some() => return Err("Урок не найден".into()),
+                                _ => {}
+                            }
+                            if let Some(id) = old_id {
+                                if !database
+                                    .update_user_lesson(id, &editor.lesson)
+                                    .map_err(|e| e.to_string())?
+                                {
+                                    return Err(
+                                        "Урок не найден или недоступен для изменения".into()
+                                    );
+                                }
+                                Ok(())
+                            } else {
+                                database
+                                    .create_user_lesson(&editor.lesson)
+                                    .map_err(|e| e.to_string())
+                            }
+                        })
+                        .map(|()| PathBuf::new())
+                } else if let Some(root) = self.catalog.user_lesson_path() {
                     if let Some(path) = &editor.path {
                         stamina_data::edit_user_lesson(
                             root,
@@ -965,12 +1228,14 @@ impl StaminatorApp {
                             self.catalog.lesson_roots(),
                             &editor.lesson,
                         )
+                        .map_err(|e| e.to_string())
                     } else {
                         stamina_data::create_user_lesson(
                             root,
                             self.catalog.lesson_roots(),
                             &editor.lesson,
                         )
+                        .map_err(|e| e.to_string())
                     }
                 } else {
                     editor.error = "Не найден пользовательский каталог уроков".into();
@@ -990,7 +1255,17 @@ impl StaminatorApp {
                         } else {
                             ContentLanguage::Russian
                         };
-                        self.catalog.refresh_lessons();
+                        if let Ok(Some(database)) = self.users.database() {
+                            match database.list_lessons() {
+                                Ok(lessons) => self.catalog.set_stored_lessons(lessons),
+                                Err(error) => {
+                                    self.profile_error =
+                                        format!("Не удалось загрузить уроки: {error}")
+                                }
+                            }
+                        } else {
+                            self.catalog.refresh_lessons();
+                        }
                         self.content_language = language;
                         self.selected_mode = TrainingMode::Lessons;
                         self.selected_lessons[usize::from(language == ContentLanguage::English)] =
@@ -1025,6 +1300,60 @@ impl StaminatorApp {
         }
     }
 
+    fn import_profile_from(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let profile = storage_transfer::import_profile_json(path).map_err(|e| e.to_string())?;
+        let value = serde_json::to_value(profile).map_err(|e| e.to_string())?;
+        self.users
+            .import_profile(serde_json::from_value(value).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        self.sync_profile_language();
+        self.restore_external_text();
+        self.profile_error.clear();
+        Ok(())
+    }
+
+    fn export_profile_to(&self, path: &std::path::Path) -> Result<(), String> {
+        let profile = self
+            .users
+            .active_profile()
+            .ok_or_else(|| "Профиль не выбран".to_string())?;
+        let value = serde_json::to_value(profile).map_err(|e| e.to_string())?;
+        let profile = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        storage_transfer::export_profile_json(&profile, path).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn restore_backup_from(&mut self, path: &std::path::Path) -> Result<PathBuf, String> {
+        let safety = self.users.restore_backup(path).map_err(|e| e.to_string())?;
+        self.sync_profile_language();
+        self.session = None;
+        self.last_result = None;
+        self.result_open = false;
+        self.restore_external_text();
+        let database = self
+            .users
+            .database()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "База данных недоступна".to_string())?;
+        let lessons = database.list_lessons().map_err(|e| e.to_string())?;
+        let mut groups = std::collections::HashMap::new();
+        for (lesson, _) in &lessons {
+            if let Some(group) = database
+                .get_app_setting(&format!("lesson_group:{}", lesson.id))
+                .map_err(|e| e.to_string())?
+            {
+                groups.insert(lesson.id.clone(), group);
+            }
+        }
+        self.catalog.set_lesson_groups(groups);
+        self.catalog.set_stored_lessons(lessons);
+        self.show_keyboard = database
+            .get_app_setting("show_keyboard")
+            .map_err(|e| e.to_string())?
+            .is_none_or(|value| value != "false");
+        Ok(safety)
+    }
+
     fn show_profiles(&mut self, ctx: &egui::Context) {
         let mut open = self.profiles_open;
         egui::Window::new("Пользователи")
@@ -1049,12 +1378,33 @@ impl StaminatorApp {
                                 self.last_result = None;
                                 self.result_open = false;
                                 self.profile_error.clear();
+                                self.sync_profile_language();
                                 self.restore_external_text();
                             }
                             Err(error) => self.profile_error = error.to_string(),
                         }
                     }
                 }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Импорт профиля…").clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .add_filter("JSON", &["json"])
+                            .pick_file()
+                        && let Err(error) = self.import_profile_from(&path)
+                    {
+                        self.profile_error = format!("Не удалось импортировать профиль: {error}");
+                    }
+                    if ui.button("Экспорт профиля…").clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .add_filter("JSON", &["json"])
+                            .set_file_name("profile.json")
+                            .save_file()
+                        && let Err(error) = self.export_profile_to(&path)
+                    {
+                        self.profile_error = format!("Не удалось экспортировать профиль: {error}");
+                    }
+                });
                 ui.separator();
                 ui.label("Имя профиля");
                 ui.text_edit_singleline(&mut self.profile_name_input);
@@ -1065,6 +1415,7 @@ impl StaminatorApp {
                                 self.profile_name_input.clear();
                                 self.profile_error.clear();
                                 self.session = None;
+                                self.sync_profile_language();
                                 self.restore_external_text();
                             }
                             Err(error) => self.profile_error = error.to_string(),
@@ -1092,6 +1443,7 @@ impl StaminatorApp {
                             Ok(()) => {
                                 self.profile_error.clear();
                                 self.session = None;
+                                self.sync_profile_language();
                                 self.restore_external_text();
                             }
                             Err(error) => self.profile_error = error.to_string(),
@@ -1297,14 +1649,48 @@ impl StaminatorApp {
                     self.progress_open = true;
                 }
                 ui.menu_button("Опции", |ui| {
+                    if ui.button("Создать резервную копию…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().add_filter("SQLite", &["sqlite3"]).set_file_name("staminator-backup.sqlite3").save_file()
+                            && let Err(error) = self.export_backup_to(&path) {
+                            self.profile_error = format!("Не удалось создать копию: {error}");
+                        }
+                        ui.close();
+                    }
+                    if ui.button("Проверить резервную копию…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().add_filter("SQLite", &["sqlite3"]).pick_file() {
+                            match storage_transfer::prepare_database_restore(path) {
+                                Ok(()) => self.profile_error = "Резервная копия проверена".into(),
+                                Err(error) => self.profile_error = format!("Ошибка резервной копии: {error}"),
+                            }
+                        }
+                        ui.close();
+                    }
+                    if ui.add_enabled(!active, egui::Button::new("Восстановить резервную копию…")).clicked() {
+                        if let Some(path) = rfd::FileDialog::new().add_filter("SQLite", &["sqlite3"]).pick_file() {
+                            let confirmed = storage_transfer::prepare_database_restore(&path).map(|()| {
+                                let answer = rfd::MessageDialog::new().set_title("Восстановить данные")
+                                    .set_description("Текущие данные будут заменены. Перед восстановлением приложение сохранит их резервную копию.")
+                                    .set_buttons(rfd::MessageButtons::YesNo).show();
+                                answer == rfd::MessageDialogResult::Yes
+                            });
+                            match confirmed {
+                                Ok(true) => match self.restore_backup_from(&path) {
+                                    Ok(safety) => {
+                                        self.profile_error = format!("Данные восстановлены. Предыдущая база: {}", safety.display());
+                                    }
+                                    Err(error) => self.profile_error = format!("Не удалось восстановить данные: {error}"),
+                                },
+                                Ok(false) => {}
+                                Err(error) => self.profile_error = format!("Ошибка резервной копии: {error}"),
+                            }
+                        }
+                        ui.close();
+                    }
                     if ui
                         .checkbox(&mut self.show_keyboard, "Показывать клавиатуру")
                         .changed()
                     {
-                        save_keyboard_setting_to(
-                            self.keyboard_setting_path.as_deref(),
-                            self.show_keyboard,
-                        );
+                        self.persist_keyboard_setting();
                     }
                     ui.separator();
                     ui.label(format!("Занятие: {current_label}"));
@@ -1419,7 +1805,7 @@ impl StaminatorApp {
                     let ctx = ui.ctx().clone();
                     if ctx.input(|input| input.viewport().close_requested()) {
                         self.show_keyboard = false;
-                        save_keyboard_setting_to(self.keyboard_setting_path.as_deref(), false);
+                        self.persist_keyboard_setting();
                     }
                     self.handle_input(&ctx);
                     let layout = if self.english_layout {
@@ -1474,18 +1860,20 @@ impl StaminatorApp {
                     }
                 }
                 ResultAction::Retry => {
-                    self.accept_result();
-                    self.start();
+                    if self.accept_result() {
+                        self.start();
+                    }
                 }
                 ResultAction::Next => {
-                    self.accept_result();
-                    if self.advance_content() {
+                    if self.accept_result() && self.advance_content() {
                         self.start();
                     }
                 }
                 ResultAction::Close => {
-                    self.accept_result();
-                    if self.result_completed && self.selected_mode == TrainingMode::Lessons {
+                    if self.accept_result()
+                        && self.result_completed
+                        && self.selected_mode == TrainingMode::Lessons
+                    {
                         self.advance_content();
                     }
                 }
@@ -1519,6 +1907,228 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn sqlite_catalog_preserves_groups_and_updates_builtin_lessons() {
+        let root = test_path().with_extension("directory");
+        let builtin = root.join("builtin");
+        let user = root.join("user");
+        fs::create_dir_all(builtin.join("basics")).unwrap();
+        fs::create_dir_all(user.join("practice")).unwrap();
+        let builtin_path = builtin.join("basics/first.json");
+        let user_path = user.join("practice/custom.json");
+        let builtin_lesson = stamina_data::JsonLesson {
+            version: 1,
+            id: "first".into(),
+            title: "First".into(),
+            language: "en".into(),
+            description: None,
+            text: "abc".into(),
+        };
+        let user_lesson = stamina_data::JsonLesson {
+            id: "custom".into(),
+            title: "Custom".into(),
+            ..builtin_lesson.clone()
+        };
+        fs::write(&builtin_path, serde_json::to_vec(&builtin_lesson).unwrap()).unwrap();
+        fs::write(&user_path, serde_json::to_vec(&user_lesson).unwrap()).unwrap();
+        let mut database =
+            stamina_data::storage::Database::open(root.join("data.sqlite3")).unwrap();
+        let mut catalog = ContentCatalog::fixture_empty();
+        catalog.set_lesson_roots(vec![builtin.clone(), user.clone()]);
+        sync_catalog_with_database(&mut catalog, &mut database).unwrap();
+        assert!(
+            catalog
+                .lessons(ContentLanguage::English)
+                .iter()
+                .any(|lesson| lesson.name == "practice / Custom")
+        );
+        let mut updated = builtin_lesson;
+        updated.text = "new".into();
+        fs::write(&builtin_path, serde_json::to_vec(&updated).unwrap()).unwrap();
+        catalog.set_lesson_roots(vec![builtin, user]);
+        sync_catalog_with_database(&mut catalog, &mut database).unwrap();
+        assert_eq!(database.lesson("first").unwrap().unwrap().0.text, "new");
+        assert_eq!(database.lesson("custom").unwrap().unwrap().0, user_lesson);
+        assert_eq!(
+            catalog.lesson_groups().get("custom").map(String::as_str),
+            Some("practice")
+        );
+        drop(database);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn app_exports_lesson_and_backup_and_opens_lesson_for_import() {
+        let root = test_path().with_extension("transfer");
+        fs::create_dir_all(&root).unwrap();
+        let mut app = test_app(root.join("fixture.json"));
+        let unavailable = root.join("unavailable.sqlite3");
+        assert!(app.export_backup_to(&unavailable).is_err());
+        assert!(!unavailable.exists());
+        app.users =
+            UserStore::load_database(root.join("app.sqlite3"), &root.join("legacy.json")).unwrap();
+        let lesson = stamina_data::JsonLesson {
+            version: 1,
+            id: "exported".into(),
+            title: "Exported".into(),
+            language: "ru".into(),
+            description: None,
+            text: "текст".into(),
+        };
+        app.catalog
+            .set_stored_lessons(vec![(lesson.clone(), false)]);
+        let lesson_path = root.join("lesson.json");
+        app.export_lesson_to(0, &lesson_path).unwrap();
+        assert!(app.export_lesson_to(0, &lesson_path).is_err());
+        app.import_lesson_from(&lesson_path).unwrap();
+        assert_eq!(app.lesson_editor.as_ref().unwrap().lesson, lesson);
+        let missing = root.join("missing.json");
+        assert!(app.import_lesson_from(&missing).is_err());
+        assert_eq!(app.lesson_editor.as_ref().unwrap().lesson.id, "exported");
+        let malformed = root.join("malformed.json");
+        fs::write(&malformed, "{bad json}").unwrap();
+        assert!(app.import_lesson_from(&malformed).is_err());
+        assert_eq!(app.lesson_editor.as_ref().unwrap().lesson.text, "текст");
+        assert!(app.export_lesson_to(10, &root.join("absent.json")).is_err());
+        assert!(!root.join("absent.json").exists());
+        let backup = root.join("backup.sqlite3");
+        app.export_backup_to(&backup).unwrap();
+        storage_transfer::prepare_database_restore(&backup).unwrap();
+        assert!(app.export_backup_to(&backup).is_err());
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_sync_updates_builtin_group_and_keeps_user_lesson_id_conflicts() {
+        let root = test_path().with_extension("sync-conflicts");
+        let builtin = root.join("builtin");
+        fs::create_dir_all(builtin.join("Basics")).unwrap();
+        let builtin_path = builtin.join("Basics/shared.json");
+        let document = |title: &str, text: &str| stamina_data::JsonLesson {
+            version: 1,
+            id: "shared".into(),
+            title: title.into(),
+            language: "en".into(),
+            description: None,
+            text: text.into(),
+        };
+        fs::write(
+            &builtin_path,
+            serde_json::to_vec(&document("Bundled", "bundle text")).unwrap(),
+        )
+        .unwrap();
+
+        let mut database =
+            stamina_data::storage::Database::open(root.join("data.sqlite3")).unwrap();
+        let user_lesson = stamina_data::storage::LessonDocument {
+            version: 1,
+            id: "shared".into(),
+            title: "My copy".into(),
+            language: "en".into(),
+            description: None,
+            text: "user text".into(),
+        };
+        database.create_user_lesson(&user_lesson).unwrap();
+
+        let mut catalog = ContentCatalog::fixture_empty();
+        catalog.set_lesson_roots(vec![builtin.clone()]);
+        sync_catalog_with_database(&mut catalog, &mut database).unwrap();
+        assert_eq!(
+            database.lesson("shared").unwrap().unwrap(),
+            (user_lesson.clone(), false)
+        );
+        assert_eq!(
+            database
+                .get_app_setting("lesson_group:shared")
+                .unwrap()
+                .as_deref(),
+            Some("Basics")
+        );
+        assert_eq!(
+            catalog.lessons(ContentLanguage::English)[0].name,
+            "Basics / My copy"
+        );
+
+        fs::create_dir_all(builtin.join("Advanced")).unwrap();
+        let new_path = builtin.join("Advanced/shared.json");
+        fs::write(
+            &new_path,
+            serde_json::to_vec(&document("Bundled", "changed bundled text")).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(&builtin_path).unwrap();
+        catalog.set_lesson_roots(vec![builtin]);
+        sync_catalog_with_database(&mut catalog, &mut database).unwrap();
+
+        // An ID already owned by a user remains theirs, including its saved group.
+        assert_eq!(
+            database.lesson("shared").unwrap().unwrap(),
+            (user_lesson, false)
+        );
+        assert_eq!(
+            database
+                .get_app_setting("lesson_group:shared")
+                .unwrap()
+                .as_deref(),
+            Some("Basics")
+        );
+        assert_eq!(
+            catalog.lessons(ContentLanguage::English)[0].name,
+            "Basics / My copy"
+        );
+        drop(database);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_sync_moves_builtin_group_and_refreshes_display_name() {
+        let root = test_path().with_extension("sync-groups");
+        let builtin = root.join("builtin");
+        fs::create_dir_all(builtin.join("Basics")).unwrap();
+        let old_path = builtin.join("Basics/lesson.json");
+        let new_path = builtin.join("Advanced/lesson.json");
+        let lesson = stamina_data::JsonLesson {
+            version: 1,
+            id: "grouped".into(),
+            title: "Lesson".into(),
+            language: "en".into(),
+            description: None,
+            text: "text".into(),
+        };
+        fs::write(&old_path, serde_json::to_vec(&lesson).unwrap()).unwrap();
+
+        let mut database =
+            stamina_data::storage::Database::open(root.join("data.sqlite3")).unwrap();
+        let mut catalog = ContentCatalog::fixture_empty();
+        catalog.set_lesson_roots(vec![builtin.clone()]);
+        sync_catalog_with_database(&mut catalog, &mut database).unwrap();
+        assert_eq!(
+            catalog.lessons(ContentLanguage::English)[0].name,
+            "Basics / Lesson"
+        );
+
+        fs::create_dir_all(new_path.parent().unwrap()).unwrap();
+        fs::write(&new_path, serde_json::to_vec(&lesson).unwrap()).unwrap();
+        fs::remove_file(&old_path).unwrap();
+        catalog.set_lesson_roots(vec![builtin]);
+        sync_catalog_with_database(&mut catalog, &mut database).unwrap();
+
+        assert_eq!(
+            database
+                .get_app_setting("lesson_group:grouped")
+                .unwrap()
+                .as_deref(),
+            Some("Advanced")
+        );
+        assert_eq!(
+            catalog.lessons(ContentLanguage::English)[0].name,
+            "Advanced / Lesson"
+        );
+        drop(database);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn key(key: egui::Key) -> egui::Event {
@@ -1610,6 +2220,20 @@ mod tests {
         app.external_path = Some(PathBuf::from("example.txt"));
         app.external_text = "ab".into();
         app
+    }
+
+    fn database_test_app(path: PathBuf) -> StaminatorApp {
+        let legacy = path.with_extension("legacy.json");
+        let users = UserStore::load_database(path, &legacy).unwrap();
+        StaminatorApp::from_parts(
+            ContentCatalog::fixture_empty(),
+            None,
+            true,
+            None,
+            users,
+            String::new(),
+            |_| {},
+        )
     }
 
     #[test]
@@ -1925,6 +2549,387 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_lesson_editor_create_edit_and_reopen_round_trip() {
+        let root = std::env::temp_dir().join(format!(
+            "staminator-sqlite-editor-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("staminator.sqlite3");
+        let legacy_path = root.join("legacy.json");
+        let mut app = test_app(root.join("test-profile.json"));
+        app.users = UserStore::load_database(database_path.clone(), &legacy_path).unwrap();
+        app.catalog.set_stored_lessons(vec![]);
+        app.selected_mode = TrainingMode::Lessons;
+        app.chooser_open = true;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let create = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Создать урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(create)]);
+        let editor = app.lesson_editor.as_mut().unwrap();
+        editor.lesson.id = "sqlite-round-trip".into();
+        editor.lesson.title = "SQLite round trip".into();
+        editor.lesson.text = "first text".into();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let save = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Сохранить урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(save)]);
+        assert!(app.lesson_editor.is_none());
+
+        let restarted_users =
+            UserStore::load_database(database_path.clone(), &legacy_path).unwrap();
+        let database = restarted_users.database().unwrap().unwrap();
+        let lessons = database.list_lessons().unwrap();
+        assert_eq!(lessons.len(), 1);
+        assert_eq!(lessons[0].0.text, "first text");
+        assert!(!lessons[0].1);
+        drop(database);
+        let mut restarted = test_app(root.join("second-profile.json"));
+        restarted.users = restarted_users;
+        restarted.catalog.set_stored_lessons(lessons);
+        restarted.selected_mode = TrainingMode::Lessons;
+        restarted.chooser_open = true;
+        draw_accessible(&mut restarted, &ctx, vec![]);
+        let nodes = draw_accessible(&mut restarted, &ctx, vec![]);
+        let edit = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Изменить выбранный урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut restarted, &ctx, vec![accessible_click(edit)]);
+        assert_eq!(
+            restarted.lesson_editor.as_ref().unwrap().lesson.id,
+            "sqlite-round-trip"
+        );
+        restarted.lesson_editor.as_mut().unwrap().lesson.text = "edited text".into();
+        let nodes = draw_accessible(&mut restarted, &ctx, vec![]);
+        let save = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Сохранить урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut restarted, &ctx, vec![accessible_click(save)]);
+        assert!(restarted.lesson_editor.is_none());
+
+        let reopened = stamina_data::storage::Database::open(&database_path).unwrap();
+        let saved = reopened.lesson("sqlite-round-trip").unwrap().unwrap();
+        assert_eq!(saved.0.text, "edited text");
+        assert!(!saved.1);
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sqlite_lesson_editor_rejects_builtin_duplicate_and_invalid_documents() {
+        let root = std::env::temp_dir().join(format!(
+            "staminator-sqlite-editor-errors-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("staminator.sqlite3");
+        let legacy_path = root.join("legacy.json");
+        let users = UserStore::load_database(database_path.clone(), &legacy_path).unwrap();
+        let mut database = users.database().unwrap().unwrap();
+        let built_in = stamina_data::storage::LessonDocument {
+            version: 1,
+            id: "protected".into(),
+            title: "Built in".into(),
+            language: "ru".into(),
+            description: None,
+            text: "original".into(),
+        };
+        let user_lesson = stamina_data::storage::LessonDocument {
+            version: 1,
+            id: "already-used".into(),
+            title: "Existing user lesson".into(),
+            language: "ru".into(),
+            description: None,
+            text: "existing".into(),
+        };
+        database.save_lesson(&built_in, true).unwrap();
+        database.save_lesson(&user_lesson, false).unwrap();
+        let stored = database.list_lessons().unwrap();
+        drop(database);
+
+        let mut app = test_app(root.join("unused-profile.json"));
+        app.users = users;
+        app.catalog.set_stored_lessons(stored);
+        app.selected_mode = TrainingMode::Lessons;
+        app.selected_lessons[0] = Some("protected".into());
+        app.chooser_open = true;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let edit = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Изменить выбранный урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(edit)]);
+        assert!(
+            app.lesson_editor
+                .as_ref()
+                .unwrap()
+                .error
+                .contains("Встроенный урок")
+        );
+        app.lesson_editor = None;
+
+        // A new document cannot take the ID of an existing user document.
+        app.chooser_open = true;
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let create = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Создать урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(create)]);
+        let editor = app.lesson_editor.as_mut().unwrap();
+        editor.lesson.id = "already-used".into();
+        editor.lesson.title = "Duplicate".into();
+        editor.lesson.text = "new".into();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let save = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Сохранить урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(save)]);
+        assert!(
+            app.lesson_editor
+                .as_ref()
+                .unwrap()
+                .error
+                .contains("уже существует")
+        );
+
+        // Invalid documents are rejected while the editor keeps the entered content.
+        let editor = app.lesson_editor.as_mut().unwrap();
+        editor.lesson.title.clear();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let save = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Сохранить урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(save)]);
+        let editor = app.lesson_editor.as_ref().unwrap();
+        assert!(editor.error.contains("название"));
+        assert_eq!(editor.lesson.id, "already-used");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sqlite_lesson_editor_reports_database_open_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "staminator-sqlite-editor-db-error-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("staminator.sqlite3");
+        let legacy_path = root.join("legacy.json");
+        let mut app = test_app(root.join("unused-profile.json"));
+        app.users = UserStore::load_database(database_path.clone(), &legacy_path).unwrap();
+        fs::remove_file(&database_path).unwrap();
+        fs::create_dir(&database_path).unwrap();
+        app.lesson_editor = Some(content_editor::LessonEditor::new("ru"));
+        let editor = app.lesson_editor.as_mut().unwrap();
+        editor.lesson.id = "lesson".into();
+        editor.lesson.title = "Lesson".into();
+        editor.lesson.text = "text".into();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let save = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Сохранить урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(save)]);
+        assert!(
+            app.lesson_editor
+                .as_ref()
+                .unwrap()
+                .error
+                .contains("Не удалось открыть базу")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sqlite_keyboard_visibility_option_persists_as_global_setting() {
+        let root = std::env::temp_dir().join(format!(
+            "staminator-sqlite-keyboard-setting-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("staminator.sqlite3");
+        let legacy_path = root.join("legacy.json");
+        let mut app = test_app(root.join("unused-profile.json"));
+        app.users = UserStore::load_database(database_path.clone(), &legacy_path).unwrap();
+        app.show_keyboard = false;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let options = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Опции"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(options)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let checkbox = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Показывать клавиатуру"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(checkbox)]);
+        assert!(app.show_keyboard);
+        let reopened = UserStore::load_database(database_path, &legacy_path).unwrap();
+        let database = reopened.database().unwrap().unwrap();
+        assert_eq!(
+            database
+                .get_app_setting("show_keyboard")
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+        drop(database);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sqlite_lesson_editor_rejects_changing_existing_id() {
+        let root = std::env::temp_dir().join(format!(
+            "staminator-sqlite-editor-id-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("staminator.sqlite3");
+        let legacy_path = root.join("legacy.json");
+        let users = UserStore::load_database(database_path, &legacy_path).unwrap();
+        let mut database = users.database().unwrap().unwrap();
+        let lesson = stamina_data::storage::LessonDocument {
+            version: 1,
+            id: "fixed-id".into(),
+            title: "Lesson".into(),
+            language: "ru".into(),
+            description: None,
+            text: "original".into(),
+        };
+        database.save_lesson(&lesson, false).unwrap();
+        let stored = database.list_lessons().unwrap();
+        drop(database);
+        let mut app = test_app(root.join("unused-profile.json"));
+        app.users = users;
+        app.catalog.set_stored_lessons(stored);
+        app.selected_mode = TrainingMode::Lessons;
+        app.selected_lessons[0] = Some("fixed-id".into());
+        app.chooser_open = true;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let edit = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Изменить выбранный урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(edit)]);
+        let editor = app.lesson_editor.as_mut().unwrap();
+        editor.lesson.id = "changed-id".into();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let save = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Сохранить урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(save)]);
+        assert!(
+            app.lesson_editor
+                .as_ref()
+                .unwrap()
+                .error
+                .contains("Изменение ID")
+        );
+        assert_eq!(app.lesson_editor.as_ref().unwrap().lesson.id, "changed-id");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sqlite_lesson_editor_reports_missing_record_after_catalog_load() {
+        let root = std::env::temp_dir().join(format!(
+            "staminator-sqlite-editor-missing-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("staminator.sqlite3");
+        let legacy_path = root.join("legacy.json");
+        let users = UserStore::load_database(database_path.clone(), &legacy_path).unwrap();
+        let mut database = users.database().unwrap().unwrap();
+        let lesson = stamina_data::storage::LessonDocument {
+            version: 1,
+            id: "removed-after-load".into(),
+            title: "Lesson".into(),
+            language: "ru".into(),
+            description: None,
+            text: "original".into(),
+        };
+        database.save_lesson(&lesson, false).unwrap();
+        let catalog_lessons = database.list_lessons().unwrap();
+        database.delete_lesson(&lesson.id).unwrap();
+        drop(database);
+
+        let mut app = test_app(root.join("unused-profile.json"));
+        app.users = users;
+        app.catalog.set_stored_lessons(catalog_lessons);
+        app.selected_mode = TrainingMode::Lessons;
+        app.selected_lessons[0] = Some(lesson.id.clone());
+        app.chooser_open = true;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let edit = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Изменить выбранный урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(edit)]);
+        assert_eq!(app.lesson_editor.as_ref().unwrap().lesson.id, lesson.id);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let save = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Сохранить урок"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(save)]);
+        let editor = app.lesson_editor.as_ref().unwrap();
+        assert!(editor.error.contains("Урок не найден"));
+        assert_eq!(editor.lesson.text, "original");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn refresh_preserves_lesson_id_and_new_lesson_can_be_completed() {
         let root = std::env::temp_dir().join(format!(
             "staminator-refresh-{}-{:?}",
@@ -1978,7 +2983,7 @@ mod tests {
         assert_eq!(app.session.as_ref().unwrap().remaining_chars(), 1);
         app.stop();
         app.stop();
-        app.record_current_result();
+        app.record_current_result(None);
         assert!(app.result_open);
         assert!(!app.result_completed);
         let records = UserStore::load_from(&path).unwrap();
@@ -1987,6 +2992,7 @@ mod tests {
         assert_eq!((result.correct, result.errors), (1, 1));
         assert_eq!(result.exercise, "example.txt");
         assert_eq!(result.layout, "English");
+        assert_eq!(result.stop_reason, "manual");
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2234,10 +3240,14 @@ mod tests {
         let russian_id = app.users.create("Русский профиль").unwrap().id.clone();
         assert_eq!(app.users.active_profile().unwrap().content_language, "RU");
         app.users.select(&english_id).unwrap();
+        app.sync_profile_language();
+        assert_eq!(app.content_language, ContentLanguage::English);
         assert_eq!(app.users.active_profile().unwrap().content_language, "EN");
         let loaded = UserStore::load_from(path.clone()).unwrap();
         assert_eq!(loaded.active_profile().unwrap().content_language, "EN");
         app.users.select(&russian_id).unwrap();
+        app.sync_profile_language();
+        assert_eq!(app.content_language, ContentLanguage::Russian);
         assert_eq!(app.users.active_profile().unwrap().content_language, "RU");
         fs::remove_file(path).unwrap();
     }
@@ -3073,7 +4083,14 @@ mod tests {
         app.stop();
         app.accept_result();
         assert!(app.profile_error.contains("Не удалось сохранить результат"));
-        fs::remove_file(blocker).unwrap();
+        assert!(!app.result_recorded);
+        assert!(app.result_open);
+        fs::remove_file(&blocker).unwrap();
+        fs::create_dir(&blocker).unwrap();
+        assert!(app.accept_result());
+        assert_eq!(app.users.active_records().len(), 1);
+        fs::remove_file(blocker.join("profiles.json")).unwrap();
+        fs::remove_dir(blocker).unwrap();
     }
 
     #[test]
@@ -3158,5 +4175,124 @@ mod tests {
                 assert_eq!(cycle, vec![0, 1, 2]);
             }
         }
+    }
+
+    #[test]
+    fn profile_json_roundtrips_between_database_apps_and_rejects_duplicate() {
+        let root = test_path().with_extension("profile-transfer");
+        fs::create_dir_all(&root).unwrap();
+        let mut source = database_test_app(root.join("source.sqlite3"));
+        let source_id = source.users.active_profile_id().to_owned();
+        source.users.rename(&source_id, "Transferred").unwrap();
+        source.users.set_content_language("EN").unwrap();
+        let profile_path = root.join("profile.json");
+        source.export_profile_to(&profile_path).unwrap();
+        let expected = source.users.active_profile().unwrap().clone();
+
+        let mut destination = database_test_app(root.join("destination.sqlite3"));
+        destination.import_profile_from(&profile_path).unwrap();
+        assert_eq!(destination.users.active_profile(), Some(&expected));
+        assert_eq!(destination.content_language, ContentLanguage::English);
+        assert!(destination.import_profile_from(&profile_path).is_err());
+        assert_eq!(destination.users.profiles().len(), 2);
+        let invalid_path = root.join("invalid-profile.json");
+        fs::write(&invalid_path, b"not json").unwrap();
+        assert!(destination.import_profile_from(&invalid_path).is_err());
+        assert_eq!(destination.users.active_profile(), Some(&expected));
+        assert_eq!(destination.content_language, ContentLanguage::English);
+
+        drop(source);
+        drop(destination);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manual_session_reason_survives_database_restart_and_profile_export() {
+        let root = test_path().with_extension("reason-transfer");
+        fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("profile.sqlite3");
+        let mut app = database_test_app(database_path.clone());
+        app.selected_mode = TrainingMode::ExternalText;
+        app.external_text = "ab".into();
+        app.external_path = Some(PathBuf::from("example.txt"));
+        app.start();
+        app.type_input_char('a', 100);
+        app.stop();
+        assert!(app.accept_result());
+        let profile = root.join("profile.json");
+        app.export_profile_to(&profile).unwrap();
+        assert_eq!(
+            storage_transfer::import_profile_json(&profile)
+                .unwrap()
+                .results[0]
+                .stop_reason,
+            "manual"
+        );
+        let reopened = UserStore::load_database(database_path, &root.join("missing.json")).unwrap();
+        assert_eq!(reopened.active_records()[0].stop_reason, "manual");
+        app.start();
+        app.type_input_char('a', 100);
+        app.type_input_char('b', 200);
+        app.open_stopped_result();
+        assert!(app.accept_result());
+        assert_eq!(app.users.active_records()[1].stop_reason, "completed");
+        app.start();
+        app.type_input_char('a', 0);
+        app.check_time_limit(300_000);
+        assert!(app.accept_result());
+        assert_eq!(app.users.active_records()[2].stop_reason, "time_limit");
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_backup_loads_lessons_groups_settings_and_resets_session() {
+        let root = test_path().with_extension("restore-backup");
+        fs::create_dir_all(&root).unwrap();
+        let mut source = database_test_app(root.join("source.sqlite3"));
+        source.users.set_content_language("EN").unwrap();
+        let mut database = source.users.database().unwrap().unwrap();
+        let lesson = stamina_data::storage::LessonDocument {
+            version: 1,
+            id: "backup.lesson".into(),
+            title: "Backup lesson".into(),
+            language: "en".into(),
+            description: None,
+            text: "backup text".into(),
+        };
+        database.save_lesson(&lesson, true).unwrap();
+        database
+            .set_app_setting("lesson_group:backup.lesson", "Imported/From backup")
+            .unwrap();
+        database.set_app_setting("show_keyboard", "false").unwrap();
+        let backup = root.join("backup.sqlite3");
+        storage_transfer::export_database_backup(&database, &backup).unwrap();
+        drop(database);
+
+        let mut app = database_test_app(root.join("destination.sqlite3"));
+        app.session = Some(Session::new("stale session"));
+        app.result_open = true;
+        let safety = app.restore_backup_from(&backup).unwrap();
+
+        assert!(safety.is_file());
+        assert!(app.session.is_none());
+        assert!(!app.result_open);
+        assert!(!app.show_keyboard);
+        assert_eq!(app.content_language, ContentLanguage::English);
+        assert_eq!(
+            app.catalog
+                .lesson_groups()
+                .get("backup.lesson")
+                .map(String::as_str),
+            Some("Imported/From backup")
+        );
+        assert_eq!(
+            app.catalog.lessons(ContentLanguage::English)[0].name,
+            "Imported/From backup / Backup lesson"
+        );
+
+        drop(source);
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
     }
 }

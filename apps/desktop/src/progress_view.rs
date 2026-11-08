@@ -181,6 +181,7 @@ mod tests {
             elapsed_ms: 60_000,
             cpm: (40 + index) as f64,
             error_percent: 2.5,
+            stop_reason: "unknown".into(),
         }
     }
 
