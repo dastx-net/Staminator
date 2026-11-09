@@ -12,6 +12,8 @@ mod sound;
 mod storage_transfer;
 mod training_view;
 mod user_store;
+mod window_geometry;
+mod window_monitors;
 
 use content::{ContentCatalog, ContentLanguage, Exercise};
 use eframe::egui;
@@ -26,6 +28,140 @@ use std::{
     time::Instant,
 };
 use user_store::UserStore;
+use window_geometry::{LogicalRect, SavedWindowGeometry};
+
+const MAIN_WINDOW: &str = "main";
+const KEYBOARD_WINDOW: &str = "keyboard";
+
+fn default_window_geometry(id: &str, visible: bool) -> SavedWindowGeometry {
+    let rect = if id == MAIN_WINDOW {
+        LogicalRect::new(80.0, 80.0, 1400.0, 560.0)
+    } else {
+        LogicalRect::new(120.0, 650.0, 1100.0, 420.0)
+    };
+    SavedWindowGeometry {
+        rect,
+        pixels_per_point: None,
+        maximized: false,
+        visible,
+    }
+}
+
+struct WindowPlacementState {
+    profile_id: String,
+    main: SavedWindowGeometry,
+    keyboard: SavedWindowGeometry,
+    keyboard_builder: SavedWindowGeometry,
+    keyboard_builder_scale: f32,
+    keyboard_restore_pending: bool,
+    monitor_areas: Vec<LogicalRect>,
+    monitor_scale: f32,
+    last_monitor_check: Instant,
+    dirty: bool,
+    changed_at: Instant,
+    // Allow native viewport commands to take effect before sampling geometry.
+    settling_frames: u8,
+}
+
+fn sample_window(
+    saved: &mut SavedWindowGeometry,
+    info: &egui::ViewportInfo,
+    size: egui::Vec2,
+    zoom: f32,
+) {
+    if info.minimized == Some(true) {
+        return;
+    }
+    if let Some(maximized) = info.maximized {
+        saved.maximized = maximized;
+    }
+    if saved.maximized || info.fullscreen == Some(true) {
+        return;
+    }
+    let mut rect = saved.rect;
+    if let Some(outer) = info.outer_rect {
+        rect.x = outer.min.x;
+        rect.y = outer.min.y;
+    }
+    let size = info.inner_rect.map_or(size, |inner| inner.size());
+    rect.width = size.x;
+    rect.height = size.y;
+    if window_geometry::is_valid_rect(rect) {
+        saved.rect = rect;
+        saved.pixels_per_point = info
+            .native_pixels_per_point
+            .map(|native| native * zoom)
+            .filter(|scale| scale.is_finite() && *scale > 0.0 && *scale <= 16.0);
+    }
+}
+
+fn rect_at_scale(saved: SavedWindowGeometry, current_scale: f32) -> LogicalRect {
+    let mut rect = saved.rect;
+    if let Some(scale) = saved
+        .pixels_per_point
+        .filter(|_| current_scale.is_finite() && current_scale > 0.0)
+    {
+        rect.x *= scale / current_scale;
+        rect.y *= scale / current_scale;
+    }
+    rect
+}
+
+fn safe_window_rect(rect: LogicalRect, areas: &[LogicalRect]) -> LogicalRect {
+    window_geometry::choose_visible_rect_on_monitors(Some(rect), rect, areas)
+}
+
+fn viewport_scale(ctx: &egui::Context, id: egui::ViewportId) -> Option<f32> {
+    ctx.input(|input| {
+        input
+            .raw
+            .viewports
+            .get(&id)
+            .and_then(|info| info.native_pixels_per_point)
+    })
+    .map(|scale| scale * ctx.zoom_factor())
+    .filter(|scale| scale.is_finite() && *scale > 0.0)
+}
+
+fn areas_at_scale(areas: &[LogicalRect], source_scale: f32, target_scale: f32) -> Vec<LogicalRect> {
+    let ratio = source_scale / target_scale;
+    areas
+        .iter()
+        .map(|area| {
+            LogicalRect::new(
+                area.x * ratio,
+                area.y * ratio,
+                area.width * ratio,
+                area.height * ratio,
+            )
+        })
+        .collect()
+}
+
+fn apply_one_window(
+    ctx: &egui::Context,
+    id: egui::ViewportId,
+    geometry: SavedWindowGeometry,
+    scale: f32,
+    areas: &[LogicalRect],
+    can_position: bool,
+) {
+    let rect = safe_window_rect(rect_at_scale(geometry, scale), areas);
+    ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Maximized(false));
+    ctx.send_viewport_cmd_to(
+        id,
+        egui::ViewportCommand::InnerSize(egui::vec2(rect.width, rect.height)),
+    );
+    if can_position {
+        ctx.send_viewport_cmd_to(
+            id,
+            egui::ViewportCommand::OuterPosition(egui::pos2(rect.x, rect.y)),
+        );
+    }
+    if geometry.maximized {
+        ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Maximized(true));
+    }
+}
 
 fn background_mode(mode: user_store::BackgroundPlacement) -> &'static str {
     match mode {
@@ -63,6 +199,7 @@ fn save_keyboard_setting_to(path: Option<&std::path::Path>, show: bool) {
 struct KeyboardInputQueue {
     events: Vec<egui::Event>,
     close_requested: bool,
+    viewport: Option<(egui::ViewportInfo, egui::Vec2)>,
 }
 
 fn queue_keyboard_input(
@@ -172,6 +309,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 560.0])
             .with_min_inner_size([900.0, 320.0]),
+        persist_window: false,
         ..Default::default()
     };
     eframe::run_native(
@@ -239,6 +377,7 @@ struct StaminatorApp {
     started_at: Instant,
     last_result: Option<staminator_core::SessionStats>,
     show_keyboard: bool,
+    window_placement: Option<WindowPlacementState>,
     keyboard_input: Arc<Mutex<KeyboardInputQueue>>,
     last_keyboard_state: Option<(keyboard::KeyboardLayout, Option<char>)>,
     keyboard_setting_path: Option<PathBuf>,
@@ -260,6 +399,243 @@ struct StaminatorApp {
 }
 
 impl StaminatorApp {
+    fn flush_window_placement(&mut self) -> bool {
+        let Some(state) = self.window_placement.as_mut() else {
+            return true;
+        };
+        if !state.dirty || state.profile_id != self.users.active_profile_id() {
+            return !state.dirty;
+        }
+        for (id, value) in [(MAIN_WINDOW, state.main), (KEYBOARD_WINDOW, state.keyboard)] {
+            if let Err(error) = self.users.set_window_geometry(id, Some(value)) {
+                self.profile_error = localized_error("settings.save_error", error);
+                return false;
+            }
+        }
+        state.dirty = false;
+        true
+    }
+
+    fn restore_window_placement(&mut self, ctx: &egui::Context, initial: bool) {
+        let read = |id| self.users.window_geometry(id);
+        let main = read(MAIN_WINDOW);
+        let keyboard = read(KEYBOARD_WINDOW);
+        if let Err(error) = &main {
+            self.profile_error = localized_error("settings.load_error", error);
+        }
+        if let Err(error) = &keyboard {
+            self.profile_error = localized_error("settings.load_error", error);
+        }
+        if main.is_err() || keyboard.is_err() {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            return;
+        }
+        let needs_defaults = main.as_ref().is_ok_and(Option::is_none)
+            || keyboard.as_ref().is_ok_and(Option::is_none);
+        let main = main
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| default_window_geometry(MAIN_WINDOW, true));
+        let keyboard = keyboard.ok().flatten().unwrap_or_else(|| {
+            default_window_geometry(
+                KEYBOARD_WINDOW,
+                if initial { self.show_keyboard } else { true },
+            )
+        });
+        self.keyboard_input
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .viewport = None;
+        self.show_keyboard = keyboard.visible;
+        self.window_placement = Some(WindowPlacementState {
+            profile_id: self.users.active_profile_id().to_owned(),
+            main,
+            keyboard,
+            keyboard_builder: keyboard,
+            keyboard_builder_scale: keyboard
+                .pixels_per_point
+                .unwrap_or_else(|| ctx.pixels_per_point()),
+            keyboard_restore_pending: keyboard.visible,
+            monitor_areas: window_monitors::monitor_work_areas(ctx.pixels_per_point()),
+            monitor_scale: ctx.pixels_per_point(),
+            last_monitor_check: Instant::now(),
+            dirty: needs_defaults,
+            changed_at: Instant::now(),
+            settling_frames: 3,
+        });
+        self.apply_window_placement(ctx);
+        if needs_defaults {
+            let _ = self.flush_window_placement();
+        }
+    }
+
+    fn apply_window_placement(&self, ctx: &egui::Context) {
+        let Some(state) = &self.window_placement else {
+            return;
+        };
+        let can_position = ctx.input(|i| i.viewport().outer_rect.is_some());
+        let areas = &state.monitor_areas;
+        for (id, geometry) in [
+            (egui::ViewportId::ROOT, state.main),
+            (
+                egui::ViewportId::from_hash_of("keyboard-window"),
+                state.keyboard,
+            ),
+        ] {
+            if id != egui::ViewportId::ROOT && !self.show_keyboard {
+                continue;
+            }
+            let scale = if id == egui::ViewportId::ROOT {
+                ctx.pixels_per_point()
+            } else {
+                viewport_scale(ctx, id).unwrap_or(ctx.pixels_per_point())
+            };
+            let adjusted = areas_at_scale(areas, state.monitor_scale, scale);
+            apply_one_window(ctx, id, geometry, scale, &adjusted, can_position);
+        }
+        ctx.request_repaint();
+    }
+
+    fn update_window_placement(&mut self, ctx: &egui::Context) {
+        let active = self.users.active_profile_id();
+        if self
+            .window_placement
+            .as_ref()
+            .is_none_or(|state| state.profile_id != active)
+        {
+            let initial = self.window_placement.is_none();
+            self.restore_window_placement(ctx, initial);
+            return;
+        }
+        let state = self
+            .window_placement
+            .as_mut()
+            .expect("placement initialized");
+        if state.settling_frames > 0 {
+            state.settling_frames -= 1;
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+        let (root_info, root_size, keyboard_info) = ctx.input(|i| {
+            (
+                i.viewport().clone(),
+                i.content_rect().size(),
+                i.raw
+                    .viewports
+                    .get(&egui::ViewportId::from_hash_of("keyboard-window"))
+                    .cloned(),
+            )
+        });
+        let keyboard_snapshot = self
+            .keyboard_input
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .viewport
+            .clone();
+        if self.show_keyboard && state.keyboard_restore_pending {
+            let id = egui::ViewportId::from_hash_of("keyboard-window");
+            if let Some(scale) = viewport_scale(ctx, id) {
+                let areas = areas_at_scale(&state.monitor_areas, state.monitor_scale, scale);
+                apply_one_window(
+                    ctx,
+                    id,
+                    state.keyboard,
+                    scale,
+                    &areas,
+                    root_info.outer_rect.is_some(),
+                );
+                state.keyboard_restore_pending = false;
+                state.settling_frames = 3;
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                return;
+            }
+        }
+        let old_main = state.main;
+        let old_keyboard = state.keyboard;
+        sample_window(&mut state.main, &root_info, root_size, ctx.zoom_factor());
+        if self.show_keyboard {
+            if let Some((info, size)) = keyboard_snapshot.as_ref() {
+                sample_window(&mut state.keyboard, info, *size, ctx.zoom_factor());
+            } else if let Some(info) = keyboard_info.as_ref() {
+                let size = info.inner_rect.map_or(
+                    egui::vec2(state.keyboard.rect.width, state.keyboard.rect.height),
+                    |r| r.size(),
+                );
+                sample_window(&mut state.keyboard, info, size, ctx.zoom_factor());
+            }
+        }
+        state.keyboard.visible = self.show_keyboard;
+        if old_main != state.main || old_keyboard != state.keyboard {
+            state.dirty = true;
+            state.changed_at = Instant::now();
+        }
+        let areas = if state.last_monitor_check.elapsed() >= std::time::Duration::from_secs(1) {
+            state.last_monitor_check = Instant::now();
+            window_monitors::monitor_work_areas(ctx.pixels_per_point())
+        } else {
+            Vec::new()
+        };
+        let monitors_changed = !areas.is_empty() && areas != state.monitor_areas;
+        if monitors_changed {
+            state.monitor_areas = areas;
+            state.monitor_scale = ctx.pixels_per_point();
+            state.keyboard_builder = state.keyboard;
+            state.keyboard_builder_scale = state
+                .keyboard
+                .pixels_per_point
+                .unwrap_or_else(|| ctx.pixels_per_point());
+            state.keyboard_restore_pending = self.show_keyboard;
+            state.settling_frames = 3;
+        }
+        let should_save =
+            state.dirty && state.changed_at.elapsed() >= std::time::Duration::from_secs(1);
+        if monitors_changed {
+            self.apply_window_placement(ctx);
+        }
+        if should_save {
+            let _ = self.flush_window_placement();
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+    }
+
+    fn reset_window_placement(&mut self, ctx: &egui::Context) {
+        for id in [MAIN_WINDOW, KEYBOARD_WINDOW] {
+            if let Err(error) = self.users.set_window_geometry(id, None) {
+                self.profile_error = localized_error("settings.save_error", error);
+                return;
+            }
+        }
+        // Record the default visibility so a legacy global setting cannot
+        // reappear after a reset and restart.
+        if let Err(error) = self.users.set_window_geometry(
+            KEYBOARD_WINDOW,
+            Some(default_window_geometry(KEYBOARD_WINDOW, true)),
+        ) {
+            self.profile_error = localized_error("settings.save_error", error);
+            return;
+        }
+        self.keyboard_input
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .viewport = None;
+        self.show_keyboard = true;
+        self.window_placement = Some(WindowPlacementState {
+            profile_id: self.users.active_profile_id().to_owned(),
+            main: default_window_geometry(MAIN_WINDOW, true),
+            keyboard: default_window_geometry(KEYBOARD_WINDOW, true),
+            keyboard_builder: default_window_geometry(KEYBOARD_WINDOW, true),
+            keyboard_builder_scale: ctx.pixels_per_point(),
+            keyboard_restore_pending: true,
+            monitor_areas: window_monitors::monitor_work_areas(ctx.pixels_per_point()),
+            monitor_scale: ctx.pixels_per_point(),
+            last_monitor_check: Instant::now(),
+            dirty: false,
+            changed_at: Instant::now(),
+            settling_frames: 3,
+        });
+        self.apply_window_placement(ctx);
+    }
+
     fn sync_profile_language(&mut self) {
         localization::set_language(
             self.users
@@ -391,6 +767,7 @@ impl StaminatorApp {
             started_at: Instant::now(),
             last_result: None,
             show_keyboard,
+            window_placement: None,
             keyboard_input: Arc::default(),
             last_keyboard_state: None,
             keyboard_setting_path,
@@ -550,6 +927,25 @@ impl StaminatorApp {
     }
 
     fn persist_keyboard_setting(&mut self) {
+        if let Some(state) = &mut self.window_placement {
+            state.keyboard.visible = self.show_keyboard;
+            state.keyboard_builder = state.keyboard;
+            state.keyboard_builder_scale = state
+                .keyboard
+                .pixels_per_point
+                .unwrap_or(state.keyboard_builder_scale);
+            state.keyboard_restore_pending = self.show_keyboard;
+            state.dirty = true;
+            state.changed_at = Instant::now();
+            if !self.show_keyboard {
+                self.keyboard_input
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .viewport = None;
+            }
+            let _ = self.flush_window_placement();
+            return;
+        }
         match self.users.database() {
             Ok(Some(mut database)) => {
                 if let Err(error) =
@@ -1327,16 +1723,14 @@ impl StaminatorApp {
                     current.and_then(|index| self.items().get(index).map(|item| (index, item)))
                 {
                     columns[1].heading(&item.name);
-                    if self.selected_mode == TrainingMode::Lessons {
-                        if let Some((lesson, _)) = self
+                    if self.selected_mode == TrainingMode::Lessons
+                        && let Some((lesson, _)) = self
                             .catalog
                             .lesson_id(self.language(), current)
                             .and_then(|id| self.catalog.lesson_document(id))
-                        {
-                            if let Some(description) = &lesson.description {
-                                columns[1].label(description);
-                            }
-                        }
+                        && let Some(description) = &lesson.description
+                    {
+                        columns[1].label(description);
                     }
                     egui::ScrollArea::vertical()
                         .id_salt("chooser_preview")
@@ -1631,6 +2025,9 @@ impl StaminatorApp {
     }
 
     fn import_profile_from(&mut self, path: &std::path::Path) -> Result<(), String> {
+        if !self.flush_window_placement() {
+            return Err(self.profile_error.clone());
+        }
         let profile = storage_transfer::import_profile_json(path).map_err(|e| e.to_string())?;
         let value = serde_json::to_value(profile).map_err(|e| e.to_string())?;
         self.users
@@ -1654,7 +2051,11 @@ impl StaminatorApp {
     }
 
     fn restore_backup_from(&mut self, path: &std::path::Path) -> Result<PathBuf, String> {
+        if !self.flush_window_placement() {
+            return Err(self.profile_error.clone());
+        }
         let safety = self.users.restore_backup(path).map_err(|e| e.to_string())?;
+        self.window_placement = None;
         self.sync_profile_language();
         self.session = None;
         self.last_result = None;
@@ -1704,6 +2105,9 @@ impl StaminatorApp {
                         .selectable_label(self.users.active_profile_id() == id, name)
                         .clicked()
                     {
+                        if !self.flush_window_placement() {
+                            return;
+                        }
                         match self.users.select(&id) {
                             Ok(()) => {
                                 self.session = None;
@@ -1742,6 +2146,9 @@ impl StaminatorApp {
                 ui.text_edit_singleline(&mut self.profile_name_input);
                 ui.horizontal(|ui| {
                     if ui.button(localization::tr("create")).clicked() {
+                        if !self.flush_window_placement() {
+                            return;
+                        }
                         match self.users.create(&self.profile_name_input) {
                             Ok(_) => {
                                 self.profile_name_input.clear();
@@ -1771,6 +2178,9 @@ impl StaminatorApp {
                         .clicked()
                     {
                         let id = self.users.active_profile_id().to_owned();
+                        if !self.flush_window_placement() {
+                            return;
+                        }
                         match self.users.delete(&id) {
                             Ok(()) => {
                                 self.profile_error.clear();
@@ -2078,6 +2488,13 @@ impl StaminatorApp {
                     {
                         self.persist_keyboard_setting();
                     }
+                    if ui
+                        .button(localization::tr("reset-window-positions"))
+                        .clicked()
+                    {
+                        self.reset_window_placement(ui.ctx());
+                        ui.close();
+                    }
                     ui.separator();
                     ui.label(localization::format(
                         "content.label",
@@ -2206,10 +2623,35 @@ impl StaminatorApp {
 
         if self.show_keyboard {
             let viewport_id = egui::ViewportId::from_hash_of("keyboard-window");
-            let builder = egui::ViewportBuilder::default()
+            let (geometry, scale, areas) = self.window_placement.as_ref().map_or_else(
+                || {
+                    (
+                        default_window_geometry(KEYBOARD_WINDOW, true),
+                        root.ctx().pixels_per_point(),
+                        Vec::new(),
+                    )
+                },
+                |state| {
+                    (
+                        state.keyboard_builder,
+                        state.keyboard_builder_scale,
+                        areas_at_scale(
+                            &state.monitor_areas,
+                            state.monitor_scale,
+                            state.keyboard_builder_scale,
+                        ),
+                    )
+                },
+            );
+            let rect = safe_window_rect(rect_at_scale(geometry, scale), &areas);
+            let mut builder = egui::ViewportBuilder::default()
                 .with_title(localization::tr("keyboard"))
-                .with_inner_size([1100.0, 420.0])
-                .with_min_inner_size([640.0, 250.0]);
+                .with_inner_size([rect.width, rect.height])
+                .with_min_inner_size([640.0, 250.0])
+                .with_maximized(geometry.maximized);
+            if root.ctx().input(|i| i.viewport().outer_rect.is_some()) {
+                builder = builder.with_position([rect.x, rect.y]);
+            }
             let layout = if self.english_layout {
                 keyboard::KeyboardLayout::English
             } else {
@@ -2226,6 +2668,12 @@ impl StaminatorApp {
                     let ctx = ui.ctx();
                     let events = ctx.input(|input| input.events.clone());
                     let close_requested = ctx.input(|input| input.viewport().close_requested());
+                    let snapshot =
+                        ctx.input(|input| (input.viewport().clone(), input.content_rect().size()));
+                    input_queue
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .viewport = Some(snapshot);
                     queue_keyboard_input(&input_queue, ctx, events, close_requested);
                     keyboard::draw_keyboard(ui, layout, next_char);
                 });
@@ -2307,6 +2755,13 @@ impl StaminatorApp {
 
 impl eframe::App for StaminatorApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.update_window_placement(root.ctx());
+        if root.ctx().input(|input| input.viewport().close_requested())
+            && !self.flush_window_placement()
+        {
+            root.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         if root.ctx().input(|input| input.viewport().close_requested()) && !self.result_recorded {
             self.save_external_progress();
         }
@@ -2317,6 +2772,292 @@ impl eframe::App for StaminatorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn placement_frame(app: &mut StaminatorApp, ctx: &egui::Context, info: egui::ViewportInfo) {
+        let mut raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 500.0),
+            )),
+            ..Default::default()
+        };
+        raw.viewports.insert(egui::ViewportId::ROOT, info);
+        let mut output = ctx.run_ui(raw, |ui| app.update_window_placement(ui.ctx()));
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn window_placement_follows_profiles_close_and_reset_across_restart() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        let ctx = egui::Context::default();
+        let info = egui::ViewportInfo {
+            outer_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(200.0, 100.0),
+                egui::vec2(1020.0, 540.0),
+            )),
+            inner_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(210.0, 130.0),
+                egui::vec2(1000.0, 500.0),
+            )),
+            minimized: Some(false),
+            maximized: Some(false),
+            ..Default::default()
+        };
+        for _ in 0..5 {
+            placement_frame(&mut app, &ctx, info.clone());
+        }
+        let keyboard_info = egui::ViewportInfo {
+            outer_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(350.0, 600.0),
+                egui::vec2(920.0, 340.0),
+            )),
+            inner_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(360.0, 630.0),
+                egui::vec2(900.0, 300.0),
+            )),
+            minimized: Some(false),
+            maximized: Some(false),
+            ..Default::default()
+        };
+        app.keyboard_input.lock().unwrap().viewport =
+            Some((keyboard_info, egui::vec2(900.0, 300.0)));
+        placement_frame(&mut app, &ctx, info.clone());
+        let first = app.users.active_profile_id().to_owned();
+        queue_keyboard_input(&app.keyboard_input, &ctx, vec![], true);
+        app.take_keyboard_input();
+        assert!(app.flush_window_placement());
+        let keyboard = app.users.window_geometry(KEYBOARD_WINDOW).unwrap().unwrap();
+        assert_eq!((keyboard.rect.x, keyboard.rect.width), (350.0, 900.0));
+        assert_eq!(
+            app.users
+                .window_geometry(MAIN_WINDOW)
+                .unwrap()
+                .unwrap()
+                .rect
+                .x,
+            200.0
+        );
+        assert!(
+            !app.users
+                .window_geometry(KEYBOARD_WINDOW)
+                .unwrap()
+                .unwrap()
+                .visible
+        );
+
+        let second = app.users.create("Second").unwrap().id.clone();
+        placement_frame(&mut app, &ctx, info.clone());
+        assert!(app.show_keyboard);
+        assert_eq!(app.window_placement.as_ref().unwrap().profile_id, second);
+        app.users.select(&first).unwrap();
+        placement_frame(&mut app, &ctx, info);
+        assert!(!app.show_keyboard);
+        assert_eq!(app.window_placement.as_ref().unwrap().main.rect.x, 200.0);
+
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.reset_window_placement(ui.ctx())
+        });
+        output.textures_delta.clear();
+        assert!(app.show_keyboard);
+        assert!(app.users.window_geometry(MAIN_WINDOW).unwrap().is_none());
+        let reopened = UserStore::load_from(&path).unwrap();
+        assert!(
+            reopened
+                .window_geometry(KEYBOARD_WINDOW)
+                .unwrap()
+                .unwrap()
+                .visible
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn minimized_and_maximized_windows_keep_their_normal_rectangle() {
+        let mut saved = default_window_geometry(MAIN_WINDOW, true);
+        let original = saved.rect;
+        let info = egui::ViewportInfo {
+            outer_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(-32000.0, -32000.0),
+                egui::vec2(200.0, 100.0),
+            )),
+            minimized: Some(true),
+            maximized: Some(false),
+            ..Default::default()
+        };
+        sample_window(&mut saved, &info, egui::vec2(200.0, 100.0), 1.0);
+        assert_eq!(saved.rect, original);
+        let info = egui::ViewportInfo {
+            minimized: Some(false),
+            maximized: Some(true),
+            ..info
+        };
+        sample_window(&mut saved, &info, egui::vec2(1900.0, 1000.0), 1.0);
+        assert!(saved.maximized);
+        assert_eq!(saved.rect, original);
+    }
+
+    #[test]
+    fn saved_position_tracks_physical_screen_coordinates_across_scale_changes() {
+        let mut saved = default_window_geometry(MAIN_WINDOW, true);
+        saved.rect.x = -900.0;
+        saved.rect.y = 250.0;
+        saved.pixels_per_point = Some(2.0);
+        let restored = rect_at_scale(saved, 1.0);
+        assert_eq!((restored.x, restored.y), (-1800.0, 500.0));
+        assert_eq!((restored.width, restored.height), (1400.0, 560.0));
+    }
+
+    #[test]
+    fn keyboard_restore_uses_its_own_scale() {
+        let mut app = test_app(test_path());
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let mut keyboard = default_window_geometry(KEYBOARD_WINDOW, true);
+        keyboard.rect.x = 800.0;
+        keyboard.pixels_per_point = Some(1.0);
+        let id = egui::ViewportId::from_hash_of("keyboard-window");
+        app.window_placement = Some(WindowPlacementState {
+            profile_id: app.users.active_profile_id().to_owned(),
+            main: default_window_geometry(MAIN_WINDOW, true),
+            keyboard,
+            keyboard_builder: keyboard,
+            keyboard_builder_scale: 1.0,
+            keyboard_restore_pending: true,
+            monitor_areas: Vec::new(),
+            monitor_scale: 1.0,
+            last_monitor_check: Instant::now(),
+            dirty: false,
+            changed_at: Instant::now(),
+            settling_frames: 0,
+        });
+        let mut raw = egui::RawInput::default();
+        raw.viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                outer_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 500.0),
+                )),
+                native_pixels_per_point: Some(1.0),
+                ..Default::default()
+            },
+        );
+        raw.viewports.insert(
+            id,
+            egui::ViewportInfo {
+                native_pixels_per_point: Some(2.0),
+                ..Default::default()
+            },
+        );
+        let mut output = ctx.run_ui(raw, |ui| {
+            app.update_window_placement(ui.ctx());
+            ui.ctx()
+                .show_viewport_deferred(id, egui::ViewportBuilder::default(), |_, _| {});
+        });
+        let correct = output.viewport_output.get(&id).is_some_and(|viewport| {
+            viewport.commands.iter().any(
+            |command| matches!(command, egui::ViewportCommand::OuterPosition(pos) if pos.x == 400.0)
+        )
+        });
+        output.textures_delta.clear();
+        assert!(correct);
+    }
+
+    #[test]
+    fn missing_position_keeps_saved_position_but_updates_size() {
+        let mut saved = default_window_geometry(MAIN_WINDOW, true);
+        let position = (saved.rect.x, saved.rect.y);
+        sample_window(
+            &mut saved,
+            &egui::ViewportInfo::default(),
+            egui::vec2(1000.0, 500.0),
+            1.0,
+        );
+        assert_eq!((saved.rect.x, saved.rect.y), position);
+        assert_eq!((saved.rect.width, saved.rect.height), (1000.0, 500.0));
+    }
+
+    #[test]
+    fn unavailable_native_position_does_not_send_move_commands() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.restore_window_placement(ui.ctx(), true);
+        });
+        let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+        let moved = commands
+            .iter()
+            .any(|command| matches!(command, egui::ViewportCommand::OuterPosition(_)));
+        let resized = commands
+            .iter()
+            .any(|command| matches!(command, egui::ViewportCommand::InnerSize(_)));
+        output.textures_delta.clear();
+        assert!(!moved);
+        assert!(resized);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reset_command_in_options_restores_window_defaults() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        placement_frame(&mut app, &ctx, egui::ViewportInfo::default());
+        app.show_keyboard = false;
+        app.persist_keyboard_setting();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let options = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Опции"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(options)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let reset = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Сбросить расположение окон"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(reset)]);
+        assert!(app.show_keyboard);
+        assert!(app.users.window_geometry(MAIN_WINDOW).unwrap().is_none());
+        assert!(
+            app.users
+                .window_geometry(KEYBOARD_WINDOW)
+                .unwrap()
+                .unwrap()
+                .visible
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_window_save_keeps_pending_changes() {
+        let blocker = test_path();
+        fs::write(&blocker, b"not a directory").unwrap();
+        let mut app = test_app(blocker.join("profiles.json"));
+        app.window_placement = Some(WindowPlacementState {
+            profile_id: app.users.active_profile_id().to_owned(),
+            main: default_window_geometry(MAIN_WINDOW, true),
+            keyboard: default_window_geometry(KEYBOARD_WINDOW, true),
+            keyboard_builder: default_window_geometry(KEYBOARD_WINDOW, true),
+            keyboard_builder_scale: 1.0,
+            keyboard_restore_pending: false,
+            monitor_areas: Vec::new(),
+            monitor_scale: 1.0,
+            last_monitor_check: Instant::now(),
+            dirty: true,
+            changed_at: Instant::now(),
+            settling_frames: 0,
+        });
+        assert!(!app.flush_window_placement());
+        assert!(app.window_placement.as_ref().unwrap().dirty);
+        assert!(!app.profile_error.is_empty());
+        fs::remove_file(blocker).unwrap();
+    }
 
     fn test_path() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -4852,6 +5593,11 @@ mod tests {
         app.show_keyboard = false;
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
+        placement_frame(&mut app, &ctx, egui::ViewportInfo::default());
+        let original_id = app.users.active_profile_id().to_owned();
+        let state = app.window_placement.as_mut().unwrap();
+        state.main.rect.x = 222.0;
+        state.dirty = true;
         let nodes = draw_accessible(&mut app, &ctx, vec![]);
         let profiles = nodes
             .iter()
@@ -4869,6 +5615,18 @@ mod tests {
             .0;
         draw_accessible(&mut app, &ctx, vec![accessible_click(create)]);
         assert_eq!(app.users.active_name(), "Alice");
+        let saved = UserStore::load_from(&path).unwrap();
+        assert_eq!(
+            saved
+                .profiles()
+                .iter()
+                .find(|p| p.id == original_id)
+                .unwrap()
+                .window_geometry[MAIN_WINDOW]
+                .rect
+                .x,
+            222.0
+        );
         let nodes = draw_accessible(&mut app, &ctx, vec![]);
         let original = nodes
             .iter()

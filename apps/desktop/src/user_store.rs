@@ -3,6 +3,7 @@
 use crate::localization;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -54,6 +55,33 @@ pub struct Profile {
     pub interface_language: String,
     #[serde(default, deserialize_with = "deserialize_background")]
     pub background: BackgroundImageSettings,
+    /// JSON fallback for window geometry; SQLite stores these in profile settings.
+    #[serde(default, deserialize_with = "deserialize_window_geometry")]
+    pub window_geometry: BTreeMap<String, crate::window_geometry::SavedWindowGeometry>,
+}
+
+fn deserialize_window_geometry<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, crate::window_geometry::SavedWindowGeometry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let mut result = BTreeMap::new();
+    if let Some(entries) = value.as_object() {
+        for (id, value) in entries {
+            if id.trim().is_empty() {
+                continue;
+            }
+            if let Ok(geometry) =
+                serde_json::from_value::<crate::window_geometry::SavedWindowGeometry>(value.clone())
+                && crate::window_geometry::is_valid_saved_geometry(&geometry)
+            {
+                result.insert(id.clone(), geometry);
+            }
+        }
+    }
+    Ok(result)
 }
 
 fn deserialize_background<'de, D>(deserializer: D) -> Result<BackgroundImageSettings, D::Error>
@@ -135,6 +163,101 @@ pub struct UserStore {
 }
 
 impl UserStore {
+    /// Read geometry for a stable window ID in the active profile.
+    pub fn window_geometry(
+        &self,
+        id: &str,
+    ) -> io::Result<Option<crate::window_geometry::SavedWindowGeometry>> {
+        if id.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "window ID must not be empty",
+            ));
+        }
+        let profile = self.active_profile().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                localization::tr("profile.not_found"),
+            )
+        })?;
+        if self.database {
+            let key = format!("window_geometry:{id}");
+            if let Some(value) = self
+                .database()?
+                .expect("database flag")
+                .get_setting(&profile.id, &key)
+                .map_err(storage_io_error)?
+            {
+                // A null marker records an explicit reset and prevents stale JSON fallback.
+                return Ok(serde_json::from_str::<
+                    Option<crate::window_geometry::SavedWindowGeometry>,
+                >(&value)
+                .ok()
+                .flatten()
+                .filter(crate::window_geometry::is_valid_saved_geometry));
+            }
+        }
+        Ok(profile
+            .window_geometry
+            .get(id)
+            .copied()
+            .filter(crate::window_geometry::is_valid_saved_geometry))
+    }
+
+    /// Save or reset geometry for a stable window ID in the active profile.
+    pub fn set_window_geometry(
+        &mut self,
+        id: &str,
+        value: Option<crate::window_geometry::SavedWindowGeometry>,
+    ) -> io::Result<()> {
+        if id.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "window ID must not be empty",
+            ));
+        }
+        if value.is_some_and(|geometry| !crate::window_geometry::is_valid_saved_geometry(&geometry))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid window geometry",
+            ));
+        }
+        if self.active_profile().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                localization::tr("profile.not_found"),
+            ));
+        }
+        let profile_id = self.active_profile_id.clone();
+        if self.database {
+            let key = format!("window_geometry:{id}");
+            let serialized = serde_json::to_string(&value).map_err(invalid_data)?;
+            self.database()?
+                .expect("database flag")
+                .set_setting(&profile_id, &key, &serialized)
+                .map_err(storage_io_error)?;
+            return Ok(());
+        }
+        let original = self.clone();
+        let profile = self
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.id == profile_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    localization::tr("profile.not_found"),
+                )
+            })?;
+        if let Some(geometry) = value {
+            profile.window_geometry.insert(id.to_owned(), geometry);
+        } else {
+            profile.window_geometry.remove(id);
+        }
+        self.commit_or_restore(original)
+    }
+
     pub fn background_settings(&self) -> Option<&BackgroundImageSettings> {
         self.active_profile().map(|profile| &profile.background)
     }
@@ -470,6 +593,7 @@ impl UserStore {
             content_language: default_content_language(),
             interface_language: default_content_language(),
             background: BackgroundImageSettings::default(),
+            window_geometry: BTreeMap::new(),
         });
         self.active_profile_id = id;
         self.commit_or_restore(original)?;
@@ -698,6 +822,7 @@ impl UserStore {
                 content_language: default_content_language(),
                 interface_language: "RU".into(),
                 background: BackgroundImageSettings::default(),
+                window_geometry: BTreeMap::new(),
             });
             self.active_profile_id = id;
         } else if !self.profiles.iter().any(|p| p.id == self.active_profile_id) {
@@ -842,6 +967,7 @@ mod tests {
             content_language: "EN".into(),
             interface_language: "RU".into(),
             background: BackgroundImageSettings::default(),
+            window_geometry: BTreeMap::new(),
         };
         store.import_profile(profile.clone()).unwrap();
         assert_eq!(store.active_profile(), Some(&profile));
@@ -895,6 +1021,7 @@ mod tests {
             content_language: "RU".into(),
             interface_language: "RU".into(),
             background: BackgroundImageSettings::default(),
+            window_geometry: BTreeMap::new(),
         };
         assert_eq!(
             store.import_profile(duplicate).unwrap_err().to_string(),
@@ -1738,6 +1865,95 @@ mod tests {
         assert_eq!(records.len(), MAX_RESULTS_PER_PROFILE);
         assert_eq!(records.first().unwrap().exercise, "exercise-2");
         assert_eq!(records.last().unwrap().exercise, "newest");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn window_geometry_is_scoped_by_window_and_profile_and_persists_in_json() {
+        let path = test_path();
+        let mut store = UserStore::new_at(&path);
+        let first_id = store.active_profile_id().to_owned();
+        let first = crate::window_geometry::SavedWindowGeometry {
+            rect: crate::window_geometry::LogicalRect::new(20.0, 30.0, 800.0, 600.0),
+            pixels_per_point: None,
+            maximized: false,
+            visible: true,
+        };
+        store.set_window_geometry("main", Some(first)).unwrap();
+        let second_id = store.create("Second").unwrap().id.clone();
+        let second = crate::window_geometry::SavedWindowGeometry {
+            rect: crate::window_geometry::LogicalRect::new(100.0, 120.0, 900.0, 700.0),
+            pixels_per_point: None,
+            maximized: true,
+            visible: false,
+        };
+        store.set_window_geometry("keyboard", Some(second)).unwrap();
+        store.select(&first_id).unwrap();
+        assert_eq!(store.window_geometry("main").unwrap(), Some(first));
+        assert_eq!(store.window_geometry("keyboard").unwrap(), None);
+        let mut reopened = UserStore::load_from(&path).unwrap();
+        reopened.select(&first_id).unwrap();
+        assert_eq!(reopened.window_geometry("main").unwrap(), Some(first));
+        reopened.select(&second_id).unwrap();
+        assert_eq!(reopened.window_geometry("keyboard").unwrap(), Some(second));
+        reopened.set_window_geometry("keyboard", None).unwrap();
+        let mut reopened = UserStore::load_from(&path).unwrap();
+        reopened.select(&first_id).unwrap();
+        assert_eq!(reopened.window_geometry("main").unwrap(), Some(first));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sqlite_window_geometry_is_profile_scoped_and_survives_restart_and_reset() {
+        let path = test_path().with_extension("sqlite3");
+        let legacy = path.with_extension("json");
+        let mut store = UserStore::load_database(path.clone(), &legacy).unwrap();
+        let first_id = store.active_profile_id().to_owned();
+        let first = crate::window_geometry::SavedWindowGeometry {
+            rect: crate::window_geometry::LogicalRect::new(40.0, 50.0, 800.0, 600.0),
+            pixels_per_point: None,
+            maximized: true,
+            visible: true,
+        };
+        store.set_window_geometry("main", Some(first)).unwrap();
+        let second_id = store.create("Second").unwrap().id.clone();
+        assert_eq!(store.window_geometry("main").unwrap(), None);
+        store.set_window_geometry("main", None).unwrap();
+        store.select(&first_id).unwrap();
+        assert_eq!(store.window_geometry("main").unwrap(), Some(first));
+        let mut reopened = UserStore::load_database(path.clone(), &legacy).unwrap();
+        assert_eq!(reopened.window_geometry("main").unwrap(), Some(first));
+        reopened.select(&second_id).unwrap();
+        assert_eq!(reopened.window_geometry("main").unwrap(), None);
+        reopened
+            .set_window_geometry("keyboard", Some(first))
+            .unwrap();
+        let reopened = UserStore::load_database(path.clone(), &legacy).unwrap();
+        assert_eq!(reopened.window_geometry("keyboard").unwrap(), Some(first));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn malformed_window_geometry_uses_safe_none_fallback() {
+        let path = test_path();
+        fs::write(&path, br#"{"active_profile_id":"p","profiles":[{"id":"p","name":"P","window_geometry":{"main":{"rect":{"x":0,"y":0,"width":-1,"height":600}}}}]}"#).unwrap();
+        let mut store = UserStore::load_from(&path).unwrap();
+        assert_eq!(store.window_geometry("main").unwrap(), None);
+        assert_eq!(
+            store
+                .set_window_geometry(
+                    "main",
+                    Some(crate::window_geometry::SavedWindowGeometry {
+                        rect: crate::window_geometry::LogicalRect::new(0.0, 0.0, 20.0, 20.0),
+                        pixels_per_point: None,
+                        maximized: false,
+                        visible: true
+                    })
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
         let _ = fs::remove_file(path);
     }
 }
