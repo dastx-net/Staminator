@@ -213,7 +213,10 @@ fn queue_keyboard_input(
         .filter(|event| {
             matches!(
                 event,
-                egui::Event::Key { .. } | egui::Event::Text(_) | egui::Event::Copy
+                egui::Event::Key { .. }
+                    | egui::Event::Text(_)
+                    | egui::Event::Ime(_)
+                    | egui::Event::Copy
             )
         })
         .collect();
@@ -355,8 +358,8 @@ struct StaminatorApp {
     english_layout: bool,
     content_language: ContentLanguage,
     catalog: ContentCatalog,
-    selected_content: [usize; 4],
-    selected_lessons: [Option<String>; 2],
+    selected_content: [usize; 20],
+    selected_lessons: [Option<String>; 10],
     chooser_open: bool,
     chooser_filter: String,
     chooser_preview: Option<usize>,
@@ -643,15 +646,54 @@ impl StaminatorApp {
                 .map_or("RU", |profile| profile.interface_language.as_str()),
         );
         self.catalog.refresh_diagnostics();
-        self.content_language = if self
+        self.content_language = self
             .users
             .active_profile()
-            .is_some_and(|profile| profile.content_language == "EN")
+            .and_then(|profile| ContentLanguage::parse(&profile.content_language))
+            .unwrap_or(ContentLanguage::Russian);
+        self.selected_lessons = std::array::from_fn(|i| {
+            self.users.active_profile().and_then(|profile| {
+                profile
+                    .selected_lessons
+                    .get(ContentLanguage::ALL[i].code())
+                    .cloned()
+            })
+        });
+    }
+
+    fn sync_profile_training(&mut self) {
+        self.selected_mode = self
+            .users
+            .active_profile()
+            .and_then(|profile| profile.selected_mode.as_deref())
+            .and_then(|key| TrainingMode::ALL.into_iter().find(|mode| mode.key() == key))
+            .unwrap_or_default();
+        self.english_layout = self
+            .users
+            .active_profile()
+            .and_then(|profile| profile.selected_layout.as_deref())
+            == Some("layout.en");
+        if matches!(
+            self.selected_mode,
+            TrainingMode::Phrases | TrainingMode::Letters
+        ) && self.catalog.phrases(self.content_language).is_empty()
         {
-            ContentLanguage::English
+            self.selected_mode = TrainingMode::Lessons;
+        }
+    }
+
+    fn persist_training_selection(&mut self) {
+        let layout = if self.english_layout {
+            "layout.en"
         } else {
-            ContentLanguage::Russian
+            "layout.ru"
         };
+        if let Err(error) = self
+            .users
+            .set_training_selection(self.selected_mode.key(), layout)
+        {
+            self.profile_error = error.to_string();
+        }
     }
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         training_view::install_text_font(&cc.egui_ctx);
@@ -719,6 +761,7 @@ impl StaminatorApp {
             profile_error,
             sound::play,
         );
+        app.sync_profile_training();
         app.restore_external_text();
         app
     }
@@ -733,20 +776,29 @@ impl StaminatorApp {
     ) -> Self {
         Self {
             play_sound,
-            selected_mode: TrainingMode::Lessons,
-            english_layout: false,
+            selected_mode: users
+                .active_profile()
+                .and_then(|profile| profile.selected_mode.as_deref())
+                .and_then(|key| TrainingMode::ALL.into_iter().find(|mode| mode.key() == key))
+                .unwrap_or_default(),
+            english_layout: users
+                .active_profile()
+                .and_then(|profile| profile.selected_layout.as_deref())
+                == Some("layout.en"),
             content_language: users
                 .active_profile()
-                .map_or(ContentLanguage::Russian, |profile| {
-                    if profile.content_language == "EN" {
-                        ContentLanguage::English
-                    } else {
-                        ContentLanguage::Russian
-                    }
-                }),
+                .and_then(|profile| ContentLanguage::parse(&profile.content_language))
+                .unwrap_or(ContentLanguage::Russian),
             catalog,
-            selected_content: [0; 4],
-            selected_lessons: [None, None],
+            selected_content: [0; 20],
+            selected_lessons: std::array::from_fn(|i| {
+                users.active_profile().and_then(|profile| {
+                    profile
+                        .selected_lessons
+                        .get(ContentLanguage::ALL[i].code())
+                        .cloned()
+                })
+            }),
             chooser_open: false,
             chooser_filter: String::new(),
             chooser_preview: None,
@@ -985,8 +1037,7 @@ impl StaminatorApp {
     }
 
     fn content_slot(&self) -> usize {
-        usize::from(self.content_language == ContentLanguage::English) * 2
-            + usize::from(self.selected_mode == TrainingMode::Phrases)
+        self.content_language.index() * 2 + usize::from(self.selected_mode == TrainingMode::Phrases)
     }
 
     fn items(&self) -> &[Exercise] {
@@ -998,7 +1049,7 @@ impl StaminatorApp {
 
     fn current_index(&self) -> usize {
         if self.selected_mode == TrainingMode::Lessons {
-            let language = usize::from(self.language() == ContentLanguage::English);
+            let language = self.language().index();
             self.selected_lessons[language]
                 .as_deref()
                 .and_then(|id| self.catalog.lesson_index(self.language(), id))
@@ -1113,15 +1164,11 @@ impl StaminatorApp {
     }
 
     fn restore_external_text(&mut self) {
-        self.content_language = if self
+        self.content_language = self
             .users
             .active_profile()
-            .is_some_and(|p| p.content_language == "EN")
-        {
-            ContentLanguage::English
-        } else {
-            ContentLanguage::Russian
-        };
+            .and_then(|profile| ContentLanguage::parse(&profile.content_language))
+            .unwrap_or(ContentLanguage::Russian);
         self.external_path = None;
         self.external_text.clear();
         self.external_source = None;
@@ -1239,13 +1286,25 @@ impl StaminatorApp {
     }
 
     fn select_content(&mut self, index: usize) {
+        if !self.save_before_switch() {
+            return;
+        }
         let index = index.min(self.items().len().saturating_sub(1));
         if self.selected_mode == TrainingMode::Lessons {
-            let language = usize::from(self.language() == ContentLanguage::English);
+            let language = self.language().index();
             self.selected_lessons[language] = self
                 .catalog
                 .lesson_id(self.language(), index)
                 .map(str::to_owned);
+            if self
+                .users
+                .active_profile()
+                .is_some_and(|profile| profile.content_language == self.content_language.code())
+                && let Some(id) = self.selected_lessons[language].as_deref()
+                && let Err(error) = self.users.set_selected_lesson(id)
+            {
+                self.profile_error = error.to_string();
+            }
         } else {
             self.selected_content[self.content_slot()] = index;
         }
@@ -1269,6 +1328,9 @@ impl StaminatorApp {
     }
 
     fn start(&mut self) {
+        if !self.save_before_switch() {
+            return;
+        }
         if self.selected_mode == TrainingMode::Phrases {
             self.generation = self.generation.wrapping_add(1);
             let slot = self.content_slot();
@@ -1350,6 +1412,19 @@ impl StaminatorApp {
         }
         self.result_open = false;
         true
+    }
+
+    fn save_before_switch(&mut self) -> bool {
+        if self.session.is_none() {
+            return true;
+        }
+        if self.last_result.is_none() {
+            self.stop();
+            if self.last_result.is_none() {
+                self.open_stopped_result();
+            }
+        }
+        self.accept_result()
     }
 
     fn record_current_result(&mut self, progress: Option<user_store::ExternalProgress>) {
@@ -1565,7 +1640,7 @@ impl StaminatorApp {
                     pressed: true,
                     ..
                 } => self.toggle_pause(),
-                egui::Event::Text(text) => {
+                egui::Event::Text(text) | egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
                     if self
                         .session
                         .as_ref()
@@ -1710,7 +1785,7 @@ impl StaminatorApp {
                         for (index, name) in &matches[range] {
                             let response = ui.selectable_label(
                                 Some(*index) == current,
-                                format!("{}. {}", index + 1, name),
+                                localization::visual_text(&format!("{}. {}", index + 1, name)),
                             );
                             if response.double_clicked() {
                                 chosen = Some(*index);
@@ -1722,7 +1797,7 @@ impl StaminatorApp {
                 if let Some((current, item)) =
                     current.and_then(|index| self.items().get(index).map(|item| (index, item)))
                 {
-                    columns[1].heading(&item.name);
+                    columns[1].heading(localization::visual_text(&item.name));
                     if self.selected_mode == TrainingMode::Lessons
                         && let Some((lesson, _)) = self
                             .catalog
@@ -1730,13 +1805,13 @@ impl StaminatorApp {
                             .and_then(|id| self.catalog.lesson_document(id))
                         && let Some(description) = &lesson.description
                     {
-                        columns[1].label(description);
+                        columns[1].label(localization::visual_text(description));
                     }
                     egui::ScrollArea::vertical()
                         .id_salt("chooser_preview")
                         .max_height(240.0)
                         .show(&mut columns[1], |ui| {
-                            ui.label(&item.text);
+                            ui.label(localization::visual_text(&item.text));
                         });
                     if columns[1].button(localization::tr("choose")).clicked() {
                         chosen = Some(current);
@@ -1775,25 +1850,13 @@ impl StaminatorApp {
             }
         }
         if create {
-            self.lesson_editor = Some(content_editor::LessonEditor::new(
-                if self.language() == ContentLanguage::English {
-                    "en"
-                } else {
-                    "ru"
-                },
-            ));
+            self.lesson_editor = Some(content_editor::LessonEditor::new(self.language().tag()));
             self.chooser_open = false;
         }
         if edit && let Some(current) = current {
             let id = self.catalog.lesson_id(self.language(), current);
             if let Ok(Some(_)) = self.users.database() {
-                let mut editor = content_editor::LessonEditor::new(
-                    if self.language() == ContentLanguage::English {
-                        "en"
-                    } else {
-                        "ru"
-                    },
-                );
+                let mut editor = content_editor::LessonEditor::new(self.language().tag());
                 match id.and_then(|id| self.catalog.lesson_document(id)) {
                     Some((lesson, _)) => {
                         editor.lesson = lesson.clone();
@@ -1809,12 +1872,7 @@ impl StaminatorApp {
                 .lessons
                 .into_iter()
                 .find(|item| Some(item.lesson.id.as_str()) == id);
-            let mut editor =
-                content_editor::LessonEditor::new(if self.language() == ContentLanguage::English {
-                    "en"
-                } else {
-                    "ru"
-                });
+            let mut editor = content_editor::LessonEditor::new(self.language().tag());
             if let Some(item) = item {
                 if self
                     .catalog
@@ -1837,10 +1895,7 @@ impl StaminatorApp {
             self.chooser_open = false;
         }
         if refresh {
-            for (index, language) in [ContentLanguage::Russian, ContentLanguage::English]
-                .into_iter()
-                .enumerate()
-            {
+            for (index, language) in ContentLanguage::ALL.into_iter().enumerate() {
                 if self.selected_lessons[index].is_none() {
                     self.selected_lessons[index] =
                         self.catalog.lesson_id(language, 0).map(str::to_owned);
@@ -1887,14 +1942,7 @@ impl StaminatorApp {
         if let Some(mut editor) = self.lesson_editor.take() {
             let mut open = true;
             if editor.show(ctx, &mut open) {
-                if !["ru", "en"].iter().any(|lang| {
-                    editor
-                        .lesson
-                        .language
-                        .split('-')
-                        .next()
-                        .is_some_and(|value| value.eq_ignore_ascii_case(lang))
-                }) {
+                if ContentLanguage::parse(&editor.lesson.language).is_none() {
                     editor.error = localization::tr("lesson.language_error");
                     self.lesson_editor = Some(editor);
                     return;
@@ -1966,17 +2014,8 @@ impl StaminatorApp {
                 };
                 match result {
                     Ok(_) => {
-                        let language = if editor
-                            .lesson
-                            .language
-                            .split('-')
-                            .next()
-                            .is_some_and(|v| v.eq_ignore_ascii_case("en"))
-                        {
-                            ContentLanguage::English
-                        } else {
-                            ContentLanguage::Russian
-                        };
+                        let language = ContentLanguage::parse(&editor.lesson.language)
+                            .expect("validated language");
                         if let Ok(Some(database)) = self.users.database() {
                             match database.list_lessons() {
                                 Ok(lessons) => self.catalog.set_stored_lessons(lessons),
@@ -1991,9 +2030,16 @@ impl StaminatorApp {
                             self.catalog.refresh_lessons();
                         }
                         self.content_language = language;
+                        if let Err(error) = self
+                            .users
+                            .set_content_language(language.code())
+                            .and_then(|()| self.users.set_selected_lesson(&editor.lesson.id))
+                        {
+                            self.profile_error = error.to_string();
+                        }
                         self.selected_mode = TrainingMode::Lessons;
-                        self.selected_lessons[usize::from(language == ContentLanguage::English)] =
-                            Some(editor.lesson.id.clone());
+                        self.persist_training_selection();
+                        self.selected_lessons[language.index()] = Some(editor.lesson.id.clone());
                         self.session = None;
                         self.last_result = None;
                         open = false;
@@ -2025,7 +2071,7 @@ impl StaminatorApp {
     }
 
     fn import_profile_from(&mut self, path: &std::path::Path) -> Result<(), String> {
-        if !self.flush_window_placement() {
+        if !self.save_before_switch() || !self.flush_window_placement() {
             return Err(self.profile_error.clone());
         }
         let profile = storage_transfer::import_profile_json(path).map_err(|e| e.to_string())?;
@@ -2033,7 +2079,11 @@ impl StaminatorApp {
         self.users
             .import_profile(serde_json::from_value(value).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
+        self.session = None;
+        self.last_result = None;
+        self.result_open = false;
         self.sync_profile_language();
+        self.sync_profile_training();
         self.restore_external_text();
         self.profile_error.clear();
         Ok(())
@@ -2057,6 +2107,7 @@ impl StaminatorApp {
         let safety = self.users.restore_backup(path).map_err(|e| e.to_string())?;
         self.window_placement = None;
         self.sync_profile_language();
+        self.sync_profile_training();
         self.session = None;
         self.last_result = None;
         self.result_open = false;
@@ -2105,7 +2156,7 @@ impl StaminatorApp {
                         .selectable_label(self.users.active_profile_id() == id, name)
                         .clicked()
                     {
-                        if !self.flush_window_placement() {
+                        if !self.save_before_switch() || !self.flush_window_placement() {
                             return;
                         }
                         match self.users.select(&id) {
@@ -2115,6 +2166,7 @@ impl StaminatorApp {
                                 self.result_open = false;
                                 self.profile_error.clear();
                                 self.sync_profile_language();
+                                self.sync_profile_training();
                                 self.restore_external_text();
                             }
                             Err(error) => self.profile_error = error.to_string(),
@@ -2146,7 +2198,7 @@ impl StaminatorApp {
                 ui.text_edit_singleline(&mut self.profile_name_input);
                 ui.horizontal(|ui| {
                     if ui.button(localization::tr("create")).clicked() {
-                        if !self.flush_window_placement() {
+                        if !self.save_before_switch() || !self.flush_window_placement() {
                             return;
                         }
                         match self.users.create(&self.profile_name_input) {
@@ -2155,6 +2207,7 @@ impl StaminatorApp {
                                 self.profile_error.clear();
                                 self.session = None;
                                 self.sync_profile_language();
+                                self.sync_profile_training();
                                 self.restore_external_text();
                             }
                             Err(error) => self.profile_error = error.to_string(),
@@ -2186,6 +2239,7 @@ impl StaminatorApp {
                                 self.profile_error.clear();
                                 self.session = None;
                                 self.sync_profile_language();
+                                self.sync_profile_training();
                                 self.restore_external_text();
                             }
                             Err(error) => self.profile_error = error.to_string(),
@@ -2260,6 +2314,11 @@ impl StaminatorApp {
                 ui.menu_button(localization::tr("mode"), |ui| {
                     ui.add_enabled_ui(!active, |ui| {
                         for mode in TrainingMode::ALL {
+                            if matches!(mode, TrainingMode::Phrases | TrainingMode::Letters)
+                                && self.catalog.phrases(self.language()).is_empty()
+                            {
+                                continue;
+                            }
                             if ui
                                 .add(
                                     egui::Button::new(localization::tr(mode.key()))
@@ -2267,7 +2326,11 @@ impl StaminatorApp {
                                 )
                                 .clicked()
                             {
+                                if !self.save_before_switch() {
+                                    return;
+                                }
                                 self.selected_mode = mode;
+                                self.persist_training_selection();
                                 self.session = None;
                                 self.last_result = None;
                                 self.result_open = false;
@@ -2280,50 +2343,60 @@ impl StaminatorApp {
                                 ui.close();
                             }
                         }
+                        if self.catalog.phrases(self.language()).is_empty() {
+                            ui.label(localization::tr("mode.empty_phrases"));
+                        }
                         ui.separator();
                         ui.menu_button(localization::tr("content-language"), |ui| {
-                            let russian = ui
-                                .selectable_value(
-                                    &mut self.content_language,
-                                    ContentLanguage::Russian,
-                                    localization::tr("language.russian"),
-                                )
-                                .clicked();
-                            let english = ui
-                                .selectable_value(
-                                    &mut self.content_language,
-                                    ContentLanguage::English,
-                                    "English",
-                                )
-                                .clicked();
-                            if russian || english {
-                                self.chooser_preview = None;
-                                let value = if self.content_language == ContentLanguage::English {
-                                    "EN"
-                                } else {
-                                    "RU"
-                                };
-                                if let Err(error) = self.users.set_content_language(value) {
-                                    self.profile_error = error.to_string();
+                            for language in ContentLanguage::ALL {
+                                if ui
+                                    .selectable_label(
+                                        self.content_language == language,
+                                        localization::visual_text(language.name()),
+                                    )
+                                    .clicked()
+                                {
+                                    if !self.save_before_switch() {
+                                        return;
+                                    }
+                                    match self.users.set_content_language(language.code()) {
+                                        Ok(()) => {
+                                            self.content_language = language;
+                                            if matches!(
+                                                self.selected_mode,
+                                                TrainingMode::Phrases | TrainingMode::Letters
+                                            ) && self.catalog.phrases(language).is_empty()
+                                            {
+                                                self.selected_mode = TrainingMode::Lessons;
+                                                self.persist_training_selection();
+                                            }
+                                            self.chooser_preview = None;
+                                            self.session = None;
+                                            self.last_result = None;
+                                            self.result_open = false;
+                                        }
+                                        Err(error) => self.profile_error = error.to_string(),
+                                    }
+                                    ui.close();
                                 }
-                                self.session = None;
-                                self.last_result = None;
-                                self.result_open = false;
-                                ui.close();
                             }
                         });
                         ui.menu_button(localization::tr("layout"), |ui| {
                             let russian = ui
-                                .selectable_value(
-                                    &mut self.english_layout,
-                                    false,
+                                .selectable_label(
+                                    !self.english_layout,
                                     localization::tr("layout.russian"),
                                 )
                                 .clicked();
                             let english = ui
-                                .selectable_value(&mut self.english_layout, true, "English")
+                                .selectable_label(self.english_layout, "English")
                                 .clicked();
                             if russian || english {
+                                if !self.save_before_switch() {
+                                    return;
+                                }
+                                self.english_layout = english;
+                                self.persist_training_selection();
                                 self.session = None;
                                 self.last_result = None;
                                 self.result_open = false;
@@ -2394,10 +2467,9 @@ impl StaminatorApp {
                             .active_profile()
                             .map_or("RU", |p| p.interface_language.as_str())
                             .to_owned();
-                        for (code, name) in [
-                            ("RU", localization::tr("language.russian")),
-                            ("EN", "English".to_owned()),
-                        ] {
+                        for option in ContentLanguage::ALL {
+                            let code = option.code();
+                            let name = localization::visual_text(option.name());
                             if ui.selectable_label(language == code, name).clicked() {
                                 match self.users.set_interface_language(code) {
                                     Ok(()) => {
@@ -2663,6 +2735,11 @@ impl StaminatorApp {
                 self.last_keyboard_state = Some(state);
             }
             let input_queue = Arc::clone(&self.keyboard_input);
+            let unsupported = !matches!(
+                self.language(),
+                ContentLanguage::Russian | ContentLanguage::English
+            ) && self.selected_mode == TrainingMode::Lessons;
+            let unsupported_message = localization::tr("keyboard.unsupported_layout");
             root.ctx()
                 .show_viewport_deferred(viewport_id, builder, move |ui, _class| {
                     let ctx = ui.ctx();
@@ -2675,7 +2752,13 @@ impl StaminatorApp {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .viewport = Some(snapshot);
                     queue_keyboard_input(&input_queue, ctx, events, close_requested);
-                    keyboard::draw_keyboard(ui, layout, next_char);
+                    if unsupported {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            ui.label(&unsupported_message);
+                        });
+                    } else {
+                        keyboard::draw_keyboard(ui, layout, next_char);
+                    }
                 });
         } else {
             self.last_keyboard_state = None;
@@ -3638,7 +3721,7 @@ mod tests {
         .unwrap();
         let mut app = test_app(root.join("profiles.json"));
         app.catalog.set_lesson_roots(vec![builtin.clone(), user]);
-        app.lesson_editor = Some(content_editor::LessonEditor::new("fr"));
+        app.lesson_editor = Some(content_editor::LessonEditor::new("xx"));
         let editor = app.lesson_editor.as_mut().unwrap();
         editor.lesson.id = "used".into();
         editor.lesson.title = "Edited".into();
@@ -3653,13 +3736,7 @@ mod tests {
             .unwrap()
             .0;
         draw_accessible(&mut app, &ctx, vec![accessible_click(id)]);
-        assert!(
-            app.lesson_editor
-                .as_ref()
-                .unwrap()
-                .error
-                .contains("русском")
-        );
+        assert!(app.lesson_editor.as_ref().unwrap().error.contains("язык"));
         app.lesson_editor.as_mut().unwrap().lesson.language = "ru".into();
         let nodes = draw_accessible(&mut app, &ctx, vec![]);
         let id = nodes
@@ -4532,6 +4609,183 @@ mod tests {
         assert_eq!(app.current_label(), "Cats nap.");
         app.selected_mode = TrainingMode::Lessons;
         assert_eq!(app.current_label(), "EN words");
+    }
+
+    #[test]
+    fn changing_interface_language_keeps_lesson_and_keyboard_layout() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.users.set_content_language("EN").unwrap();
+        app.sync_profile_language();
+        app.selected_mode = TrainingMode::Lessons;
+        app.select_content(1);
+        let selected = app.current_label();
+        let layout = app.english_layout;
+        app.users.set_interface_language("ES").unwrap();
+        app.sync_profile_language();
+        assert_eq!(app.language(), ContentLanguage::English);
+        assert_eq!(app.current_label(), selected);
+        assert_eq!(app.english_layout, layout);
+        let reopened = UserStore::load_from(&path).unwrap();
+        assert_eq!(reopened.active_profile().unwrap().interface_language, "ES");
+        assert_eq!(reopened.active_profile().unwrap().content_language, "EN");
+        localization::set_language("RU");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn training_selection_restores_with_profile_and_remains_independent_of_translation() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        let original = app.users.active_profile_id().to_owned();
+        app.selected_mode = TrainingMode::AllKeys;
+        app.english_layout = true;
+        app.persist_training_selection();
+        app.users.set_interface_language("FR").unwrap();
+        app.sync_profile_language();
+        assert!(app.selected_mode == TrainingMode::AllKeys);
+        assert!(app.english_layout);
+        app.users.create("Second").unwrap();
+        app.sync_profile_language();
+        app.sync_profile_training();
+        assert!(app.selected_mode == TrainingMode::Lessons);
+        assert!(!app.english_layout);
+        app.users.select(&original).unwrap();
+        app.sync_profile_language();
+        app.sync_profile_training();
+        assert!(app.selected_mode == TrainingMode::AllKeys);
+        assert!(app.english_layout);
+        let reopened = UserStore::load_from(&path).unwrap();
+        assert_eq!(
+            reopened.active_profile().unwrap().selected_mode.as_deref(),
+            Some("mode.all-keys")
+        );
+        assert_eq!(
+            reopened
+                .active_profile()
+                .unwrap()
+                .selected_layout
+                .as_deref(),
+            Some("layout.en")
+        );
+        localization::set_language("RU");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn restored_phrase_mode_falls_back_to_lessons_when_language_has_no_phrases() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.users.set_content_language("FA").unwrap();
+        app.users
+            .set_training_selection("mode.phrases", "layout.en")
+            .unwrap();
+        app.sync_profile_language();
+        app.sync_profile_training();
+        assert_eq!(app.content_language, ContentLanguage::Persian);
+        assert!(app.selected_mode == TrainingMode::Lessons);
+        assert!(app.english_layout);
+        assert!(app.catalog.phrases(app.language()).is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn committed_ime_text_advances_a_lesson() {
+        let mut app = test_app(test_path());
+        app.external_text = "سلام".into();
+        app.start();
+        let ctx = egui::Context::default();
+        input(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Ime(egui::ImeEvent::Commit("سلام".into()))],
+        );
+        assert_eq!(
+            app.session.as_ref().unwrap().stop_reason(),
+            Some(StopReason::Completed)
+        );
+    }
+
+    #[test]
+    fn switching_profile_saves_running_session_to_previous_profile() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        let original = app.users.active_profile_id().to_owned();
+        app.start();
+        app.type_input_char('a', 1);
+        assert!(app.save_before_switch());
+        assert_eq!(app.users.active_records().len(), 1);
+        app.users.create("Second").unwrap();
+        assert!(app.users.active_records().is_empty());
+        app.users.select(&original).unwrap();
+        assert_eq!(app.users.active_records()[0].correct, 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn switching_is_blocked_if_session_result_cannot_be_saved() {
+        let blocker = test_path();
+        fs::write(&blocker, "not a directory").unwrap();
+        let mut app = test_app(blocker.join("profiles.json"));
+        app.start();
+        app.type_input_char('a', 1);
+        assert!(!app.save_before_switch());
+        assert!(app.result_open);
+        assert!(!app.result_recorded);
+        assert_eq!(app.session.as_ref().unwrap().stats().correct, 1);
+        assert!(!app.profile_error.is_empty());
+        let _ = fs::remove_file(blocker);
+    }
+
+    #[test]
+    fn all_bundled_languages_select_and_complete_their_own_lessons() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        let lessons = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lessons");
+        app.catalog.set_lesson_roots(vec![lessons]);
+        for language in ContentLanguage::ALL {
+            app.users.set_content_language(language.code()).unwrap();
+            app.sync_profile_language();
+            app.selected_mode = TrainingMode::Lessons;
+            assert!(
+                !app.catalog.lessons(language).is_empty(),
+                "{}",
+                language.code()
+            );
+            app.select_content(0);
+            let first = app
+                .catalog
+                .lesson_id(language, app.current_index())
+                .unwrap()
+                .to_owned();
+            let text = app.current_exercise().unwrap().text.clone();
+            app.start();
+            for (i, ch) in text.chars().enumerate() {
+                app.type_input_char(ch, i as u64 + 1);
+            }
+            app.open_stopped_result();
+            assert!(app.result_completed, "{}", language.code());
+            app.accept_result();
+            assert!(app.advance_content());
+            assert_ne!(
+                app.catalog
+                    .lesson_id(language, app.current_index())
+                    .unwrap(),
+                first
+            );
+        }
+        let reopened = UserStore::load_from(&path).unwrap();
+        let profile = reopened.active_profile().unwrap();
+        for language in ContentLanguage::ALL {
+            assert_eq!(
+                profile
+                    .selected_lessons
+                    .get(language.code())
+                    .map(String::as_str),
+                app.catalog.lesson_id(language, 1)
+            );
+        }
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -5466,6 +5720,60 @@ mod tests {
     }
 
     #[test]
+    fn accessible_lesson_language_menu_switches_courses_without_changing_interface() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.show_keyboard = false;
+        app.catalog.set_lesson_roots(vec![
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lessons"),
+        ]);
+        app.users.set_content_language("EN").unwrap();
+        app.content_language = ContentLanguage::English;
+        app.selected_mode = TrainingMode::Phrases;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let mode = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Режим"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(mode)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let language = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Язык текста"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(language)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let spanish = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Español"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(spanish)]);
+        assert_eq!(app.language(), ContentLanguage::Spanish);
+        assert!(app.selected_mode == TrainingMode::Lessons);
+        assert!(
+            app.catalog
+                .lesson_id(app.language(), app.current_index())
+                .unwrap()
+                .starts_with("ktouch.es1.")
+        );
+        assert_eq!(app.users.active_profile().unwrap().interface_language, "RU");
+        assert_eq!(
+            UserStore::load_from(&path)
+                .unwrap()
+                .active_profile()
+                .unwrap()
+                .content_language,
+            "ES"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn interface_language_menu_preserves_session_and_reloads_profile() {
         let path = test_path();
         let mut app = test_app(path.clone());
@@ -5509,6 +5817,45 @@ mod tests {
         );
         let nodes = draw_accessible(&mut app, &ctx, vec![]);
         assert!(nodes.iter().any(|(_, n)| n.label() == Some("Options")));
+    }
+
+    #[test]
+    fn arabic_interface_selection_preserves_active_training() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.show_keyboard = false;
+        app.start();
+        app.type_input_char('a', 1);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let options = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Опции"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(options)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let language = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Язык интерфейса"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(language)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let arabic = localization::visual_text("العربية");
+        let choice = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some(arabic.as_str()))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(choice)]);
+        assert_eq!(app.users.active_profile().unwrap().interface_language, "AR");
+        assert_eq!(app.users.active_profile().unwrap().content_language, "RU");
+        assert_eq!(app.session.as_ref().unwrap().stats().correct, 1);
+        assert!(app.english_layout);
+        localization::set_language("RU");
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -5915,7 +6262,25 @@ mod tests {
         let expected = source.users.active_profile().unwrap().clone();
 
         let mut destination = database_test_app(root.join("destination.sqlite3"));
+        let previous = destination.users.active_profile_id().to_owned();
+        destination.selected_mode = TrainingMode::ExternalText;
+        destination.external_text = "abc".into();
+        destination.start();
+        destination.type_input_char('a', 1);
         destination.import_profile_from(&profile_path).unwrap();
+        assert!(destination.session.is_none());
+        assert!(destination.last_result.is_none());
+        assert_eq!(
+            destination
+                .users
+                .profiles()
+                .iter()
+                .find(|p| p.id == previous)
+                .unwrap()
+                .results
+                .len(),
+            1
+        );
         assert_eq!(destination.users.active_profile(), Some(&expected));
         assert_eq!(destination.content_language, ContentLanguage::English);
         assert!(destination.import_profile_from(&profile_path).is_err());

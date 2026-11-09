@@ -53,6 +53,13 @@ pub struct Profile {
     pub content_language: String,
     #[serde(default = "default_content_language")]
     pub interface_language: String,
+    /// Last selected lesson, keyed by content language code.
+    #[serde(default)]
+    pub selected_lessons: BTreeMap<String, String>,
+    #[serde(default)]
+    pub selected_mode: Option<String>,
+    #[serde(default)]
+    pub selected_layout: Option<String>,
     #[serde(default, deserialize_with = "deserialize_background")]
     pub background: BackgroundImageSettings,
     /// JSON fallback for window geometry; SQLite stores these in profile settings.
@@ -134,6 +141,10 @@ pub enum BackgroundPlacement {
 
 fn default_content_language() -> String {
     "RU".into()
+}
+
+fn is_supported_language(language: &str) -> bool {
+    crate::content::ContentLanguage::parse(language).is_some()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -317,6 +328,28 @@ impl UserStore {
         restored.database = true;
         restored.background_default_version = 1;
         restored.revision.set(loaded.revision);
+        for profile in &mut restored.profiles {
+            if let Some(value) = database
+                .get_setting(&profile.id, "selected_lessons")
+                .map_err(storage_io_error)?
+            {
+                profile.selected_lessons = serde_json::from_str(&value).map_err(invalid_data)?;
+            }
+            profile.selected_mode = database
+                .get_setting(&profile.id, "selected_mode")
+                .map_err(storage_io_error)?;
+            profile.selected_layout = database
+                .get_setting(&profile.id, "selected_layout")
+                .map_err(storage_io_error)?;
+            if let Some(value) = database
+                .get_setting(&profile.id, "training_selection")
+                .map_err(storage_io_error)?
+                && let Ok((mode, layout)) = serde_json::from_str::<(String, String)>(&value)
+            {
+                profile.selected_mode = Some(mode);
+                profile.selected_layout = Some(layout);
+            }
+        }
         *self = restored;
         Ok(safety_path)
     }
@@ -332,6 +365,7 @@ impl UserStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let mut legacy_selections = BTreeMap::new();
         let mut database =
             stamina_data::storage::Database::open(&path).map_err(storage_io_error)?;
         let backup = sibling_path(legacy, "bak");
@@ -343,6 +377,24 @@ impl UserStore {
             None
         };
         if let Some(source) = source {
+            if let Ok(bytes) = fs::read(source)
+                && let Ok(legacy_store) = serde_json::from_slice::<Self>(&bytes)
+            {
+                legacy_selections = legacy_store
+                    .profiles
+                    .into_iter()
+                    .map(|profile| {
+                        (
+                            profile.id,
+                            (
+                                profile.selected_lessons,
+                                profile.selected_mode,
+                                profile.selected_layout,
+                            ),
+                        )
+                    })
+                    .collect();
+            }
             database
                 .import_profiles_json(source)
                 .map_err(storage_io_error)?;
@@ -358,6 +410,45 @@ impl UserStore {
         store.database = true;
         store.background_default_version = 1;
         store.revision.set(loaded.revision);
+        for profile in &mut store.profiles {
+            let key = "selected_lessons";
+            let stored = database
+                .get_setting(&profile.id, key)
+                .map_err(storage_io_error)?;
+            if let Some(value) = stored {
+                if let Ok(selected) = serde_json::from_str::<BTreeMap<String, String>>(&value) {
+                    profile.selected_lessons = selected;
+                }
+            } else if let Some((selected, _, _)) = legacy_selections.get(&profile.id) {
+                profile.selected_lessons = selected.clone();
+                database
+                    .set_setting(
+                        &profile.id,
+                        key,
+                        &serde_json::to_string(selected).map_err(invalid_data)?,
+                    )
+                    .map_err(storage_io_error)?;
+            }
+            if let Some(value) = database
+                .get_setting(&profile.id, "training_selection")
+                .map_err(storage_io_error)?
+            {
+                if let Ok((mode, layout)) = serde_json::from_str::<(String, String)>(&value) {
+                    profile.selected_mode = Some(mode);
+                    profile.selected_layout = Some(layout);
+                }
+            } else if let Some((_, Some(mode), Some(layout))) = legacy_selections.get(&profile.id) {
+                profile.selected_mode = Some(mode.clone());
+                profile.selected_layout = Some(layout.clone());
+                database
+                    .set_setting(
+                        &profile.id,
+                        "training_selection",
+                        &serde_json::to_string(&(mode, layout)).map_err(invalid_data)?,
+                    )
+                    .map_err(storage_io_error)?;
+            }
+        }
         store.normalize();
         let after: stamina_data::storage::Snapshot =
             serde_json::from_value(serde_json::to_value(&store).map_err(invalid_data)?)
@@ -474,7 +565,7 @@ impl UserStore {
         &self.profiles
     }
 
-    pub fn import_profile(&mut self, profile: Profile) -> io::Result<()> {
+    pub fn import_profile(&mut self, mut profile: Profile) -> io::Result<()> {
         if profile.id.trim().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -482,13 +573,24 @@ impl UserStore {
             ));
         }
         if profile.results.len() > MAX_RESULTS_PER_PROFILE
-            || !matches!(profile.content_language.as_str(), "RU" | "EN")
+            || !is_supported_language(&profile.content_language)
+            || !is_supported_language(&profile.interface_language)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 localization::tr("profile.invalid_contents"),
             ));
         }
+        profile.content_language =
+            crate::content::ContentLanguage::parse(&profile.content_language)
+                .unwrap()
+                .code()
+                .into();
+        profile.interface_language =
+            crate::content::ContentLanguage::parse(&profile.interface_language)
+                .unwrap()
+                .code()
+                .into();
         valid_name(&profile.name)?;
         ensure_unique(&self.profiles, &profile.name, None)?;
         if self
@@ -524,7 +626,7 @@ impl UserStore {
     }
 
     pub fn set_content_language(&mut self, language: &str) -> io::Result<()> {
-        if !matches!(language, "RU" | "EN") {
+        if !is_supported_language(language) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 localization::tr("profile.invalid_content_language"),
@@ -541,13 +643,16 @@ impl UserStore {
                     localization::tr("profile.not_found"),
                 )
             })?;
-        profile.content_language = language.into();
+        profile.content_language = crate::content::ContentLanguage::parse(language)
+            .unwrap()
+            .code()
+            .into();
         self.commit_or_restore(original)
     }
 
     /// Set the interface language for the active profile.
     pub fn set_interface_language(&mut self, language: &str) -> io::Result<()> {
-        if !matches!(language, "RU" | "EN") {
+        if !is_supported_language(language) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 localization::tr("profile.invalid_interface_language"),
@@ -564,7 +669,97 @@ impl UserStore {
                     localization::tr("profile.not_found"),
                 )
             })?;
-        profile.interface_language = language.into();
+        profile.interface_language = crate::content::ContentLanguage::parse(language)
+            .unwrap()
+            .code()
+            .into();
+        self.commit_or_restore(original)
+    }
+
+    /// Save the selected lesson for the active profile's current content language.
+    pub fn set_selected_lesson(&mut self, lesson: &str) -> io::Result<()> {
+        let lesson = lesson.trim();
+        if lesson.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "lesson must not be empty",
+            ));
+        }
+        let original = self.clone();
+        let (profile_id, serialized) = {
+            let profile = self
+                .profiles
+                .iter_mut()
+                .find(|p| p.id == self.active_profile_id)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        localization::tr("profile.not_found"),
+                    )
+                })?;
+            profile
+                .selected_lessons
+                .insert(profile.content_language.clone(), lesson.to_owned());
+            (
+                profile.id.clone(),
+                serde_json::to_string(&profile.selected_lessons).map_err(invalid_data)?,
+            )
+        };
+        if self.database {
+            let result = self.database().and_then(|db| {
+                db.expect("database flag")
+                    .set_setting(&profile_id, "selected_lessons", &serialized)
+                    .map_err(storage_io_error)
+            });
+            if let Err(error) = result {
+                *self = original;
+                return Err(error);
+            }
+            return Ok(());
+        }
+        self.commit_or_restore(original)
+    }
+
+    /// Save the selected training mode and keyboard layout for the active profile.
+    pub fn set_training_selection(&mut self, mode: &str, layout: &str) -> io::Result<()> {
+        let mode = mode.trim();
+        let layout = layout.trim();
+        if mode.is_empty() || layout.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mode and layout must not be empty",
+            ));
+        }
+        let original = self.clone();
+        let profile_id = self
+            .active_profile()
+            .map(|profile| profile.id.clone())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    localization::tr("profile.not_found"),
+                )
+            })?;
+        if self.database {
+            let mut database = self.database()?.expect("database flag");
+            database
+                .set_setting(
+                    &profile_id,
+                    "training_selection",
+                    &serde_json::to_string(&(mode, layout)).map_err(invalid_data)?,
+                )
+                .map_err(storage_io_error)?;
+        }
+        let profile = self
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.id == profile_id)
+            .expect("active profile was found");
+        profile.selected_mode = Some(mode.to_owned());
+        profile.selected_layout = Some(layout.to_owned());
+        if self.database {
+            return Ok(());
+        }
         self.commit_or_restore(original)
     }
 
@@ -592,6 +787,9 @@ impl UserStore {
             external_text: None,
             content_language: default_content_language(),
             interface_language: default_content_language(),
+            selected_lessons: BTreeMap::new(),
+            selected_mode: None,
+            selected_layout: None,
             background: BackgroundImageSettings::default(),
             window_geometry: BTreeMap::new(),
         });
@@ -802,9 +1000,14 @@ impl UserStore {
                     suffix += 1;
                 }
             }
-            if !matches!(self.profiles[i].content_language.as_str(), "RU" | "EN") {
-                self.profiles[i].content_language = default_content_language();
-            }
+            self.profiles[i].content_language =
+                crate::content::ContentLanguage::parse(&self.profiles[i].content_language)
+                    .map_or("RU", |language| language.code())
+                    .into();
+            self.profiles[i].interface_language =
+                crate::content::ContentLanguage::parse(&self.profiles[i].interface_language)
+                    .map_or("RU", |language| language.code())
+                    .into();
             let results = &mut self.profiles[i].results;
             if results.len() > MAX_RESULTS_PER_PROFILE {
                 let excess = results.len() - MAX_RESULTS_PER_PROFILE;
@@ -821,6 +1024,9 @@ impl UserStore {
                 external_text: None,
                 content_language: default_content_language(),
                 interface_language: "RU".into(),
+                selected_lessons: BTreeMap::new(),
+                selected_mode: None,
+                selected_layout: None,
                 background: BackgroundImageSettings::default(),
                 window_geometry: BTreeMap::new(),
             });
@@ -966,6 +1172,9 @@ mod tests {
             external_text: None,
             content_language: "EN".into(),
             interface_language: "RU".into(),
+            selected_lessons: BTreeMap::new(),
+            selected_mode: None,
+            selected_layout: None,
             background: BackgroundImageSettings::default(),
             window_geometry: BTreeMap::new(),
         };
@@ -1020,6 +1229,9 @@ mod tests {
             external_text: None,
             content_language: "RU".into(),
             interface_language: "RU".into(),
+            selected_lessons: BTreeMap::new(),
+            selected_mode: None,
+            selected_layout: None,
             background: BackgroundImageSettings::default(),
             window_geometry: BTreeMap::new(),
         };
@@ -1082,6 +1294,9 @@ mod tests {
         let backup_path = legacy.with_extension("backup.sqlite3");
         let mut store = UserStore::load_database(database_path.clone(), &legacy).unwrap();
         store.create("Before backup").unwrap();
+        store.set_content_language("FA").unwrap();
+        store.set_selected_lesson("ktouch.ir.002").unwrap();
+        store.set_training_selection("Text", "FA").unwrap();
         store
             .database()
             .unwrap()
@@ -1091,6 +1306,23 @@ mod tests {
         store.create("After backup").unwrap();
         let safety = store.restore_backup(&backup_path).unwrap();
         assert_eq!(store.active_name(), "Before backup");
+        assert_eq!(
+            store
+                .active_profile()
+                .unwrap()
+                .selected_lessons
+                .get("FA")
+                .map(String::as_str),
+            Some("ktouch.ir.002")
+        );
+        assert_eq!(
+            store.active_profile().unwrap().selected_mode.as_deref(),
+            Some("Text")
+        );
+        assert_eq!(
+            store.active_profile().unwrap().selected_layout.as_deref(),
+            Some("FA")
+        );
         let saved = stamina_data::storage::Database::open(&safety)
             .unwrap()
             .load_snapshot()
@@ -1228,7 +1460,7 @@ mod tests {
         let temp_blocker = sibling_path(&path, "tmp");
         fs::create_dir(&temp_blocker).unwrap();
 
-        let failures: [FailureOperation; 4] = [
+        let failures: [FailureOperation; 5] = [
             (
                 "select",
                 Box::new({
@@ -1253,6 +1485,10 @@ mod tests {
             (
                 "set_content_language",
                 Box::new(|s| s.set_content_language("EN")),
+            ),
+            (
+                "set_selected_lesson",
+                Box::new(|s| s.set_selected_lesson("ktouch.ru1.001")),
             ),
         ];
         for (operation, mutate) in failures {
@@ -1297,7 +1533,7 @@ mod tests {
         let mut store = UserStore::load_database(database.clone(), &legacy).unwrap();
         let before_memory = serde_json::to_value(&store).unwrap();
         fs::copy(&database, &preserved).unwrap();
-        let failures: [FailureOperation; 4] = [
+        let failures: [FailureOperation; 5] = [
             (
                 "select",
                 Box::new({
@@ -1322,6 +1558,10 @@ mod tests {
             (
                 "set_content_language",
                 Box::new(|s| s.set_content_language("EN")),
+            ),
+            (
+                "set_selected_lesson",
+                Box::new(|s| s.set_selected_lesson("ktouch.ru1.001")),
             ),
         ];
         for (operation, mutate) in failures {
@@ -1451,6 +1691,53 @@ mod tests {
                 .unwrap()
                 .content_language,
             "EN"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn content_and_interface_languages_support_all_locales_independently_and_persist() {
+        let path = test_path();
+        let mut store = UserStore::load_from(&path).unwrap();
+        let locales = [
+            "RU", "EN", "ES", "AR", "FR", "PT-BR", "DE", "IT", "TR", "FA",
+        ];
+
+        for (index, locale) in locales.iter().enumerate() {
+            store.set_content_language(locale).unwrap();
+            let interface_locale = locales[(index + 1) % locales.len()];
+            store.set_interface_language(interface_locale).unwrap();
+            assert_eq!(store.active_profile().unwrap().content_language, *locale);
+            assert_eq!(
+                store.active_profile().unwrap().interface_language,
+                interface_locale
+            );
+        }
+
+        let reopened = UserStore::load_from(&path).unwrap();
+        assert_eq!(reopened.active_profile().unwrap().content_language, "FA");
+        assert_eq!(reopened.active_profile().unwrap().interface_language, "RU");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn language_aliases_are_canonicalized_before_saving_profile() {
+        let path = test_path();
+        let mut store = UserStore::new_at(&path);
+        assert_eq!(
+            store.set_selected_lesson("  ").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        store.set_content_language("pt_br").unwrap();
+        store.set_interface_language("en").unwrap();
+        store.set_selected_lesson("ktouch.br.001").unwrap();
+        let loaded = UserStore::load_from(&path).unwrap();
+        let profile = loaded.active_profile().unwrap();
+        assert_eq!(profile.content_language, "PT-BR");
+        assert_eq!(profile.interface_language, "EN");
+        assert_eq!(
+            profile.selected_lessons.get("PT-BR").map(String::as_str),
+            Some("ktouch.br.001")
         );
         let _ = fs::remove_file(path);
     }
@@ -1621,6 +1908,268 @@ mod tests {
             "EN"
         );
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn selected_lessons_are_scoped_by_profile_and_content_language_in_sqlite() {
+        let path = test_path().with_extension("sqlite3");
+        let legacy = path.with_extension("json");
+        let mut store = UserStore::load_database(path.clone(), &legacy).unwrap();
+        let first = store.active_profile_id().to_owned();
+        store.set_selected_lesson("RU basics").unwrap();
+        store.set_content_language("EN").unwrap();
+        store.set_selected_lesson("English basics").unwrap();
+
+        let second = store.create("Second").unwrap().id.clone();
+        store.set_content_language("EN").unwrap();
+        store.set_selected_lesson("Second profile lesson").unwrap();
+        store.select(&first).unwrap();
+        store.set_content_language("RU").unwrap();
+        assert_eq!(
+            store
+                .active_profile()
+                .unwrap()
+                .selected_lessons
+                .get("RU")
+                .map(String::as_str),
+            Some("RU basics")
+        );
+        assert_eq!(
+            store
+                .active_profile()
+                .unwrap()
+                .selected_lessons
+                .get("EN")
+                .map(String::as_str),
+            Some("English basics")
+        );
+
+        let mut reopened = UserStore::load_database(path.clone(), &legacy).unwrap();
+        assert_eq!(
+            reopened
+                .active_profile()
+                .unwrap()
+                .selected_lessons
+                .get("RU")
+                .map(String::as_str),
+            Some("RU basics")
+        );
+        assert_eq!(
+            reopened
+                .active_profile()
+                .unwrap()
+                .selected_lessons
+                .get("EN")
+                .map(String::as_str),
+            Some("English basics")
+        );
+        reopened.select(&second).unwrap();
+        assert_eq!(
+            reopened
+                .active_profile()
+                .unwrap()
+                .selected_lessons
+                .get("EN")
+                .map(String::as_str),
+            Some("Second profile lesson")
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn selected_lessons_are_saved_per_language_and_profile_in_json() {
+        let path = test_path();
+        let mut store = UserStore::load_from(&path).unwrap();
+        let first = store.active_profile_id().to_owned();
+        store.set_selected_lesson("Урок RU").unwrap();
+        store.set_content_language("EN").unwrap();
+        store.set_selected_lesson("Lesson EN").unwrap();
+        let second = store.create("Second").unwrap().id.clone();
+        store.set_selected_lesson("Second lesson").unwrap();
+        store.select(&first).unwrap();
+
+        let mut reopened = UserStore::load_from(&path).unwrap();
+        assert_eq!(
+            reopened
+                .active_profile()
+                .unwrap()
+                .selected_lessons
+                .get("RU")
+                .map(String::as_str),
+            Some("Урок RU")
+        );
+        assert_eq!(
+            reopened
+                .active_profile()
+                .unwrap()
+                .selected_lessons
+                .get("EN")
+                .map(String::as_str),
+            Some("Lesson EN")
+        );
+        reopened.select(&second).unwrap();
+        assert_eq!(
+            reopened
+                .active_profile()
+                .unwrap()
+                .selected_lessons
+                .get("RU")
+                .map(String::as_str),
+            Some("Second lesson")
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn training_selection_is_profile_scoped_and_persists_in_json() {
+        let path = test_path();
+        let mut store = UserStore::load_from(&path).unwrap();
+        let first = store.active_profile_id().to_owned();
+        store.set_training_selection("Text", "EN").unwrap();
+        let second = store.create("Second").unwrap().id.clone();
+        store.set_training_selection("Words", "RU").unwrap();
+        store.select(&first).unwrap();
+
+        let mut reopened = UserStore::load_from(&path).unwrap();
+        assert_eq!(
+            reopened.active_profile().unwrap().selected_mode.as_deref(),
+            Some("Text")
+        );
+        assert_eq!(
+            reopened
+                .active_profile()
+                .unwrap()
+                .selected_layout
+                .as_deref(),
+            Some("EN")
+        );
+        reopened.select(&second).unwrap();
+        assert_eq!(
+            reopened.active_profile().unwrap().selected_mode.as_deref(),
+            Some("Words")
+        );
+        assert_eq!(
+            reopened
+                .active_profile()
+                .unwrap()
+                .selected_layout
+                .as_deref(),
+            Some("RU")
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn training_selection_is_profile_scoped_and_persists_in_sqlite() {
+        let path = test_path().with_extension("sqlite3");
+        let legacy = path.with_extension("json");
+        let mut store = UserStore::load_database(path.clone(), &legacy).unwrap();
+        let first = store.active_profile_id().to_owned();
+        store.set_training_selection("Text", "EN").unwrap();
+        let second = store.create("Second").unwrap().id.clone();
+        store.set_training_selection("Words", "RU").unwrap();
+
+        let mut reopened = UserStore::load_database(path.clone(), &legacy).unwrap();
+        assert_eq!(
+            reopened.active_profile().unwrap().selected_mode.as_deref(),
+            Some("Words")
+        );
+        reopened.select(&first).unwrap();
+        assert_eq!(
+            reopened.active_profile().unwrap().selected_mode.as_deref(),
+            Some("Text")
+        );
+        assert_eq!(
+            reopened
+                .active_profile()
+                .unwrap()
+                .selected_layout
+                .as_deref(),
+            Some("EN")
+        );
+        reopened.select(&second).unwrap();
+        assert_eq!(
+            reopened.active_profile().unwrap().selected_mode.as_deref(),
+            Some("Words")
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn imports_legacy_json_training_selection_into_sqlite_settings() {
+        let legacy = test_path();
+        let database = legacy.with_extension("sqlite3");
+        let mut source = UserStore::new_at(&legacy);
+        source.set_training_selection("Words", "DE").unwrap();
+        source.set_content_language("DE").unwrap();
+        source.set_selected_lesson("lesson-de-01").unwrap();
+        let profile_id = source.active_profile_id().to_owned();
+
+        let imported = UserStore::load_database(database.clone(), &legacy).unwrap();
+        assert_eq!(imported.active_profile_id(), profile_id);
+        assert_eq!(
+            imported.active_profile().unwrap().selected_mode.as_deref(),
+            Some("Words")
+        );
+        assert_eq!(
+            imported
+                .active_profile()
+                .unwrap()
+                .selected_layout
+                .as_deref(),
+            Some("DE")
+        );
+        assert_eq!(
+            imported
+                .active_profile()
+                .unwrap()
+                .selected_lessons
+                .get("DE")
+                .map(String::as_str),
+            Some("lesson-de-01")
+        );
+
+        let reopened = UserStore::load_database(database.clone(), &legacy).unwrap();
+        assert_eq!(
+            reopened.active_profile().unwrap().selected_mode.as_deref(),
+            Some("Words")
+        );
+        assert_eq!(
+            reopened
+                .active_profile()
+                .unwrap()
+                .selected_layout
+                .as_deref(),
+            Some("DE")
+        );
+        let _ = fs::remove_file(legacy);
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
+    fn failed_training_selection_write_restores_profile_state() {
+        let blocker = test_path();
+        fs::write(&blocker, b"not a directory").unwrap();
+        let path = blocker.join("profiles.json");
+        let mut store = UserStore::new_at(&path);
+
+        assert!(store.set_training_selection("Text", "EN").is_err());
+        assert_eq!(store.active_profile().unwrap().selected_mode, None);
+        assert_eq!(store.active_profile().unwrap().selected_layout, None);
+        let _ = fs::remove_file(blocker);
+    }
+
+    #[test]
+    fn failed_sqlite_training_selection_open_leaves_profile_state_unchanged() {
+        let database = test_path().with_extension("sqlite3");
+        let legacy = database.with_extension("json");
+        let mut store = UserStore::load_database(database.clone(), &legacy).unwrap();
+        store.path = database.parent().unwrap().to_path_buf();
+
+        assert!(store.set_training_selection("Text", "EN").is_err());
+        assert_eq!(store.active_profile().unwrap().selected_mode, None);
+        assert_eq!(store.active_profile().unwrap().selected_layout, None);
+        let _ = fs::remove_file(database);
     }
 
     #[test]

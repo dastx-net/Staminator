@@ -4,10 +4,72 @@ use crate::localization;
 use staminator_core::FormatArgs;
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ContentLanguage {
     Russian,
     English,
+    Spanish,
+    Arabic,
+    French,
+    Portuguese,
+    German,
+    Italian,
+    Turkish,
+    Persian,
+}
+
+impl ContentLanguage {
+    pub const ALL: [Self; 10] = [
+        Self::Russian,
+        Self::English,
+        Self::Spanish,
+        Self::Arabic,
+        Self::French,
+        Self::Portuguese,
+        Self::German,
+        Self::Italian,
+        Self::Turkish,
+        Self::Persian,
+    ];
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|&v| v == self).unwrap()
+    }
+    pub fn code(self) -> &'static str {
+        [
+            "RU", "EN", "ES", "AR", "FR", "PT-BR", "DE", "IT", "TR", "FA",
+        ][self.index()]
+    }
+    pub fn tag(self) -> &'static str {
+        [
+            "ru", "en", "es", "ar", "fr", "pt-BR", "de", "it", "tr", "fa",
+        ][self.index()]
+    }
+    pub fn name(self) -> &'static str {
+        [
+            "Русский",
+            "English",
+            "Español",
+            "العربية",
+            "Français",
+            "Português (Brasil)",
+            "Deutsch",
+            "Italiano",
+            "Türkçe",
+            "فارسی",
+        ][self.index()]
+    }
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim().replace('_', "-");
+        Self::ALL.into_iter().find(|v| {
+            value.eq_ignore_ascii_case(v.tag())
+                || value.eq_ignore_ascii_case(v.code())
+                || (*v == Self::Portuguese && value.eq_ignore_ascii_case("pt"))
+                || (value
+                    .split('-')
+                    .next()
+                    .is_some_and(|base| base.eq_ignore_ascii_case(v.tag())))
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,6 +84,8 @@ pub struct ContentCatalog {
     russian_lessons: Vec<Exercise>,
     russian_lesson_ids: Vec<String>,
     english_lesson_ids: Vec<String>,
+    other_lessons: std::collections::HashMap<ContentLanguage, Vec<Exercise>>,
+    other_lesson_ids: std::collections::HashMap<ContentLanguage, Vec<String>>,
     lesson_groups: std::collections::HashMap<String, String>,
     lesson_roots: Vec<PathBuf>,
     data_dir: Option<PathBuf>,
@@ -116,6 +180,8 @@ impl ContentCatalog {
                 .map(|i| format!("legacy.en.{i}"))
                 .collect(),
             lesson_groups: std::collections::HashMap::new(),
+            other_lessons: Default::default(),
+            other_lesson_ids: Default::default(),
             lesson_roots: Vec::new(),
             data_dir: Some(data_dir.to_owned()),
             lesson_diagnostics: String::new(),
@@ -139,6 +205,8 @@ impl ContentCatalog {
             russian_lesson_ids: vec!["ru.1".into(), "ru.2".into()],
             english_lesson_ids: vec!["en.1".into(), "en.2".into()],
             lesson_groups: std::collections::HashMap::new(),
+            other_lessons: Default::default(),
+            other_lesson_ids: Default::default(),
             lesson_roots: Vec::new(),
             data_dir: None,
             lesson_diagnostics: String::new(),
@@ -198,6 +266,8 @@ impl ContentCatalog {
             russian_lesson_ids: Vec::new(),
             english_lesson_ids: Vec::new(),
             lesson_groups: std::collections::HashMap::new(),
+            other_lessons: Default::default(),
+            other_lesson_ids: Default::default(),
             lesson_roots: Vec::new(),
             data_dir: None,
             lesson_diagnostics: String::new(),
@@ -233,6 +303,8 @@ impl ContentCatalog {
         self.english_lessons.clear();
         self.russian_lesson_ids.clear();
         self.english_lesson_ids.clear();
+        self.other_lessons.clear();
+        self.other_lesson_ids.clear();
         self.lesson_groups.clear();
         for entry in catalog.lessons {
             let group = self
@@ -264,13 +336,20 @@ impl ContentCatalog {
                     .skip(1)
                     .any(|root| entry.path.starts_with(root));
             self.lesson_documents.push((document, built_in));
-            let language = lesson.language.split('-').next().unwrap_or("");
-            let (items, ids) = if language.eq_ignore_ascii_case("ru") {
-                (&mut self.russian_lessons, &mut self.russian_lesson_ids)
-            } else if language.eq_ignore_ascii_case("en") {
-                (&mut self.english_lessons, &mut self.english_lesson_ids)
-            } else {
+            let Some(language) = ContentLanguage::parse(&lesson.language) else {
                 continue;
+            };
+            let (items, ids) = match language {
+                ContentLanguage::Russian => {
+                    (&mut self.russian_lessons, &mut self.russian_lesson_ids)
+                }
+                ContentLanguage::English => {
+                    (&mut self.english_lessons, &mut self.english_lesson_ids)
+                }
+                _ => (
+                    self.other_lessons.entry(language).or_default(),
+                    self.other_lesson_ids.entry(language).or_default(),
+                ),
             };
             ids.push(lesson.id);
             items.push(Exercise {
@@ -329,14 +408,23 @@ impl ContentCatalog {
         self.english_lessons.clear();
         self.russian_lesson_ids.clear();
         self.english_lesson_ids.clear();
+        self.other_lessons.clear();
+        self.other_lesson_ids.clear();
         for (lesson, _) in &self.lesson_documents {
-            let language = lesson.language.split('-').next().unwrap_or("");
-            let (items, ids) = if language.eq_ignore_ascii_case("ru") {
-                (&mut self.russian_lessons, &mut self.russian_lesson_ids)
-            } else if language.eq_ignore_ascii_case("en") {
-                (&mut self.english_lessons, &mut self.english_lesson_ids)
-            } else {
+            let Some(language) = ContentLanguage::parse(&lesson.language) else {
                 continue;
+            };
+            let (items, ids) = match language {
+                ContentLanguage::Russian => {
+                    (&mut self.russian_lessons, &mut self.russian_lesson_ids)
+                }
+                ContentLanguage::English => {
+                    (&mut self.english_lessons, &mut self.english_lesson_ids)
+                }
+                _ => (
+                    self.other_lessons.entry(language).or_default(),
+                    self.other_lesson_ids.entry(language).or_default(),
+                ),
             };
             ids.push(lesson.id.clone());
             let name = self.lesson_groups.get(&lesson.id).map_or_else(
@@ -379,6 +467,13 @@ impl ContentCatalog {
         let ids = match language {
             ContentLanguage::Russian => &self.russian_lesson_ids,
             ContentLanguage::English => &self.english_lesson_ids,
+            _ => {
+                return self
+                    .other_lesson_ids
+                    .get(&language)
+                    .and_then(|ids| ids.get(index))
+                    .map(String::as_str);
+            }
         };
         ids.get(index).map(String::as_str)
     }
@@ -387,6 +482,12 @@ impl ContentCatalog {
         let ids = match language {
             ContentLanguage::Russian => &self.russian_lesson_ids,
             ContentLanguage::English => &self.english_lesson_ids,
+            _ => {
+                return self
+                    .other_lesson_ids
+                    .get(&language)
+                    .and_then(|ids| ids.iter().position(|value| value == id));
+            }
         };
         ids.iter().position(|value| value == id)
     }
@@ -407,6 +508,7 @@ impl ContentCatalog {
         match language {
             ContentLanguage::Russian => &self.russian_lessons,
             ContentLanguage::English => &self.english_lessons,
+            _ => self.other_lessons.get(&language).map_or(&[], Vec::as_slice),
         }
     }
 
@@ -414,6 +516,7 @@ impl ContentCatalog {
         match language {
             ContentLanguage::Russian => &self.russian_phrases,
             ContentLanguage::English => &self.english_phrases,
+            _ => &[],
         }
     }
 
@@ -424,6 +527,15 @@ impl ContentCatalog {
         language: ContentLanguage,
         phrases: &[String],
     ) -> std::io::Result<usize> {
+        if !matches!(
+            language,
+            ContentLanguage::Russian | ContentLanguage::English
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                localization::tr("mode.empty_phrases"),
+            ));
+        }
         if phrases.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -449,6 +561,7 @@ impl ContentCatalog {
         let language_dir = root.join(match language {
             ContentLanguage::Russian => "ru",
             ContentLanguage::English => "en",
+            _ => unreachable!(),
         });
         std::fs::create_dir_all(&language_dir)?;
         use std::io::Write;
@@ -486,6 +599,7 @@ impl ContentCatalog {
         let target = match language {
             ContentLanguage::Russian => &mut self.russian_phrases,
             ContentLanguage::English => &mut self.english_phrases,
+            _ => unreachable!(),
         };
         target.extend(normalized.iter().map(|phrase| Exercise {
             name: (*phrase).to_owned(),
@@ -539,6 +653,7 @@ impl ContentCatalog {
         match language {
             ContentLanguage::Russian => &self.russian_keys,
             ContentLanguage::English => &self.english_keys,
+            _ => "",
         }
     }
 
@@ -684,6 +799,41 @@ mod tests {
         ContentCatalog, ContentLanguage, Exercise, load_lessons, load_phrases, phrase_segment,
         read_caps,
     };
+
+    #[test]
+    fn language_tags_are_normalized_without_equating_portuguese_regions() {
+        assert_eq!(
+            ContentLanguage::parse(" pt_BR "),
+            Some(ContentLanguage::Portuguese)
+        );
+        assert_eq!(
+            ContentLanguage::parse("pt"),
+            Some(ContentLanguage::Portuguese)
+        );
+        assert_eq!(
+            ContentLanguage::parse("fr-FR"),
+            Some(ContentLanguage::French)
+        );
+        assert_eq!(ContentLanguage::parse("pt-PT"), None);
+    }
+
+    #[test]
+    fn unavailable_phrase_language_is_rejected_without_changing_other_languages() {
+        let mut catalog = ContentCatalog::fixture();
+        let original = catalog.phrases(ContentLanguage::Russian).to_vec();
+        let error = catalog
+            .add_user_phrases(ContentLanguage::Spanish, &["hola".into()])
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(catalog.phrases(ContentLanguage::Spanish).is_empty());
+        assert!(catalog.keys(ContentLanguage::Spanish).is_empty());
+        assert_eq!(catalog.lesson_id(ContentLanguage::Spanish, 0), None);
+        assert_eq!(
+            catalog.lesson_index(ContentLanguage::Spanish, "missing"),
+            None
+        );
+        assert_eq!(catalog.phrases(ContentLanguage::Russian), original);
+    }
     use std::{
         fs,
         path::PathBuf,

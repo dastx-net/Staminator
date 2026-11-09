@@ -4,11 +4,27 @@ use std::collections::BTreeMap;
 
 const RU: &str = include_str!("../resources/ru.json");
 const EN: &str = include_str!("../resources/en.json");
+const ES: &str = include_str!("../resources/es.json");
+const AR: &str = include_str!("../resources/ar.json");
+const FR: &str = include_str!("../resources/fr.json");
+const PT_BR: &str = include_str!("../resources/pt-BR.json");
+const DE: &str = include_str!("../resources/de.json");
+const IT: &str = include_str!("../resources/it.json");
+const TR: &str = include_str!("../resources/tr.json");
+const FA: &str = include_str!("../resources/fa.json");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Locale {
     Ru,
     En,
+    Es,
+    Ar,
+    Fr,
+    PtBr,
+    De,
+    It,
+    Tr,
+    Fa,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -55,6 +71,14 @@ impl Catalog {
             match locale {
                 Locale::Ru => RU,
                 Locale::En => EN,
+                Locale::Es => ES,
+                Locale::Ar => AR,
+                Locale::Fr => FR,
+                Locale::PtBr => PT_BR,
+                Locale::De => DE,
+                Locale::It => IT,
+                Locale::Tr => TR,
+                Locale::Fa => FA,
             },
             RU,
         )
@@ -182,7 +206,28 @@ fn plural_category(locale: &Value, n: i64) -> &'static str {
         } else {
             "many"
         }
-    } else if n == 1 {
+    } else if language.starts_with("ar") {
+        let magnitude = n.unsigned_abs();
+        if magnitude == 0 {
+            "zero"
+        } else if magnitude == 1 {
+            "one"
+        } else if magnitude == 2 {
+            "two"
+        } else if (3..=10).contains(&(magnitude % 100)) {
+            "few"
+        } else if (11..=99).contains(&(magnitude % 100)) {
+            "many"
+        } else {
+            "other"
+        }
+    } else if language.starts_with("fr") || language.starts_with("pt") {
+        if n.unsigned_abs() <= 1 {
+            "one"
+        } else {
+            "other"
+        }
+    } else if n.unsigned_abs() == 1 {
         "one"
     } else {
         "other"
@@ -230,6 +275,29 @@ mod tests {
                 placeholders(&en[key]),
                 "placeholders differ for {key}"
             );
+        }
+        for resource in [ES, AR, FR, PT_BR, DE, IT, TR, FA] {
+            let catalog = parse(resource).unwrap();
+            assert_eq!(
+                catalog.as_object().unwrap().keys().collect::<Vec<_>>(),
+                ru.keys().collect::<Vec<_>>(),
+                "translation keys must match"
+            );
+            for (key, value) in catalog
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(key, _)| *key != "_locale")
+            {
+                let fallback = ru
+                    .get(key)
+                    .unwrap_or_else(|| panic!("unknown translation key {key}"));
+                assert_eq!(
+                    placeholders(value),
+                    placeholders(fallback),
+                    "placeholders differ for {key}"
+                );
+            }
         }
     }
     #[test]
@@ -309,6 +377,62 @@ mod tests {
             en.format("lesson.complete", &FormatArgs::new().count(2)),
             "Completed 2 lessons"
         );
+    }
+    #[test]
+    fn all_embedded_locales_load_and_plural_categories_follow_language_rules() {
+        for locale in [
+            Locale::Ru,
+            Locale::En,
+            Locale::Es,
+            Locale::Ar,
+            Locale::Fr,
+            Locale::PtBr,
+            Locale::De,
+            Locale::It,
+            Locale::Tr,
+            Locale::Fa,
+        ] {
+            let catalog = Catalog::embedded(locale);
+            assert!(catalog.selected.is_object());
+        }
+        let categories = |tag: &str| -> Vec<&'static str> {
+            let value = serde_json::json!({"_locale":tag});
+            [0, 1, 2, 3, 5, 11, 21]
+                .into_iter()
+                .map(|n| plural_category(&value, n))
+                .collect()
+        };
+        assert_eq!(
+            categories("ru"),
+            ["many", "one", "few", "few", "many", "many", "one"]
+        );
+        assert_eq!(
+            categories("ar"),
+            ["zero", "one", "two", "few", "few", "many", "many"]
+        );
+        assert_eq!(
+            categories("fr"),
+            ["one", "one", "other", "other", "other", "other", "other"]
+        );
+        for tag in ["en", "es", "de", "it", "tr", "fa"] {
+            assert_eq!(
+                plural_category(&serde_json::json!({"_locale":tag}), 1),
+                "one"
+            );
+            assert_eq!(
+                plural_category(&serde_json::json!({"_locale":tag}), 2),
+                "other"
+            );
+        }
+        assert_eq!(
+            plural_category(&serde_json::json!({"_locale":"pt-BR"}), 0),
+            "one"
+        );
+        for tag in ["ar", "fr", "pt-BR", "en"] {
+            let locale = serde_json::json!({"_locale":tag});
+            assert_eq!(plural_category(&locale, -1), plural_category(&locale, 1));
+            assert_eq!(plural_category(&locale, -2), plural_category(&locale, 2));
+        }
     }
     #[test]
     fn falls_back_to_russian_key() {

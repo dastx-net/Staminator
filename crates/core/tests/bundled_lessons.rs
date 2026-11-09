@@ -7,7 +7,18 @@ fn bundled_courses_load_in_order_and_can_be_completed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lessons");
     let catalog = load_lesson_catalog(&[root]);
     assert!(catalog.diagnostics.is_empty(), "{:?}", catalog.diagnostics);
-    for (language, prefix, count) in [("en", "ktouch.us.", 15), ("ru", "ktouch.ru1.", 16)] {
+    for (language, prefix, count) in [
+        ("en", "ktouch.us.", 15),
+        ("ru", "ktouch.ru1.", 16),
+        ("es", "ktouch.es1.", 15),
+        ("ar", "ktouch.ara.", 13),
+        ("fr", "ktouch.fr.", 28),
+        ("pt-BR", "ktouch.br.", 11),
+        ("de", "ktouch.de1.", 50),
+        ("it", "ktouch.it.", 60),
+        ("tr", "ktouch.tr.", 15),
+        ("fa", "ktouch.ir.", 13),
+    ] {
         let lessons: Vec<_> = catalog
             .lessons
             .iter()

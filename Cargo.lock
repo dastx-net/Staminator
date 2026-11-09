@@ -186,6 +186,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arabic_reshaper"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb963411bc62b3888e69ad0d821ac03a3176ec7d74c2096bb5555a4cc419545b"
+
+[[package]]
 name = "arboard"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3194,6 +3200,7 @@ name = "staminator-desktop"
 version = "0.1.0"
 dependencies = [
  "accesskit",
+ "arabic_reshaper",
  "chrono",
  "eframe",
  "egui",
@@ -3203,6 +3210,7 @@ dependencies = [
  "serde_json",
  "stamina-data",
  "staminator-core",
+ "unicode-bidi",
  "windows-sys 0.61.2",
 ]
 
@@ -3478,6 +3486,12 @@ dependencies = [
  "tempfile",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "unicode-bidi"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"
 
 [[package]]
 name = "unicode-general-category"

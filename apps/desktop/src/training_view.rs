@@ -7,8 +7,59 @@ use std::{
 
 const TEXT_FONT: &str = "Stamina Text";
 
+// Keep one shaped glyph per input scalar so the training cursor still refers
+// to the original text. Bidi ordering is computed from the unshaped text.
+fn rtl_glyphs(text: &str) -> Option<Vec<(usize, char, bool)>> {
+    if !text
+        .chars()
+        .any(|ch| matches!(ch as u32, 0x0600..=0x06ff | 0x0750..=0x077f | 0x08a0..=0x08ff))
+    {
+        return None;
+    }
+    let mut reshaper = arabic_reshaper::ArabicReshaper::new();
+    reshaper.configuration.insert("support_ligatures", false);
+    reshaper.configuration.insert("delete_harakat", false);
+    let shaped: Vec<char> = reshaper.reshape(text).chars().collect();
+    if shaped.len() != text.chars().count() {
+        return None;
+    }
+    let bidi = unicode_bidi::BidiInfo::new(text, Some(unicode_bidi::Level::rtl()));
+    let mut glyphs = Vec::with_capacity(shaped.len());
+    let mut offset = 0;
+    for para in &bidi.paragraphs {
+        let all_levels = bidi.reordered_levels_per_char(para, para.range.clone());
+        let count = text[para.range.clone()].chars().count();
+        let levels = all_levels.get(offset..offset + count)?;
+        for i in unicode_bidi::BidiInfo::reorder_visual(levels) {
+            let index = offset + i;
+            glyphs.push((index, *shaped.get(index)?, levels[i].is_rtl()));
+        }
+        offset += levels.len();
+    }
+    (glyphs.len() == shaped.len()).then_some(glyphs)
+}
+
 pub fn install_text_font(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
+    if let Some(path) = std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .map(|p| p.join("Fonts").join("segoeui.ttf"))
+        && let Ok(bytes) = fs::read(path)
+    {
+        fonts
+            .font_data
+            .insert("Segoe UI".into(), Arc::new(FontData::from_owned(bytes)));
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, "Segoe UI".into());
+        fonts
+            .families
+            .entry(FontFamily::Monospace)
+            .or_default()
+            .push("Segoe UI".into());
+    }
     let font_path = std::env::var_os("WINDIR")
         .map(PathBuf::from)
         .map(|windir| windir.join("Fonts").join("cour.ttf"));
@@ -91,21 +142,52 @@ pub fn draw_training(
     let baseline = band.center().y;
     let mut x = text_left + scroll;
 
-    for (offset, ch) in text.chars().skip(start).take(visible_count).enumerate() {
-        let index = start + offset;
-        let color = if index < position {
-            Color32::from_rgb(164, 169, 173)
-        } else {
-            Color32::BLACK
-        };
-        text_painter.text(
-            egui::pos2(x, baseline),
-            Align2::LEFT_CENTER,
-            ch,
-            font.clone(),
-            color,
-        );
-        x += advance;
+    let visible: String = text.chars().skip(start).take(visible_count).collect();
+    if let Some(glyphs) = rtl_glyphs(&visible) {
+        let logical_position = position.saturating_sub(start).min(visible.chars().count());
+        let caret = glyphs
+            .iter()
+            .position(|(index, _, _)| *index == logical_position)
+            .map(|i| i as f32 + if glyphs[i].2 { 1.0 } else { 0.0 })
+            .unwrap_or_else(|| {
+                logical_position
+                    .checked_sub(1)
+                    .and_then(|last| glyphs.iter().position(|(index, _, _)| *index == last))
+                    .map_or(0.0, |i| i as f32 + if glyphs[i].2 { 0.0 } else { 1.0 })
+            });
+        x = current_x - caret * advance;
+        for (index, ch, _) in glyphs {
+            let color = if start + index < position {
+                Color32::from_rgb(164, 169, 173)
+            } else {
+                Color32::BLACK
+            };
+            text_painter.text(
+                egui::pos2(x, baseline),
+                Align2::LEFT_CENTER,
+                ch,
+                font.clone(),
+                color,
+            );
+            x += advance;
+        }
+    } else {
+        for (offset, ch) in visible.chars().enumerate() {
+            let index = start + offset;
+            let color = if index < position {
+                Color32::from_rgb(164, 169, 173)
+            } else {
+                Color32::BLACK
+            };
+            text_painter.text(
+                egui::pos2(x, baseline),
+                Align2::LEFT_CENTER,
+                ch,
+                font.clone(),
+                color,
+            );
+            x += advance;
+        }
     }
 
     if !text.is_empty() {
@@ -272,6 +354,14 @@ mod tests {
     }
 
     #[test]
+    fn rtl_training_paints_and_moves_cursor_with_input() {
+        let first = paint("سلام 123", 0, 0, "Default", None);
+        let next = paint("سلام 123", 1, 0, "Default", None);
+        assert_ne!(first, next);
+        assert!(!paint("فارسی", 5, 0, "Default", None).is_empty());
+    }
+
+    #[test]
     fn headless_training_handles_empty_text_and_tiny_viewport() {
         let ctx = Context::default();
         let mut output = ctx.run_ui(
@@ -339,5 +429,22 @@ mod tests {
         assert_eq!(visible_range(100, 50, 10), (45, 55));
         assert_eq!(visible_range(100, 99, 10), (94, 100));
         assert_eq!(visible_range(3, 99, 10), (3, 3));
+    }
+
+    #[test]
+    fn arabic_and_persian_are_shaped_and_reordered_without_losing_input_positions() {
+        for text in ["سلام", "فارسی 123", "سلام\nفارسی 123"] {
+            let glyphs = super::rtl_glyphs(text).unwrap();
+            assert_eq!(glyphs.len(), text.chars().count());
+            let mut indices: Vec<_> = glyphs.iter().map(|g| g.0).collect();
+            indices.sort_unstable();
+            assert_eq!(indices, (0..text.chars().count()).collect::<Vec<_>>());
+            assert!(
+                glyphs
+                    .iter()
+                    .any(|(_, ch, _)| ('\u{fb50}'..='\u{fefc}').contains(ch))
+            );
+        }
+        assert!(super::rtl_glyphs("English").is_none());
     }
 }

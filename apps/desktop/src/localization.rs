@@ -2,17 +2,48 @@ use staminator_core::{Catalog, FormatArgs, Locale};
 use std::{cell::RefCell, error::Error, fmt};
 
 thread_local! {
-    static CATALOGS: RefCell<(Locale, Catalog, Catalog)> = RefCell::new((Locale::Ru, Catalog::embedded(Locale::Ru), Catalog::embedded(Locale::En)));
+    static CATALOGS: RefCell<(Locale, Vec<Catalog>)> = RefCell::new((Locale::Ru, [Locale::Ru, Locale::En, Locale::Es, Locale::Ar, Locale::Fr, Locale::PtBr, Locale::De, Locale::It, Locale::Tr, Locale::Fa].map(Catalog::embedded).into()));
 }
 
 pub fn set_language(language: &str) {
     CATALOGS.with_borrow_mut(|catalogs| {
-        catalogs.0 = if language == "EN" {
-            Locale::En
-        } else {
-            Locale::Ru
-        }
+        catalogs.0 = locale_from_code(language);
     });
+}
+
+fn locale_from_code(language: &str) -> Locale {
+    match language
+        .trim()
+        .replace('_', "-")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "en" => Locale::En,
+        "es" => Locale::Es,
+        "ar" => Locale::Ar,
+        "fr" => Locale::Fr,
+        "pt" | "pt-br" => Locale::PtBr,
+        "de" => Locale::De,
+        "it" => Locale::It,
+        "tr" => Locale::Tr,
+        "fa" => Locale::Fa,
+        _ => Locale::Ru,
+    }
+}
+
+fn locale_index(locale: Locale) -> usize {
+    match locale {
+        Locale::Ru => 0,
+        Locale::En => 1,
+        Locale::Es => 2,
+        Locale::Ar => 3,
+        Locale::Fr => 4,
+        Locale::PtBr => 5,
+        Locale::De => 6,
+        Locale::It => 7,
+        Locale::Tr => 8,
+        Locale::Fa => 9,
+    }
 }
 
 pub fn tr(key: &str) -> String {
@@ -21,17 +52,45 @@ pub fn tr(key: &str) -> String {
 
 pub fn format(key: &str, args: &FormatArgs) -> String {
     CATALOGS.with_borrow_mut(|catalogs| {
-        let catalog = if catalogs.0 == Locale::En {
-            &mut catalogs.2
-        } else {
-            &mut catalogs.1
-        };
+        let index = locale_index(catalogs.0);
+        let catalog = &mut catalogs.1[index];
         let result = catalog.format(key, args);
         for diagnostic in catalog.take_diagnostics() {
             eprintln!("Localization: {diagnostic:?}");
         }
-        result
+        visual_text(&result)
     })
+}
+
+/// Prepare Arabic-script text for egui's left-to-right, unshaped text painter.
+pub fn visual_text(text: &str) -> String {
+    if !text
+        .chars()
+        .any(|ch| matches!(ch as u32, 0x0600..=0x06ff | 0x0750..=0x077f | 0x08a0..=0x08ff))
+    {
+        return text.to_owned();
+    }
+    let mut reshaper = arabic_reshaper::ArabicReshaper::new();
+    reshaper.configuration.insert("delete_harakat", false);
+    let shaped = reshaper.reshape(text);
+    shaped
+        .split_inclusive(['\n', '\r', '\u{2029}'])
+        .map(|line| {
+            let separator = line
+                .chars()
+                .last()
+                .filter(|c| matches!(c, '\n' | '\r' | '\u{2029}'));
+            let body = separator.map_or(line, |c| line.strip_suffix(c).unwrap_or(line));
+            let bidi = unicode_bidi::BidiInfo::new(body, Some(unicode_bidi::Level::rtl()));
+            let mut visual = bidi.paragraphs.first().map_or_else(String::new, |p| {
+                bidi.reorder_line(p, p.range.clone()).into_owned()
+            });
+            if let Some(separator) = separator {
+                visual.push(separator);
+            }
+            visual
+        })
+        .collect()
 }
 
 pub fn storage_error(error: &stamina_data::storage::StorageError) -> String {
@@ -129,6 +188,38 @@ pub fn lesson_write_error(error: &stamina_data::LessonWriteError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn language_codes_select_all_supported_locales_and_default_to_russian() {
+        for (code, locale) in [
+            ("ru", Locale::Ru),
+            ("EN", Locale::En),
+            ("es", Locale::Es),
+            ("ar", Locale::Ar),
+            ("fr", Locale::Fr),
+            ("pt-BR", Locale::PtBr),
+            ("de", Locale::De),
+            ("it", Locale::It),
+            ("tr", Locale::Tr),
+            ("fa", Locale::Fa),
+        ] {
+            assert_eq!(locale_from_code(code), locale);
+        }
+        assert_eq!(locale_from_code("pt_BR"), Locale::PtBr);
+        assert_eq!(locale_from_code("pt"), Locale::PtBr);
+        assert_eq!(locale_from_code("unknown"), Locale::Ru);
+    }
+
+    #[test]
+    fn visual_text_shapes_arabic_without_losing_other_lines() {
+        assert_eq!(visual_text("English 123"), "English 123");
+        let text = visual_text("سلام 123\rEnglish\u{2029}فارسی");
+        assert!(text.contains('\r'));
+        assert!(text.contains('\u{2029}'));
+        assert!(text.contains("123"));
+        assert!(text.contains("English"));
+        assert!(text.chars().any(|c| ('\u{fb50}'..='\u{fefc}').contains(&c)));
+    }
 
     #[test]
     fn lesson_errors_translate_typed_details_without_parsing_messages() {

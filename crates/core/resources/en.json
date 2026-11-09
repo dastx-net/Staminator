@@ -87,7 +87,7 @@
   "content_editor.lesson_title": "Lesson editor",
   "content_editor.lesson_id": "Lesson ID (for new lessons: Latin letters, digits, - or _)",
   "content_editor.lesson_name": "Name",
-  "content_editor.language": "Language (ru or en)",
+  "content_editor.language": "Language (for example, ru, en or pt-BR)",
   "content_editor.description": "Description",
   "content_editor.exercise_text": "Exercise text",
   "content_editor.generated_symbols": "Symbols to use for generation (1–4)",
@@ -126,7 +126,7 @@
   "lesson.export_error": "Could not export lesson: {error}",
   "lesson.builtin_edit": "Built-in lessons cannot be edited; create your own lesson",
   "lesson.choose_first": "Choose a lesson",
-  "lesson.language_error": "Only Russian or English lessons are supported",
+  "lesson.language_error": "This lesson language is not supported",
   "lesson.id_change_error": "Changing a lesson ID is not supported",
   "lesson.builtin_error": "Built-in lessons cannot be edited",
   "lesson.id_exists": "A lesson with this ID already exists",
@@ -248,5 +248,7 @@
   "background.tile": "Tile",
   "background.dim": "Darkening",
   "background.error": "Cannot load background",
-  "background.builtin": "Default pixel art"
+  "background.builtin": "Default pixel art",
+  "keyboard.unsupported_layout": "The on-screen keyboard for this language is not available yet. Use a system keyboard layout.",
+  "language.partial_translation": "This translation is incomplete; missing text is shown in Russian."
 }

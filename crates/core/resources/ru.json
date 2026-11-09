@@ -91,7 +91,7 @@
   "content_editor.lesson_title": "Редактор урока",
   "content_editor.lesson_id": "ID урока (для нового: латинские буквы, цифры, - или _)",
   "content_editor.lesson_name": "Название",
-  "content_editor.language": "Язык (ru или en)",
+  "content_editor.language": "Язык (например, ru, en или pt-BR)",
   "content_editor.description": "Описание",
   "content_editor.exercise_text": "Текст упражнения",
   "content_editor.generated_symbols": "Символы для генерации (1–4)",
@@ -130,7 +130,7 @@
   "lesson.export_error": "Не удалось экспортировать урок: {error}",
   "lesson.builtin_edit": "Встроенный урок нельзя изменить; создайте свой урок",
   "lesson.choose_first": "Выберите урок",
-  "lesson.language_error": "Доступны только уроки на русском или английском языке",
+  "lesson.language_error": "Этот язык уроков не поддерживается",
   "lesson.id_change_error": "Изменение ID урока не поддерживается",
   "lesson.builtin_error": "Встроенный урок нельзя изменить",
   "lesson.id_exists": "Урок с таким ID уже существует",
@@ -252,5 +252,7 @@
   "background.tile": "Замостить",
   "background.dim": "Затемнение",
   "background.error": "Не удалось загрузить фон",
-  "background.builtin": "Стандартный пиксель-арт"
+  "background.builtin": "Стандартный пиксель-арт",
+  "keyboard.unsupported_layout": "Экранная клавиатура для этого языка пока недоступна. Используйте системную раскладку.",
+  "language.partial_translation": "Перевод неполный: недостающие строки показаны по-русски."
 }
