@@ -1,5 +1,6 @@
 //! Safe file transfer helpers for database backups and standalone lessons.
 use std::{
+    collections::BTreeMap,
     error::Error,
     fmt, fs, io,
     path::{Path, PathBuf},
@@ -107,6 +108,7 @@ fn validate_profile(profile: &Profile) -> Result<(), TransferError> {
 }
 
 /// Import one UTF-8 JSON profile while retaining its ID and complete result history.
+#[cfg(test)]
 pub fn import_profile_json(path: impl AsRef<Path>) -> Result<Profile, TransferError> {
     let bytes = fs::read(path)?;
     let source = std::str::from_utf8(&bytes).map_err(|error| {
@@ -121,6 +123,7 @@ pub fn import_profile_json(path: impl AsRef<Path>) -> Result<Profile, TransferEr
 }
 
 /// Export a validated profile and all its result history as UTF-8 JSON without replacement.
+#[cfg(test)]
 pub fn export_profile_json(
     profile: &Profile,
     destination: impl AsRef<Path>,
@@ -140,6 +143,92 @@ pub fn export_profile_json(
     }
     Ok(path.to_owned())
 }
+
+/// Import a profile export and its optional stable window scales. Older files
+/// without `window_scales` remain valid and use the default scale per window.
+pub fn import_profile_json_with_window_scales(
+    path: impl AsRef<Path>,
+) -> Result<(Profile, BTreeMap<String, f32>), TransferError> {
+    let bytes = fs::read(path)?;
+    let source = std::str::from_utf8(&bytes).map_err(|error| {
+        TransferError::InvalidProfile(localization::format(
+            "transfer.invalid_utf8",
+            &FormatArgs::new().insert("offset", error.valid_up_to()),
+        ))
+    })?;
+    let value: serde_json::Value = serde_json::from_str(source)?;
+    let profile: Profile = serde_json::from_value(value.clone())?;
+    validate_profile(&profile)?;
+    let scales = parse_window_scales(value.get("window_scales"))?;
+    Ok((profile, scales))
+}
+
+/// Export a profile with its per-window scales in the same JSON object.
+pub fn export_profile_json_with_window_scales(
+    profile: &Profile,
+    window_scales: &BTreeMap<String, f32>,
+    destination: impl AsRef<Path>,
+) -> Result<PathBuf, TransferError> {
+    validate_profile(profile)?;
+    validate_window_scales(window_scales)?;
+    let mut value = serde_json::to_value(profile)?;
+    value
+        .as_object_mut()
+        .expect("profile serializes as an object")
+        .insert("window_scales".into(), serde_json::to_value(window_scales)?);
+    write_json_without_overwrite(&value, destination)
+}
+
+fn parse_window_scales(
+    value: Option<&serde_json::Value>,
+) -> Result<BTreeMap<String, f32>, TransferError> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    let entries = value
+        .as_object()
+        .ok_or_else(|| TransferError::InvalidProfile("window_scales must be an object".into()))?;
+    let mut scales = BTreeMap::new();
+    for (id, value) in entries {
+        let scale = value.as_f64().map(|value| value as f32).ok_or_else(|| {
+            TransferError::InvalidProfile(format!("invalid scale for window {id}"))
+        })?;
+        scales.insert(id.clone(), scale);
+    }
+    validate_window_scales(&scales)?;
+    Ok(scales)
+}
+
+fn validate_window_scales(scales: &BTreeMap<String, f32>) -> Result<(), TransferError> {
+    for (id, scale) in scales {
+        if id.trim().is_empty() || !scale.is_finite() || !(0.5..=3.0).contains(scale) {
+            return Err(TransferError::InvalidProfile(format!(
+                "invalid scale for window {id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn write_json_without_overwrite(
+    value: &serde_json::Value,
+    destination: impl AsRef<Path>,
+) -> Result<PathBuf, TransferError> {
+    let bytes = serde_json::to_vec_pretty(value)?;
+    let path = destination.as_ref();
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    use std::io::Write;
+    if let Err(error) = file.write_all(&bytes).and_then(|()| file.write_all(b"\n")) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(error.into());
+    }
+    Ok(path.to_owned())
+}
+
 impl Error for TransferError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
@@ -402,6 +491,134 @@ mod tests {
         assert!(bytes.ends_with(b"\n"));
         assert!(std::str::from_utf8(&bytes).is_ok());
         assert_eq!(import_profile_json(&path).unwrap(), expected);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn profile_export_import_round_trips_window_scales_through_sqlite_settings() {
+        let root = dir();
+        let source_path = root.join("source.db");
+        let mut source = Database::open(&source_path).unwrap();
+        source
+            .save_snapshot(&stamina_data::storage::Snapshot {
+                profiles: vec![profile()],
+                active_profile_id: "profile-7".into(),
+            })
+            .unwrap();
+        let expected_scales = BTreeMap::from([
+            ("main".to_owned(), 0.5),
+            ("keyboard".to_owned(), 1.75),
+            ("hands".to_owned(), 3.0),
+        ]);
+        for (id, scale) in &expected_scales {
+            source
+                .set_setting(
+                    "profile-7",
+                    &format!("window_scale:{id}"),
+                    &serde_json::to_string(scale).unwrap(),
+                )
+                .unwrap();
+        }
+        let exported_scales: BTreeMap<String, f32> = ["main", "keyboard", "hands"]
+            .into_iter()
+            .filter_map(|id| {
+                source
+                    .get_setting("profile-7", &format!("window_scale:{id}"))
+                    .unwrap()
+                    .map(|value| (id.to_owned(), serde_json::from_str(&value).unwrap()))
+            })
+            .collect();
+        let export = root.join("profile.json");
+        export_profile_json_with_window_scales(&profile(), &exported_scales, &export).unwrap();
+        let (imported_profile, imported_scales) =
+            import_profile_json_with_window_scales(&export).unwrap();
+        assert_eq!(imported_profile, profile());
+        assert_eq!(imported_scales, expected_scales);
+
+        let destination_path = root.join("destination.db");
+        let mut destination = Database::open(&destination_path).unwrap();
+        destination
+            .save_snapshot(&stamina_data::storage::Snapshot {
+                profiles: vec![imported_profile],
+                active_profile_id: "profile-7".into(),
+            })
+            .unwrap();
+        for (id, scale) in &imported_scales {
+            destination
+                .set_setting(
+                    "profile-7",
+                    &format!("window_scale:{id}"),
+                    &serde_json::to_string(scale).unwrap(),
+                )
+                .unwrap();
+        }
+        let restored_scales: BTreeMap<String, f32> = ["main", "keyboard", "hands"]
+            .into_iter()
+            .filter_map(|id| {
+                destination
+                    .get_setting("profile-7", &format!("window_scale:{id}"))
+                    .unwrap()
+                    .map(|value| (id.to_owned(), serde_json::from_str(&value).unwrap()))
+            })
+            .collect();
+        assert_eq!(restored_scales, expected_scales);
+        drop(source);
+        drop(destination);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scale_profile_transfer_rejects_invalid_input_and_preserves_existing_file() {
+        let root = dir();
+        let invalid_utf8 = root.join("invalid-utf8.json");
+        fs::write(&invalid_utf8, [0xff]).unwrap();
+        assert!(matches!(
+            import_profile_json_with_window_scales(&invalid_utf8),
+            Err(TransferError::InvalidProfile(_))
+        ));
+        let occupied = root.join("occupied.json");
+        fs::write(&occupied, b"existing").unwrap();
+        assert!(
+            export_profile_json_with_window_scales(&profile(), &BTreeMap::new(), &occupied)
+                .is_err()
+        );
+        assert_eq!(fs::read(&occupied).unwrap(), b"existing");
+        let invalid_scales = BTreeMap::from([("main".into(), f32::NAN)]);
+        let output = root.join("invalid-scale.json");
+        assert!(
+            export_profile_json_with_window_scales(&profile(), &invalid_scales, &output).is_err()
+        );
+        assert!(!output.exists());
+        let mut value = serde_json::to_value(profile()).unwrap();
+        value["window_scales"] = serde_json::json!({"main": "large"});
+        fs::write(&output, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(matches!(
+            import_profile_json_with_window_scales(&output),
+            Err(TransferError::InvalidProfile(_))
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn window_scale_import_accepts_legacy_files_and_rejects_invalid_scales() {
+        let root = dir();
+        let legacy = root.join("legacy-profile.json");
+        fs::write(&legacy, serde_json::to_vec(&profile()).unwrap()).unwrap();
+        assert!(
+            import_profile_json_with_window_scales(&legacy)
+                .unwrap()
+                .1
+                .is_empty()
+        );
+
+        let invalid = root.join("invalid-scale-profile.json");
+        let mut value = serde_json::to_value(profile()).unwrap();
+        value["window_scales"] = serde_json::json!({"main": 3.1});
+        fs::write(&invalid, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(matches!(
+            import_profile_json_with_window_scales(&invalid),
+            Err(TransferError::InvalidProfile(_))
+        ));
         let _ = fs::remove_dir_all(root);
     }
 

@@ -96,7 +96,7 @@ pub fn draw_training(
     elapsed_ms: u64,
     profile_name: &str,
     prompt: Option<&str>,
-    background: Option<(&egui::TextureHandle, &str, u8)>,
+    (background, scale): (Option<(&egui::TextureHandle, &str, u8)>, f32),
 ) {
     let rect = ui.max_rect();
     let painter = ui.painter().with_clip_rect(rect);
@@ -106,7 +106,7 @@ pub fn draw_training(
         crate::background::paint(ui, rect, texture, mode, darkness);
     }
 
-    let band_height = 100.0_f32.min(rect.height().max(1.0));
+    let band_height = (100.0 * scale).min(rect.height().max(1.0));
     let band = Rect::from_center_size(
         rect.center(),
         Vec2::new((rect.width() - 20.0).max(0.0), band_height),
@@ -119,7 +119,7 @@ pub fn draw_training(
         egui::StrokeKind::Inside,
     );
 
-    let font_size = (band_height * 0.55).clamp(28.0, 58.0);
+    let font_size = (band_height * 0.55).min(58.0 * scale);
     let font = FontId::new(font_size, FontFamily::Name(TEXT_FONT.into()));
     // Measure the chosen font so the painted glyphs and fixed cursor position
     // stay aligned when the window or system font changes.
@@ -207,7 +207,7 @@ pub fn draw_training(
             band.center(),
             Align2::CENTER_CENTER,
             prompt,
-            FontId::proportional(24.0),
+            FontId::proportional(24.0 * scale),
             Color32::from_rgb(62, 72, 80),
         );
     }
@@ -330,7 +330,7 @@ mod tests {
                 )),
                 ..Default::default()
             },
-            |ui| draw_training(ui, text, position, elapsed_ms, profile, prompt, None),
+            |ui| draw_training(ui, text, position, elapsed_ms, profile, prompt, (None, 1.0)),
         );
         assert!(matches!(
             output.shapes.first().map(|clipped| &clipped.shape),
@@ -369,10 +369,88 @@ mod tests {
                 screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1.0, 1.0))),
                 ..Default::default()
             },
-            |ui| draw_training(ui, "", usize::MAX, 999, "", Some(""), None),
+            |ui| draw_training(ui, "", usize::MAX, 999, "", Some(""), (None, 1.0)),
         );
         output.textures_delta.clear();
         assert!(!output.shapes.is_empty());
+    }
+
+    fn painted_band(viewport: Vec2, scale: f32) -> Rect {
+        let ctx = Context::default();
+        let mut output = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, viewport)),
+                ..Default::default()
+            },
+            |ui| draw_training(ui, "", 0, 0, "", None, (None, scale)),
+        );
+        let band = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(rect) if rect.fill == egui::Color32::from_rgb(232, 235, 237) => {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("training band should be painted");
+        output.textures_delta.clear();
+        band
+    }
+
+    #[test]
+    fn training_band_scales_and_stays_centered() {
+        for (scale, expected_height) in [(0.5, 50.0), (2.0, 200.0), (3.0, 300.0)] {
+            let band = painted_band(Vec2::new(800.0, 400.0), scale);
+            assert_eq!(band.height(), expected_height, "scale {scale}");
+            assert_eq!(band.center(), egui::pos2(400.0, 200.0));
+            assert_eq!(band.width(), 780.0);
+        }
+    }
+
+    #[test]
+    fn caret_fits_in_short_training_band_at_high_scale() {
+        let ctx = Context::default();
+        let mut output = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(800.0, 40.0),
+                )),
+                ..Default::default()
+            },
+            |ui| draw_training(ui, "test", 0, 0, "", None, (None, 3.0)),
+        );
+        let caret = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::LineSegment { points, stroke }
+                    if stroke.color == egui::Color32::from_rgb(24, 28, 31) =>
+                {
+                    Some(*points)
+                }
+                _ => None,
+            })
+            .expect("training caret");
+        assert!(caret[0].y >= 0.0 && caret[1].y <= 40.0);
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn training_band_is_clamped_to_constrained_viewports() {
+        for (viewport, scale, expected_size) in [
+            (Vec2::new(800.0, 40.0), 3.0, Vec2::new(780.0, 40.0)),
+            (Vec2::new(12.0, 160.0), 2.0, Vec2::new(0.0, 160.0)),
+            (Vec2::new(1.0, 1.0), 3.0, Vec2::new(0.0, 1.0)),
+        ] {
+            let band = painted_band(viewport, scale);
+            assert_eq!(band.size(), expected_size);
+            assert_eq!(
+                band.center(),
+                Rect::from_min_size(egui::Pos2::ZERO, viewport).center()
+            );
+        }
     }
 
     #[test]
@@ -409,7 +487,7 @@ mod tests {
                     3_661_000,
                     "Profile",
                     Some("Paused"),
-                    Some((&texture, "fill", 120)),
+                    (Some((&texture, "fill", 120)), 1.0),
                 )
             },
         );

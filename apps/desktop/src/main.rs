@@ -9,6 +9,7 @@ mod lesson_generator;
 mod localization;
 mod progress_view;
 mod result_view;
+mod scaling;
 mod sound;
 mod storage_transfer;
 mod training_view;
@@ -207,6 +208,46 @@ struct KeyboardInputQueue {
     events: Vec<egui::Event>,
     close_requested: bool,
     viewport: Option<(egui::ViewportInfo, egui::Vec2)>,
+    scale_actions: Vec<scaling::ScaleAction>,
+}
+
+fn take_scale_actions(ctx: &egui::Context) -> Vec<scaling::ScaleAction> {
+    ctx.input_mut(|input| {
+        let mut actions = Vec::new();
+        if input.viewport().focused == Some(false) {
+            return actions;
+        }
+        let has_shortcut = input.events.iter().any(|event| {
+            matches!(event, egui::Event::Key { .. }) && scaling::shortcut_action(event).is_some()
+        });
+        input.events.retain(|event| {
+            if let Some(action) = scaling::shortcut_action(event) {
+                actions.push(action);
+                false
+            } else {
+                !(has_shortcut
+                    && matches!(
+                        event,
+                        egui::Event::Text(_) | egui::Event::Ime(egui::ImeEvent::Commit(_))
+                    ))
+            }
+        });
+        if !actions.is_empty() {
+            input.smooth_scroll_delta = egui::Vec2::ZERO;
+        }
+        actions
+    })
+}
+
+fn scaled_content(ui: &mut egui::Ui, scale: f32, add: impl FnOnce(&mut egui::Ui)) {
+    let size = ui.available_size().max(egui::vec2(1.0, 1.0)) * scale;
+    egui::ScrollArea::both().show(ui, |ui| {
+        ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_min_size(size);
+            ui.set_max_size(size);
+            add(ui);
+        });
+    });
 }
 
 fn queue_keyboard_input(
@@ -389,10 +430,12 @@ struct StaminatorApp {
     show_keyboard: bool,
     show_hands: bool,
     hands_input: Arc<Mutex<KeyboardInputQueue>>,
-    last_hands_state: Option<(keyboard::KeyboardLayout, Option<char>, bool)>,
+    last_hands_state: Option<(keyboard::KeyboardLayout, Option<char>, bool, u32)>,
     window_placement: Option<WindowPlacementState>,
     keyboard_input: Arc<Mutex<KeyboardInputQueue>>,
-    last_keyboard_state: Option<(keyboard::KeyboardLayout, Option<char>)>,
+    last_keyboard_state: Option<(keyboard::KeyboardLayout, Option<char>, u32)>,
+    scale_profile_id: String,
+    window_scales: [f32; 3],
     keyboard_setting_path: Option<PathBuf>,
     result_open: bool,
     result_completed: bool,
@@ -771,6 +814,8 @@ impl StaminatorApp {
         }
     }
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        cc.egui_ctx
+            .options_mut(|options| options.zoom_with_keyboard = false);
         training_view::install_text_font(&cc.egui_ctx);
         let keyboard_setting_path = keyboard_setting_path();
         let mut show_keyboard = load_keyboard_setting_from(keyboard_setting_path.as_deref());
@@ -900,6 +945,8 @@ impl StaminatorApp {
             window_placement: None,
             keyboard_input: Arc::default(),
             last_keyboard_state: None,
+            scale_profile_id: String::new(),
+            window_scales: [1.0; 3],
             keyboard_setting_path,
             result_open: false,
             result_completed: false,
@@ -2169,11 +2216,20 @@ impl StaminatorApp {
         if !self.save_before_switch() || !self.flush_window_placement() {
             return Err(self.profile_error.clone());
         }
-        let profile = storage_transfer::import_profile_json(path).map_err(|e| e.to_string())?;
-        let value = serde_json::to_value(profile).map_err(|e| e.to_string())?;
-        self.users
-            .import_profile(serde_json::from_value(value).map_err(|e| e.to_string())?)
+        let (profile, scales) = storage_transfer::import_profile_json_with_window_scales(path)
             .map_err(|e| e.to_string())?;
+        let value = serde_json::to_value(profile).map_err(|e| e.to_string())?;
+        let mut profile: user_store::Profile =
+            serde_json::from_value(value).map_err(|e| e.to_string())?;
+        profile.window_scales = scales.clone();
+        self.users
+            .import_profile(profile)
+            .map_err(|e| e.to_string())?;
+        for (id, scale) in scales {
+            self.users
+                .set_window_scale(&id, scale)
+                .map_err(|e| e.to_string())?;
+        }
         self.session = None;
         self.last_result = None;
         self.result_open = false;
@@ -2191,7 +2247,15 @@ impl StaminatorApp {
             .ok_or_else(|| localization::tr("profile.unselected"))?;
         let value = serde_json::to_value(profile).map_err(|e| e.to_string())?;
         let profile = serde_json::from_value(value).map_err(|e| e.to_string())?;
-        storage_transfer::export_profile_json(&profile, path).map_err(|e| e.to_string())?;
+        let mut scales = std::collections::BTreeMap::new();
+        for id in [MAIN_WINDOW, KEYBOARD_WINDOW, HANDS_WINDOW] {
+            let scale = self.users.window_scale(id).map_err(|e| e.to_string())?;
+            if scale != 1.0 {
+                scales.insert(id.to_owned(), scale);
+            }
+        }
+        storage_transfer::export_profile_json_with_window_scales(&profile, &scales, path)
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -2201,6 +2265,7 @@ impl StaminatorApp {
         }
         let safety = self.users.restore_backup(path).map_err(|e| e.to_string())?;
         self.window_placement = None;
+        self.scale_profile_id.clear();
         self.sync_profile_language();
         self.sync_profile_training();
         self.session = None;
@@ -2350,7 +2415,62 @@ impl StaminatorApp {
 }
 
 impl StaminatorApp {
+    fn apply_scale_actions(&mut self, id: &str, actions: Vec<scaling::ScaleAction>) {
+        if actions.is_empty() {
+            return;
+        }
+        match self.users.window_scale(id) {
+            Ok(mut scale) => {
+                for action in actions {
+                    scale = scaling::apply_action(scale, action);
+                }
+                if let Err(error) = self.users.set_window_scale(id, scale) {
+                    self.profile_error = localized_error("settings.save_error", error);
+                } else if self.scale_profile_id == self.users.active_profile_id() {
+                    let index = if id == MAIN_WINDOW {
+                        0
+                    } else if id == KEYBOARD_WINDOW {
+                        1
+                    } else {
+                        2
+                    };
+                    self.window_scales[index] = scale;
+                }
+            }
+            Err(error) => self.profile_error = localized_error("settings.load_error", error),
+        }
+    }
+
     fn draw(&mut self, root: &mut egui::Ui) {
+        root.ctx()
+            .options_mut(|options| options.zoom_with_keyboard = false);
+        if self.scale_profile_id != self.users.active_profile_id() {
+            self.scale_profile_id = self.users.active_profile_id().to_owned();
+            self.window_scales = [MAIN_WINDOW, KEYBOARD_WINDOW, HANDS_WINDOW]
+                .map(|id| self.users.window_scale(id).unwrap_or(1.0));
+        }
+        self.apply_scale_actions(MAIN_WINDOW, take_scale_actions(root.ctx()));
+        for (id, queue) in [
+            (KEYBOARD_WINDOW, Arc::clone(&self.keyboard_input)),
+            (HANDS_WINDOW, Arc::clone(&self.hands_input)),
+        ] {
+            let actions = std::mem::take(
+                &mut queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .scale_actions,
+            );
+            if !actions.is_empty() {
+                root.ctx()
+                    .request_repaint_of(egui::ViewportId::from_hash_of(if id == KEYBOARD_WINDOW {
+                        "keyboard-window"
+                    } else {
+                        "hands-window"
+                    }));
+            }
+            self.apply_scale_actions(id, actions);
+        }
+        let [main_scale, keyboard_scale, hands_scale] = self.window_scales;
         localization::set_language(
             self.users
                 .active_profile()
@@ -2809,13 +2929,17 @@ impl StaminatorApp {
                         _ => None,
                     }
                     .as_deref(),
-                    self.background_texture.as_ref().map(|texture| {
-                        (
-                            texture,
-                            background_mode(background_settings.placement),
-                            (u16::from(background_settings.dim_percent.min(100)) * 255 / 100) as u8,
-                        )
-                    }),
+                    (
+                        self.background_texture.as_ref().map(|texture| {
+                            (
+                                texture,
+                                background_mode(background_settings.placement),
+                                (u16::from(background_settings.dim_percent.min(100)) * 255 / 100)
+                                    as u8,
+                            )
+                        }),
+                        main_scale,
+                    ),
                 );
             });
 
@@ -2855,7 +2979,7 @@ impl StaminatorApp {
             } else {
                 keyboard::KeyboardLayout::Russian
             };
-            let state = (layout, next_char);
+            let state = (layout, next_char, keyboard_scale.to_bits());
             if self.last_keyboard_state != Some(state) {
                 root.ctx().request_repaint_of(viewport_id);
                 self.last_keyboard_state = Some(state);
@@ -2869,6 +2993,15 @@ impl StaminatorApp {
             root.ctx()
                 .show_viewport_deferred(viewport_id, builder, move |ui, _class| {
                     let ctx = ui.ctx();
+                    let actions = take_scale_actions(ctx);
+                    if !actions.is_empty() {
+                        input_queue
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .scale_actions
+                            .extend(actions);
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    }
                     let events = ctx.input(|input| input.events.clone());
                     let close_requested = ctx.input(|input| input.viewport().close_requested());
                     let snapshot =
@@ -2883,7 +3016,9 @@ impl StaminatorApp {
                             ui.label(&unsupported_message);
                         });
                     } else {
-                        keyboard::draw_keyboard(ui, layout, next_char);
+                        scaled_content(ui, keyboard_scale, |ui| {
+                            keyboard::draw_keyboard(ui, layout, next_char)
+                        });
                     }
                 });
         } else {
@@ -2932,7 +3067,7 @@ impl StaminatorApp {
             let fingers =
                 keyboard::active_fingers(layout, if unsupported { None } else { next_char });
             let queue = Arc::clone(&self.hands_input);
-            let state = (layout, next_char, unsupported);
+            let state = (layout, next_char, unsupported, hands_scale.to_bits());
             if self.last_hands_state != Some(state) {
                 root.ctx().request_repaint_of(id);
                 self.last_hands_state = Some(state);
@@ -2940,6 +3075,15 @@ impl StaminatorApp {
             root.ctx()
                 .show_viewport_deferred(id, builder, move |ui, _| {
                     let ctx = ui.ctx();
+                    let actions = take_scale_actions(ctx);
+                    if !actions.is_empty() {
+                        queue
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .scale_actions
+                            .extend(actions);
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    }
                     let (events, close, snapshot) = ctx.input(|i| {
                         (
                             i.events.clone(),
@@ -2952,7 +3096,7 @@ impl StaminatorApp {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .viewport = Some(snapshot);
                     queue_keyboard_input(&queue, ctx, events, close);
-                    hands::draw_hands(ui, &fingers);
+                    scaled_content(ui, hands_scale, |ui| hands::draw_hands(ui, &fingers));
                 });
         } else {
             self.last_hands_state = None;
@@ -3795,6 +3939,267 @@ mod tests {
         app.external_path = Some(PathBuf::from("example.txt"));
         app.external_text = "ab".into();
         app
+    }
+
+    #[test]
+    fn scaling_shortcut_does_not_enter_session_and_is_profile_scoped() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.start();
+        let ctx = egui::Context::default();
+        let event = egui::Event::Key {
+            key: egui::Key::Equals,
+            physical_key: Some(egui::Key::Equals),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        };
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![event, egui::Event::Text("+".into())],
+                ..Default::default()
+            },
+            |ui| {
+                let actions = take_scale_actions(ui.ctx());
+                app.apply_scale_actions(MAIN_WINDOW, actions);
+                app.handle_input_events(ui.ctx(), ui.ctx().input(|i| i.events.clone()));
+            },
+        );
+        output.textures_delta.clear();
+        assert_eq!(app.users.window_scale(MAIN_WINDOW).unwrap(), 1.1);
+        assert_eq!(app.users.window_scale(KEYBOARD_WINDOW).unwrap(), 1.0);
+        assert_eq!(app.session.as_ref().unwrap().retained_position(), 0);
+        assert_eq!(
+            app.session.as_ref().unwrap().stats_at(app.now_ms()).errors,
+            0
+        );
+        let first = app.users.active_profile_id().to_owned();
+        let second = app.users.create("Second").unwrap().id.clone();
+        app.users.select(&second).unwrap();
+        assert_eq!(app.users.window_scale(MAIN_WINDOW).unwrap(), 1.0);
+        app.apply_scale_actions(KEYBOARD_WINDOW, vec![scaling::ScaleAction::Decrease]);
+        app.users.select(&first).unwrap();
+        assert_eq!(app.users.window_scale(MAIN_WINDOW).unwrap(), 1.1);
+        drop(app);
+        let reopened = UserStore::load_from(&path).unwrap();
+        assert_eq!(reopened.window_scale(MAIN_WINDOW).unwrap(), 1.1);
+        fs::remove_file(path).unwrap();
+    }
+
+    fn scale_wheel() -> egui::Event {
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, 1.0),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: egui::Modifiers::CTRL,
+        }
+    }
+
+    #[test]
+    fn scale_input_respects_focus_and_preserves_typing_with_wheel() {
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput {
+            events: vec![scale_wheel(), egui::Event::Text("a".into())],
+            ..Default::default()
+        };
+        raw.viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .focused = Some(false);
+        let mut output = ctx.run_ui(raw, |ui| {
+            assert!(take_scale_actions(ui.ctx()).is_empty());
+            assert_eq!(ui.ctx().input(|i| i.events.len()), 2);
+        });
+        output.textures_delta.clear();
+        let mut raw = egui::RawInput {
+            events: vec![scale_wheel(), egui::Event::Text("a".into())],
+            ..Default::default()
+        };
+        raw.viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .focused = Some(true);
+        let mut output = ctx.run_ui(raw, |ui| {
+            assert_eq!(
+                take_scale_actions(ui.ctx()),
+                vec![scaling::ScaleAction::Increase]
+            );
+            ui.ctx().input(|i| {
+                assert_eq!(i.smooth_scroll_delta, egui::Vec2::ZERO);
+                assert!(i.events.contains(&egui::Event::Text("a".into())));
+            });
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn deferred_scale_actions_follow_window_and_active_profile() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        let first = app.users.active_profile_id().to_owned();
+        let ctx = egui::Context::default();
+        app.keyboard_input
+            .lock()
+            .unwrap()
+            .scale_actions
+            .push(scaling::ScaleAction::Increase);
+        app.hands_input
+            .lock()
+            .unwrap()
+            .scale_actions
+            .push(scaling::ScaleAction::Decrease);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
+        output.textures_delta.clear();
+        assert_eq!(app.window_scales, [1.0, 1.1, 0.9]);
+        assert_eq!(app.users.window_scale(KEYBOARD_WINDOW).unwrap(), 1.1);
+        assert_eq!(app.users.window_scale(HANDS_WINDOW).unwrap(), 0.9);
+        let second = app.users.create("Other").unwrap().id.clone();
+        app.users.select(&second).unwrap();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
+        output.textures_delta.clear();
+        assert_eq!(app.window_scales, [1.0; 3]);
+        app.users.select(&first).unwrap();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
+        output.textures_delta.clear();
+        assert_eq!(app.window_scales, [1.0, 1.1, 0.9]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn real_deferred_viewports_apply_shortcuts_without_typing_errors() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.show_keyboard = true;
+        app.show_hands = true;
+        app.start();
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let mut root = ctx.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
+        for name in ["keyboard-window", "hands-window"] {
+            let id = egui::ViewportId::from_hash_of(name);
+            let callback = root
+                .viewport_output
+                .get(&id)
+                .unwrap()
+                .viewport_ui_cb
+                .clone()
+                .unwrap();
+            let mut input = egui::RawInput {
+                viewport_id: id,
+                events: vec![scale_wheel()],
+                ..Default::default()
+            };
+            input.viewports.insert(
+                id,
+                egui::ViewportInfo {
+                    focused: Some(true),
+                    ..Default::default()
+                },
+            );
+            let mut result = ctx.run_ui(input, |ui| callback(ui));
+            result.textures_delta.clear();
+        }
+        root.textures_delta.clear();
+        let mut root = ctx.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
+        root.textures_delta.clear();
+        assert_eq!(app.users.window_scale(KEYBOARD_WINDOW).unwrap(), 1.1);
+        assert_eq!(app.users.window_scale(HANDS_WINDOW).unwrap(), 1.1);
+        assert_eq!(
+            app.session.as_ref().unwrap().stats_at(app.now_ms()).errors,
+            0
+        );
+        assert_eq!(app.session.as_ref().unwrap().retained_position(), 0);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unsupported_lesson_layout_still_accepts_keyboard_window_scaling() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.selected_mode = TrainingMode::Lessons;
+        app.content_language = ContentLanguage::French;
+        app.show_keyboard = true;
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let id = egui::ViewportId::from_hash_of("keyboard-window");
+        let mut root = ctx.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
+        let callback = root
+            .viewport_output
+            .get(&id)
+            .unwrap()
+            .viewport_ui_cb
+            .clone()
+            .unwrap();
+        let mut input = egui::RawInput {
+            viewport_id: id,
+            events: vec![scale_wheel()],
+            ..Default::default()
+        };
+        input.viewports.insert(
+            id,
+            egui::ViewportInfo {
+                focused: Some(true),
+                ..Default::default()
+            },
+        );
+        let mut result = ctx.run_ui(input, |ui| callback(ui));
+        assert!(!result.shapes.is_empty());
+        result.textures_delta.clear();
+        root.textures_delta.clear();
+        let mut root = ctx.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
+        root.textures_delta.clear();
+        assert_eq!(app.users.window_scale(KEYBOARD_WINDOW).unwrap(), 1.1);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn closing_scaled_auxiliary_windows_keeps_their_scales() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.show_keyboard = true;
+        app.show_hands = true;
+        app.users.set_window_scale(KEYBOARD_WINDOW, 1.5).unwrap();
+        app.users.set_window_scale(HANDS_WINDOW, 0.7).unwrap();
+        app.keyboard_input.lock().unwrap().close_requested = true;
+        app.hands_input.lock().unwrap().close_requested = true;
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
+        output.textures_delta.clear();
+        assert!(!app.show_keyboard && !app.show_hands);
+        assert_eq!(app.users.window_scale(KEYBOARD_WINDOW).unwrap(), 1.5);
+        assert_eq!(app.users.window_scale(HANDS_WINDOW).unwrap(), 0.7);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn scale_key_discards_its_text_and_ime_commit() {
+        let ctx = egui::Context::default();
+        let key = egui::Event::Key {
+            key: egui::Key::Plus,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        };
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![
+                    key,
+                    egui::Event::Text("+".into()),
+                    egui::Event::Ime(egui::ImeEvent::Commit("+".into())),
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                assert_eq!(
+                    take_scale_actions(ui.ctx()),
+                    vec![scaling::ScaleAction::Increase]
+                );
+                assert!(ui.ctx().input(|i| i.events.is_empty()));
+            },
+        );
+        output.textures_delta.clear();
     }
 
     #[test]
@@ -6553,9 +6958,13 @@ mod tests {
         let source_id = source.users.active_profile_id().to_owned();
         source.users.rename(&source_id, "Transferred").unwrap();
         source.users.set_content_language("EN").unwrap();
+        source.users.set_window_scale(MAIN_WINDOW, 1.5).unwrap();
+        source.users.set_window_scale(KEYBOARD_WINDOW, 0.7).unwrap();
         let profile_path = root.join("profile.json");
         source.export_profile_to(&profile_path).unwrap();
-        let expected = source.users.active_profile().unwrap().clone();
+        let mut expected = source.users.active_profile().unwrap().clone();
+        expected.window_scales.insert(MAIN_WINDOW.into(), 1.5);
+        expected.window_scales.insert(KEYBOARD_WINDOW.into(), 0.7);
 
         let mut destination = database_test_app(root.join("destination.sqlite3"));
         let previous = destination.users.active_profile_id().to_owned();
@@ -6578,6 +6987,18 @@ mod tests {
             1
         );
         assert_eq!(destination.users.active_profile(), Some(&expected));
+        assert_eq!(destination.users.window_scale(MAIN_WINDOW).unwrap(), 1.5);
+        assert_eq!(
+            destination.users.window_scale(KEYBOARD_WINDOW).unwrap(),
+            0.7
+        );
+        assert_eq!(
+            database_test_app(root.join("destination.sqlite3"))
+                .users
+                .window_scale(MAIN_WINDOW)
+                .unwrap(),
+            1.5
+        );
         assert_eq!(destination.content_language, ContentLanguage::English);
         assert!(destination.import_profile_from(&profile_path).is_err());
         assert_eq!(destination.users.profiles().len(), 2);

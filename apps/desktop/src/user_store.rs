@@ -65,6 +65,31 @@ pub struct Profile {
     /// JSON fallback for window geometry; SQLite stores these in profile settings.
     #[serde(default, deserialize_with = "deserialize_window_geometry")]
     pub window_geometry: BTreeMap<String, crate::window_geometry::SavedWindowGeometry>,
+    /// Per-window scale factors, stored in JSON or profile settings in SQLite.
+    #[serde(default, deserialize_with = "deserialize_window_scales")]
+    pub window_scales: BTreeMap<String, f32>,
+}
+
+fn deserialize_window_scales<'de, D>(deserializer: D) -> Result<BTreeMap<String, f32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let mut result = BTreeMap::new();
+    if let Some(entries) = value.as_object() {
+        for (id, value) in entries {
+            if id.trim().is_empty() {
+                continue;
+            }
+            if let Some(scale) = value.as_f64().map(|scale| scale as f32)
+                && scale.is_finite()
+                && (0.5..=3.0).contains(&scale)
+            {
+                result.insert(id.clone(), scale);
+            }
+        }
+    }
+    Ok(result)
 }
 
 fn deserialize_window_geometry<'de, D>(
@@ -174,6 +199,78 @@ pub struct UserStore {
 }
 
 impl UserStore {
+    /// Read the scale for a stable window ID in the active profile.
+    pub fn window_scale(&self, id: &str) -> io::Result<f32> {
+        if id.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "window ID must not be empty",
+            ));
+        }
+        let profile = self.active_profile().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                localization::tr("profile.not_found"),
+            )
+        })?;
+        if self.database {
+            let key = format!("window_scale:{id}");
+            if let Some(value) = self
+                .database()?
+                .expect("database flag")
+                .get_setting(&profile.id, &key)
+                .map_err(storage_io_error)?
+                && let Ok(scale) = serde_json::from_str::<f32>(&value)
+                && scale.is_finite()
+                && (0.5..=3.0).contains(&scale)
+            {
+                return Ok(scale);
+            }
+        }
+        Ok(profile.window_scales.get(id).copied().unwrap_or(1.0))
+    }
+
+    /// Save the scale for a stable window ID in the active profile.
+    pub fn set_window_scale(&mut self, id: &str, value: f32) -> io::Result<()> {
+        if id.trim().is_empty() || !value.is_finite() || !(0.5..=3.0).contains(&value) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid window scale",
+            ));
+        }
+        if self.active_profile().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                localization::tr("profile.not_found"),
+            ));
+        }
+        let profile_id = self.active_profile_id.clone();
+        if self.database {
+            self.database()?
+                .expect("database flag")
+                .set_setting(
+                    &profile_id,
+                    &format!("window_scale:{id}"),
+                    &serde_json::to_string(&value).map_err(invalid_data)?,
+                )
+                .map_err(storage_io_error)?;
+            return Ok(());
+        }
+        let original = self.clone();
+        let profile = self
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.id == profile_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    localization::tr("profile.not_found"),
+                )
+            })?;
+        profile.window_scales.insert(id.to_owned(), value);
+        self.commit_or_restore(original)
+    }
+
     /// Read geometry for a stable window ID in the active profile.
     pub fn window_geometry(
         &self,
@@ -792,6 +889,7 @@ impl UserStore {
             selected_layout: None,
             background: BackgroundImageSettings::default(),
             window_geometry: BTreeMap::new(),
+            window_scales: BTreeMap::new(),
         });
         self.active_profile_id = id;
         self.commit_or_restore(original)?;
@@ -1029,6 +1127,7 @@ impl UserStore {
                 selected_layout: None,
                 background: BackgroundImageSettings::default(),
                 window_geometry: BTreeMap::new(),
+                window_scales: BTreeMap::new(),
             });
             self.active_profile_id = id;
         } else if !self.profiles.iter().any(|p| p.id == self.active_profile_id) {
@@ -1177,6 +1276,7 @@ mod tests {
             selected_layout: None,
             background: BackgroundImageSettings::default(),
             window_geometry: BTreeMap::new(),
+            window_scales: BTreeMap::new(),
         };
         store.import_profile(profile.clone()).unwrap();
         assert_eq!(store.active_profile(), Some(&profile));
@@ -1234,6 +1334,7 @@ mod tests {
             selected_layout: None,
             background: BackgroundImageSettings::default(),
             window_geometry: BTreeMap::new(),
+            window_scales: BTreeMap::new(),
         };
         assert_eq!(
             store.import_profile(duplicate).unwrap_err().to_string(),
@@ -1626,6 +1727,46 @@ mod tests {
         assert!(store.active_records().is_empty());
         assert!(store.active_profile().unwrap().external_text.is_none());
         fs::remove_file(blocker).unwrap();
+    }
+
+    #[test]
+    fn result_with_progress_persists_stop_reason_and_keeps_progress_when_omitted() {
+        let path = test_path();
+        let mut store = UserStore::load_from(&path).unwrap();
+        let progress = ExternalProgress {
+            path: PathBuf::from("book.txt"),
+            size: 128,
+            hash: 42,
+            encoding: "Utf8".into(),
+            position: 17,
+        };
+        let input = |exercise| ResultInput {
+            mode: "file",
+            layout: "ru",
+            exercise,
+            correct: 12,
+            errors: 2,
+            elapsed_ms: 5_000,
+            cpm: 144.0,
+            error_percent: 14.3,
+        };
+
+        store
+            .record_with_progress(input("book.txt"), Some(progress.clone()), "manual")
+            .unwrap();
+        store
+            .record_with_progress(input("book.txt"), None, "completed")
+            .unwrap();
+
+        let reloaded = UserStore::load_from(&path).unwrap();
+        assert_eq!(reloaded.active_records().len(), 2);
+        assert_eq!(reloaded.active_records()[0].stop_reason, "manual");
+        assert_eq!(reloaded.active_records()[1].stop_reason, "completed");
+        assert_eq!(
+            reloaded.active_profile().unwrap().external_text,
+            Some(progress)
+        );
+        let _ = fs::remove_file(path);
     }
 
     fn test_path() -> PathBuf {
@@ -2503,6 +2644,123 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidInput
         );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn window_scale_is_scoped_by_window_and_profile_and_persists_in_json() {
+        let path = test_path();
+        let mut store = UserStore::new_at(&path);
+        let first_id = store.active_profile_id().to_owned();
+        assert_eq!(store.window_scale("main").unwrap(), 1.0);
+        store.set_window_scale("main", 1.25).unwrap();
+        let second_id = store.create("Second").unwrap().id.clone();
+        assert_eq!(store.window_scale("main").unwrap(), 1.0);
+        store.set_window_scale("keyboard", 2.0).unwrap();
+        store.select(&first_id).unwrap();
+        assert_eq!(store.window_scale("main").unwrap(), 1.25);
+        assert_eq!(store.window_scale("keyboard").unwrap(), 1.0);
+        let mut reopened = UserStore::load_from(&path).unwrap();
+        reopened.select(&second_id).unwrap();
+        assert_eq!(reopened.window_scale("keyboard").unwrap(), 2.0);
+        assert_eq!(reopened.window_scale("main").unwrap(), 1.0);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sqlite_window_scale_is_profile_scoped_and_survives_restart() {
+        let path = test_path().with_extension("sqlite3");
+        let legacy = path.with_extension("json");
+        let mut store = UserStore::load_database(path.clone(), &legacy).unwrap();
+        let first_id = store.active_profile_id().to_owned();
+        store.set_window_scale("main", 1.5).unwrap();
+        let second_id = store.create("Second").unwrap().id.clone();
+        assert_eq!(store.window_scale("main").unwrap(), 1.0);
+        store.set_window_scale("main", 2.5).unwrap();
+        let mut reopened = UserStore::load_database(path.clone(), &legacy).unwrap();
+        assert_eq!(reopened.window_scale("main").unwrap(), 2.5);
+        reopened.select(&first_id).unwrap();
+        assert_eq!(reopened.window_scale("main").unwrap(), 1.5);
+        reopened.select(&second_id).unwrap();
+        assert_eq!(reopened.window_scale("main").unwrap(), 2.5);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn malformed_sqlite_window_scales_fall_back_to_default() {
+        let path = test_path().with_extension("sqlite3");
+        let legacy = path.with_extension("json");
+        let store = UserStore::load_database(path.clone(), &legacy).unwrap();
+        let profile_id = store.active_profile_id().to_owned();
+        let mut db = stamina_data::storage::Database::open(&path).unwrap();
+        for (id, value) in [
+            ("malformed", "not json"),
+            ("large", "3.1"),
+            ("small", "0.4"),
+        ] {
+            db.set_setting(&profile_id, &format!("window_scale:{id}"), value)
+                .unwrap();
+            assert_eq!(store.window_scale(id).unwrap(), 1.0);
+        }
+        drop(db);
+        drop(store);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn malformed_or_out_of_range_window_scales_use_default_and_are_rejected_on_write() {
+        let path = test_path();
+        fs::write(&path, br#"{"active_profile_id":"p","profiles":[{"id":"p","name":"P","window_scales":{"bad":"nope","too_small":0.1,"too_large":4.0,"ok":1.5}}]}"#).unwrap();
+        let store = UserStore::load_from(&path).unwrap();
+        assert_eq!(store.window_scale("bad").unwrap(), 1.0);
+        assert_eq!(store.window_scale("too_small").unwrap(), 1.0);
+        assert_eq!(store.window_scale("too_large").unwrap(), 1.0);
+        assert_eq!(store.window_scale("ok").unwrap(), 1.5);
+
+        let mut store = store;
+        for invalid in [0.49, 3.01, f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                store.set_window_scale("main", invalid).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        assert_eq!(
+            store.set_window_scale(" ", 1.0).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn window_scale_accepts_inclusive_limits_and_failed_scale_or_geometry_save_rolls_back() {
+        let path = test_path();
+        let mut store = UserStore::load_from(&path).unwrap();
+        store.set_window_scale("main", 0.5).unwrap();
+        store.set_window_scale("keyboard", 3.0).unwrap();
+        let geometry = crate::window_geometry::SavedWindowGeometry {
+            rect: crate::window_geometry::LogicalRect::new(20.0, 30.0, 800.0, 600.0),
+            pixels_per_point: None,
+            maximized: false,
+            visible: true,
+        };
+        store.set_window_geometry("main", Some(geometry)).unwrap();
+        let before_memory = serde_json::to_value(&store).unwrap();
+        let before_file = fs::read(&path).unwrap();
+        let blocker = sibling_path(&path, "tmp");
+        fs::create_dir(&blocker).unwrap();
+
+        assert!(store.set_window_scale("main", 1.75).is_err());
+        assert_eq!(serde_json::to_value(&store).unwrap(), before_memory);
+        assert_eq!(fs::read(&path).unwrap(), before_file);
+        assert!(store.set_window_geometry("main", None).is_err());
+        assert_eq!(serde_json::to_value(&store).unwrap(), before_memory);
+        assert_eq!(fs::read(&path).unwrap(), before_file);
+
+        fs::remove_dir(blocker).unwrap();
+        let reloaded = UserStore::load_from(&path).unwrap();
+        assert_eq!(reloaded.window_scale("main").unwrap(), 0.5);
+        assert_eq!(reloaded.window_scale("keyboard").unwrap(), 3.0);
+        assert_eq!(reloaded.window_geometry("main").unwrap(), Some(geometry));
         let _ = fs::remove_file(path);
     }
 }

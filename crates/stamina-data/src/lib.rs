@@ -1099,6 +1099,51 @@ mod tests {
         fs::remove_dir_all(outside.parent().unwrap()).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn user_lesson_edit_rejects_symlinked_nested_path_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("edit-symlink-root");
+        let outside = temp_dir("edit-symlink-outside");
+        let protected = outside.join("protected.json");
+        write_json(&protected, "protected", "original");
+        symlink(&outside, root.join("nested")).unwrap();
+
+        let result = edit_user_lesson(
+            &root,
+            root.join("nested/protected.json"),
+            std::slice::from_ref(&root),
+            &json_lesson("replacement", "changed"),
+        );
+
+        assert!(matches!(result, Err(LessonWriteError::UnsafePath)));
+        assert_eq!(read_json_lesson(&protected).unwrap().text, "original");
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn user_lesson_edit_accepts_case_insensitive_json_extension() {
+        let root = temp_dir("edit-uppercase-extension");
+        let target = root.join("nested/lesson.JSON");
+        write_json(&target, "original", "before");
+
+        edit_user_lesson(
+            &root,
+            &target,
+            std::slice::from_ref(&root),
+            &json_lesson("updated", "after"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_json_lesson(&target).unwrap(),
+            json_lesson("updated", "after")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn temp_file(label: &str) -> std::path::PathBuf {
         static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         std::env::temp_dir().join(format!(
@@ -1186,6 +1231,32 @@ mod tests {
             &diagnostic.code,
             CatalogDiagnosticCode::InvalidJson { reason } if !reason.is_empty()
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_accepts_omitted_optional_description_and_rejects_unknown_fields() {
+        let root = temp_dir("catalog-json-schema");
+        fs::write(
+            root.join("older.json"),
+            r#"{"version":1,"id":"older","title":"Older","language":"en","text":"body"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("future-field.json"),
+            r#"{"version":1,"id":"future","title":"Future","language":"en","text":"body","newField":true}"#,
+        )
+        .unwrap();
+
+        let catalog = load_lesson_catalog(std::slice::from_ref(&root));
+
+        assert_eq!(catalog.lessons.len(), 1);
+        assert_eq!(catalog.lessons[0].lesson.id, "older");
+        assert_eq!(catalog.lessons[0].lesson.description, None);
+        assert!(catalog.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path.ends_with("future-field.json")
+                && matches!(diagnostic.code, CatalogDiagnosticCode::InvalidJson { .. })
+        }));
         fs::remove_dir_all(root).unwrap();
     }
 
