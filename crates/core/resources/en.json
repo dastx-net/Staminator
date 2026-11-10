@@ -62,6 +62,8 @@
   "backup-create": "Create backup…",
   "backup-check": "Check backup…",
   "backup-restore": "Restore backup…",
+  "show-hands": "Show hands",
+  "hands": "Hands",
   "show-keyboard": "Show keyboard",
   "reset-window-positions": "Reset window positions",
   "users": "Users",

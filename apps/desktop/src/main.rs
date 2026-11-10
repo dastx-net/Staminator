@@ -3,6 +3,7 @@ mod content;
 mod content_editor;
 mod external_text;
 mod generated_modes;
+mod hands;
 mod keyboard;
 mod lesson_generator;
 mod localization;
@@ -32,10 +33,13 @@ use window_geometry::{LogicalRect, SavedWindowGeometry};
 
 const MAIN_WINDOW: &str = "main";
 const KEYBOARD_WINDOW: &str = "keyboard";
+const HANDS_WINDOW: &str = "hands";
 
 fn default_window_geometry(id: &str, visible: bool) -> SavedWindowGeometry {
     let rect = if id == MAIN_WINDOW {
         LogicalRect::new(80.0, 80.0, 1400.0, 560.0)
+    } else if id == HANDS_WINDOW {
+        LogicalRect::new(150.0, 200.0, 720.0, 400.0)
     } else {
         LogicalRect::new(120.0, 650.0, 1100.0, 420.0)
     };
@@ -51,6 +55,9 @@ struct WindowPlacementState {
     profile_id: String,
     main: SavedWindowGeometry,
     keyboard: SavedWindowGeometry,
+    hands: SavedWindowGeometry,
+    hands_builder: SavedWindowGeometry,
+    hands_restore_pending: bool,
     keyboard_builder: SavedWindowGeometry,
     keyboard_builder_scale: f32,
     keyboard_restore_pending: bool,
@@ -380,6 +387,9 @@ struct StaminatorApp {
     started_at: Instant,
     last_result: Option<staminator_core::SessionStats>,
     show_keyboard: bool,
+    show_hands: bool,
+    hands_input: Arc<Mutex<KeyboardInputQueue>>,
+    last_hands_state: Option<(keyboard::KeyboardLayout, Option<char>, bool)>,
     window_placement: Option<WindowPlacementState>,
     keyboard_input: Arc<Mutex<KeyboardInputQueue>>,
     last_keyboard_state: Option<(keyboard::KeyboardLayout, Option<char>)>,
@@ -409,7 +419,11 @@ impl StaminatorApp {
         if !state.dirty || state.profile_id != self.users.active_profile_id() {
             return !state.dirty;
         }
-        for (id, value) in [(MAIN_WINDOW, state.main), (KEYBOARD_WINDOW, state.keyboard)] {
+        for (id, value) in [
+            (MAIN_WINDOW, state.main),
+            (KEYBOARD_WINDOW, state.keyboard),
+            (HANDS_WINDOW, state.hands),
+        ] {
             if let Err(error) = self.users.set_window_geometry(id, Some(value)) {
                 self.profile_error = localized_error("settings.save_error", error);
                 return false;
@@ -423,18 +437,23 @@ impl StaminatorApp {
         let read = |id| self.users.window_geometry(id);
         let main = read(MAIN_WINDOW);
         let keyboard = read(KEYBOARD_WINDOW);
+        let hands = read(HANDS_WINDOW);
         if let Err(error) = &main {
             self.profile_error = localized_error("settings.load_error", error);
         }
         if let Err(error) = &keyboard {
             self.profile_error = localized_error("settings.load_error", error);
         }
-        if main.is_err() || keyboard.is_err() {
+        if let Err(error) = &hands {
+            self.profile_error = localized_error("settings.load_error", error);
+        }
+        if main.is_err() || keyboard.is_err() || hands.is_err() {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
             return;
         }
         let needs_defaults = main.as_ref().is_ok_and(Option::is_none)
-            || keyboard.as_ref().is_ok_and(Option::is_none);
+            || keyboard.as_ref().is_ok_and(Option::is_none)
+            || hands.as_ref().is_ok_and(Option::is_none);
         let main = main
             .ok()
             .flatten()
@@ -450,10 +469,22 @@ impl StaminatorApp {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .viewport = None;
         self.show_keyboard = keyboard.visible;
+        let hands = hands
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| default_window_geometry(HANDS_WINDOW, false));
+        self.show_hands = hands.visible;
+        self.hands_input
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .viewport = None;
         self.window_placement = Some(WindowPlacementState {
             profile_id: self.users.active_profile_id().to_owned(),
             main,
             keyboard,
+            hands,
+            hands_builder: hands,
+            hands_restore_pending: hands.visible,
             keyboard_builder: keyboard,
             keyboard_builder_scale: keyboard
                 .pixels_per_point
@@ -484,8 +515,11 @@ impl StaminatorApp {
                 egui::ViewportId::from_hash_of("keyboard-window"),
                 state.keyboard,
             ),
+            (egui::ViewportId::from_hash_of("hands-window"), state.hands),
         ] {
-            if id != egui::ViewportId::ROOT && !self.show_keyboard {
+            if (id == egui::ViewportId::from_hash_of("keyboard-window") && !self.show_keyboard)
+                || (id == egui::ViewportId::from_hash_of("hands-window") && !self.show_hands)
+            {
                 continue;
             }
             let scale = if id == egui::ViewportId::ROOT {
@@ -553,6 +587,37 @@ impl StaminatorApp {
                 return;
             }
         }
+        let hands_snapshot = self
+            .hands_input
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .viewport
+            .clone();
+        if self.show_hands && state.hands_restore_pending {
+            let id = egui::ViewportId::from_hash_of("hands-window");
+            if let Some(scale) = viewport_scale(ctx, id) {
+                let areas = areas_at_scale(&state.monitor_areas, state.monitor_scale, scale);
+                apply_one_window(
+                    ctx,
+                    id,
+                    state.hands,
+                    scale,
+                    &areas,
+                    root_info.outer_rect.is_some(),
+                );
+                state.hands_restore_pending = false;
+                state.settling_frames = 3;
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                return;
+            }
+        }
+        let old_hands = state.hands;
+        if self.show_hands
+            && let Some((info, size)) = hands_snapshot.as_ref()
+        {
+            sample_window(&mut state.hands, info, *size, ctx.zoom_factor());
+        }
+        state.hands.visible = self.show_hands;
         let old_main = state.main;
         let old_keyboard = state.keyboard;
         sample_window(&mut state.main, &root_info, root_size, ctx.zoom_factor());
@@ -568,7 +633,7 @@ impl StaminatorApp {
             }
         }
         state.keyboard.visible = self.show_keyboard;
-        if old_main != state.main || old_keyboard != state.keyboard {
+        if old_main != state.main || old_keyboard != state.keyboard || old_hands != state.hands {
             state.dirty = true;
             state.changed_at = Instant::now();
         }
@@ -582,6 +647,8 @@ impl StaminatorApp {
         if monitors_changed {
             state.monitor_areas = areas;
             state.monitor_scale = ctx.pixels_per_point();
+            state.hands_builder = state.hands;
+            state.hands_restore_pending = self.show_hands;
             state.keyboard_builder = state.keyboard;
             state.keyboard_builder_scale = state
                 .keyboard
@@ -602,7 +669,7 @@ impl StaminatorApp {
     }
 
     fn reset_window_placement(&mut self, ctx: &egui::Context) {
-        for id in [MAIN_WINDOW, KEYBOARD_WINDOW] {
+        for id in [MAIN_WINDOW, KEYBOARD_WINDOW, HANDS_WINDOW] {
             if let Err(error) = self.users.set_window_geometry(id, None) {
                 self.profile_error = localized_error("settings.save_error", error);
                 return;
@@ -621,11 +688,19 @@ impl StaminatorApp {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .viewport = None;
+        self.hands_input
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .viewport = None;
         self.show_keyboard = true;
+        self.show_hands = false;
         self.window_placement = Some(WindowPlacementState {
             profile_id: self.users.active_profile_id().to_owned(),
             main: default_window_geometry(MAIN_WINDOW, true),
             keyboard: default_window_geometry(KEYBOARD_WINDOW, true),
+            hands: default_window_geometry(HANDS_WINDOW, false),
+            hands_builder: default_window_geometry(HANDS_WINDOW, false),
+            hands_restore_pending: false,
             keyboard_builder: default_window_geometry(KEYBOARD_WINDOW, true),
             keyboard_builder_scale: ctx.pixels_per_point(),
             keyboard_restore_pending: true,
@@ -819,6 +894,9 @@ impl StaminatorApp {
             started_at: Instant::now(),
             last_result: None,
             show_keyboard,
+            show_hands: false,
+            hands_input: Arc::default(),
+            last_hands_state: None,
             window_placement: None,
             keyboard_input: Arc::default(),
             last_keyboard_state: None,
@@ -1011,6 +1089,23 @@ impl StaminatorApp {
                 save_keyboard_setting_to(self.keyboard_setting_path.as_deref(), self.show_keyboard)
             }
             Err(error) => self.profile_error = localized_error("settings.save_error", error),
+        }
+    }
+
+    fn persist_hands_setting(&mut self) {
+        if let Some(state) = &mut self.window_placement {
+            state.hands.visible = self.show_hands;
+            state.hands_builder = state.hands;
+            state.hands_restore_pending = self.show_hands;
+            state.dirty = true;
+            state.changed_at = Instant::now();
+            if !self.show_hands {
+                self.hands_input
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .viewport = None;
+            }
+            let _ = self.flush_window_placement();
         }
     }
 
@@ -2263,6 +2358,31 @@ impl StaminatorApp {
         );
         let mut events = root.ctx().input(|input| input.events.clone());
         events.extend(self.take_keyboard_input());
+        let (hand_events, hand_close) = {
+            let mut queue = self
+                .hands_input
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                std::mem::take(&mut queue.events),
+                std::mem::take(&mut queue.close_requested),
+            )
+        };
+        events.extend(hand_events);
+        if hand_close && self.show_hands {
+            if let Some(state) = &mut self.window_placement
+                && let Some((info, size)) = self
+                    .hands_input
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .viewport
+                    .as_ref()
+            {
+                sample_window(&mut state.hands, info, *size, root.ctx().zoom_factor());
+            }
+            self.show_hands = false;
+            self.persist_hands_setting();
+        }
         self.handle_input_events(root.ctx(), events);
         let now = self.now_ms();
         let snapshot = self.session.as_ref().map(|s| s.snapshot(now));
@@ -2561,6 +2681,12 @@ impl StaminatorApp {
                         self.persist_keyboard_setting();
                     }
                     if ui
+                        .checkbox(&mut self.show_hands, localization::tr("show-hands"))
+                        .changed()
+                    {
+                        self.persist_hands_setting();
+                    }
+                    if ui
                         .button(localization::tr("reset-window-positions"))
                         .clicked()
                     {
@@ -2763,6 +2889,74 @@ impl StaminatorApp {
         } else {
             self.last_keyboard_state = None;
         }
+        if self.show_hands {
+            let id = egui::ViewportId::from_hash_of("hands-window");
+            let (geometry, scale, areas) = self.window_placement.as_ref().map_or_else(
+                || {
+                    (
+                        default_window_geometry(HANDS_WINDOW, true),
+                        root.ctx().pixels_per_point(),
+                        Vec::new(),
+                    )
+                },
+                |state| {
+                    let scale = state
+                        .hands_builder
+                        .pixels_per_point
+                        .unwrap_or_else(|| root.ctx().pixels_per_point());
+                    (
+                        state.hands_builder,
+                        scale,
+                        areas_at_scale(&state.monitor_areas, state.monitor_scale, scale),
+                    )
+                },
+            );
+            let rect = safe_window_rect(rect_at_scale(geometry, scale), &areas);
+            let mut builder = egui::ViewportBuilder::default()
+                .with_title(localization::tr("hands"))
+                .with_inner_size([rect.width, rect.height])
+                .with_min_inner_size([300.0, 200.0])
+                .with_maximized(geometry.maximized);
+            if root.ctx().input(|i| i.viewport().outer_rect.is_some()) {
+                builder = builder.with_position([rect.x, rect.y]);
+            }
+            let layout = if self.english_layout {
+                keyboard::KeyboardLayout::English
+            } else {
+                keyboard::KeyboardLayout::Russian
+            };
+            let unsupported = !matches!(
+                self.language(),
+                ContentLanguage::Russian | ContentLanguage::English
+            ) && self.selected_mode == TrainingMode::Lessons;
+            let fingers =
+                keyboard::active_fingers(layout, if unsupported { None } else { next_char });
+            let queue = Arc::clone(&self.hands_input);
+            let state = (layout, next_char, unsupported);
+            if self.last_hands_state != Some(state) {
+                root.ctx().request_repaint_of(id);
+                self.last_hands_state = Some(state);
+            }
+            root.ctx()
+                .show_viewport_deferred(id, builder, move |ui, _| {
+                    let ctx = ui.ctx();
+                    let (events, close, snapshot) = ctx.input(|i| {
+                        (
+                            i.events.clone(),
+                            i.viewport().close_requested(),
+                            (i.viewport().clone(), i.content_rect().size()),
+                        )
+                    });
+                    queue
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .viewport = Some(snapshot);
+                    queue_keyboard_input(&queue, ctx, events, close);
+                    hands::draw_hands(ui, &fingers);
+                });
+        } else {
+            self.last_hands_state = None;
+        }
         if self.chooser_open {
             self.show_content_chooser(root.ctx());
         }
@@ -2867,6 +3061,102 @@ mod tests {
         raw.viewports.insert(egui::ViewportId::ROOT, info);
         let mut output = ctx.run_ui(raw, |ui| app.update_window_placement(ui.ctx()));
         output.textures_delta.clear();
+    }
+
+    #[test]
+    fn hands_window_close_preserves_session_and_latest_geometry() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        placement_frame(&mut app, &ctx, egui::ViewportInfo::default());
+        app.show_hands = true;
+        app.persist_hands_setting();
+        app.start();
+        let before = app.session.as_ref().unwrap().snapshot(app.now_ms()).state;
+        app.hands_input.lock().unwrap().viewport = Some((
+            egui::ViewportInfo {
+                outer_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(333.0, 120.0),
+                    egui::vec2(700.0, 400.0),
+                )),
+                ..Default::default()
+            },
+            egui::vec2(700.0, 400.0),
+        ));
+        queue_keyboard_input(&app.hands_input, &ctx, vec![], true);
+        draw_accessible(&mut app, &ctx, vec![]);
+        assert!(!app.show_hands);
+        assert_eq!(
+            app.session.as_ref().unwrap().snapshot(app.now_ms()).state,
+            before
+        );
+        let saved = app.users.window_geometry(HANDS_WINDOW).unwrap().unwrap();
+        assert!(!saved.visible);
+        assert_eq!(saved.rect.x, 333.0);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn hands_visibility_and_geometry_follow_profiles() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        let ctx = egui::Context::default();
+        let info = egui::ViewportInfo::default();
+        for _ in 0..5 {
+            placement_frame(&mut app, &ctx, info.clone());
+        }
+        app.show_hands = true;
+        app.persist_hands_setting();
+        {
+            let state = app.window_placement.as_mut().unwrap();
+            state.hands_restore_pending = false;
+            state.settling_frames = 0;
+        }
+        app.hands_input.lock().unwrap().viewport = Some((
+            egui::ViewportInfo {
+                outer_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(250.0, 150.0),
+                    egui::vec2(700.0, 400.0),
+                )),
+                inner_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(250.0, 150.0),
+                    egui::vec2(700.0, 400.0),
+                )),
+                ..Default::default()
+            },
+            egui::vec2(700.0, 400.0),
+        ));
+        placement_frame(&mut app, &ctx, info.clone());
+        assert!(app.flush_window_placement());
+        let first = app.users.active_profile_id().to_owned();
+        assert_eq!(
+            app.users
+                .window_geometry(HANDS_WINDOW)
+                .unwrap()
+                .unwrap()
+                .rect
+                .x,
+            250.0
+        );
+        app.users.create("Second").unwrap();
+        placement_frame(&mut app, &ctx, info.clone());
+        assert!(!app.show_hands);
+        app.users.select(&first).unwrap();
+        placement_frame(&mut app, &ctx, info);
+        assert!(app.show_hands);
+        assert_eq!(app.window_placement.as_ref().unwrap().hands.rect.x, 250.0);
+        app.show_hands = false;
+        app.persist_hands_setting();
+        let reopened = UserStore::load_from(&path).unwrap();
+        assert!(
+            !reopened
+                .window_geometry(HANDS_WINDOW)
+                .unwrap()
+                .unwrap()
+                .visible
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -3004,6 +3294,9 @@ mod tests {
             profile_id: app.users.active_profile_id().to_owned(),
             main: default_window_geometry(MAIN_WINDOW, true),
             keyboard,
+            hands: default_window_geometry(HANDS_WINDOW, false),
+            hands_builder: default_window_geometry(HANDS_WINDOW, false),
+            hands_restore_pending: false,
             keyboard_builder: keyboard,
             keyboard_builder_scale: 1.0,
             keyboard_restore_pending: true,
@@ -3126,6 +3419,9 @@ mod tests {
             profile_id: app.users.active_profile_id().to_owned(),
             main: default_window_geometry(MAIN_WINDOW, true),
             keyboard: default_window_geometry(KEYBOARD_WINDOW, true),
+            hands: default_window_geometry(HANDS_WINDOW, false),
+            hands_builder: default_window_geometry(HANDS_WINDOW, false),
+            hands_restore_pending: false,
             keyboard_builder: default_window_geometry(KEYBOARD_WINDOW, true),
             keyboard_builder_scale: 1.0,
             keyboard_restore_pending: false,

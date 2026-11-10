@@ -62,6 +62,8 @@
   "backup-create": "Criar backup…",
   "backup-check": "Verificar backup…",
   "backup-restore": "Restaurar backup…",
+  "show-hands": "Mostrar mãos",
+  "hands": "Mãos",
   "show-keyboard": "Mostrar teclado",
   "reset-window-positions": "Redefinir posições das janelas",
   "users": "Usuários",

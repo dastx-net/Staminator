@@ -62,6 +62,8 @@
   "backup-create": "Yedek oluştur…",
   "backup-check": "Yedeklemeyi denetle…",
   "backup-restore": "Yedeği geri yükle…",
+  "show-hands": "Elleri göster",
+  "hands": "Eller",
   "show-keyboard": "Klavyeyi göster",
   "reset-window-positions": "Pencere konumlarını sıfırla",
   "users": "Kullanıcılar",

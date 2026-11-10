@@ -70,6 +70,8 @@
   "backup-create": "إنشاء نسخة احتياطية…",
   "backup-check": "التحقق من النسخة الاحتياطية…",
   "backup-restore": "استعادة نسخة احتياطية…",
+  "show-hands": "إظهار اليدين",
+  "hands": "اليدان",
   "show-keyboard": "إظهار لوحة المفاتيح",
   "reset-window-positions": "إعادة ضبط مواضع النوافذ",
   "users": "المستخدمون",

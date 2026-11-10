@@ -62,6 +62,8 @@
   "backup-create": "Sicherung erstellen…",
   "backup-check": "Sicherung prüfen…",
   "backup-restore": "Sicherung wiederherstellen…",
+  "show-hands": "Hände anzeigen",
+  "hands": "Hände",
   "show-keyboard": "Tastatur anzeigen",
   "reset-window-positions": "Fensterpositionen zurücksetzen",
   "users": "Benutzer",

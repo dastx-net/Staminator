@@ -62,6 +62,8 @@
   "backup-create": "Crea backup…",
   "backup-check": "Verifica backup…",
   "backup-restore": "Ripristina backup…",
+  "show-hands": "Mostra mani",
+  "hands": "Mani",
   "show-keyboard": "Mostra tastiera",
   "reset-window-positions": "Reimposta posizione delle finestre",
   "users": "Utenti",

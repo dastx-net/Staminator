@@ -44,7 +44,135 @@ pub fn draw_keyboard(ui: &mut Ui, layout: KeyboardLayout, active: Option<char>) 
         Color32::from_rgb(207, 186, 126), // right thumb
     ];
 
-    let rows: [&[(&str, &str, f32)]; 5] = match layout {
+    let rows = keyboard_rows(layout);
+
+    let shift_key = active.and_then(|ch| {
+        let (finger, shifted) = rows.iter().enumerate().find_map(|(r, row)| {
+            row.iter().enumerate().find_map(|(k, &(top, bottom, _))| {
+                key_matches_character(ch, top, bottom)
+                    .then(|| (finger_for_key(r, k), requires_shift(ch, top, bottom)))
+            })
+        })?;
+        shifted.then(|| finger.map(opposite_shift_key)).flatten()
+    });
+    for (row_index, row) in rows.iter().enumerate() {
+        let total_units: f32 = row.iter().map(|(_, _, w)| *w).sum();
+        let row_gaps = gap * (row.len().saturating_sub(1) as f32);
+        let offset_units = match row_index {
+            1 => 0.15,
+            2 => 0.35,
+            3 => 0.55,
+            _ => 0.0,
+        };
+        let row_unit = (width - 2.0 * pad_x - row_gaps) / (total_units + offset_units);
+        let mut x = x0 + offset_units * row_unit;
+        for (key_index, &(top, bottom, key_units)) in row.iter().enumerate() {
+            let w = row_unit * key_units;
+            let key_rect = Rect::from_min_size(
+                Pos2::new(x, y0 + row_index as f32 * step_y),
+                Vec2::new(w, key_h),
+            );
+            let is_active = active.is_some_and(|ch| key_matches_character(ch, top, bottom))
+                || shift_key == Some((row_index, key_index));
+            let finger = finger_for_key(row_index, key_index);
+            let zone_color = finger.map(|i| finger_colors[i]);
+            let face = if is_active {
+                Color32::from_rgb(205, 112, 43)
+            } else {
+                zone_color.map_or(Color32::from_rgb(64, 72, 81), |c| {
+                    Color32::from_rgb(
+                        (64 + c.r() as u16 / 4) as u8,
+                        (72 + c.g() as u16 / 4) as u8,
+                        (81 + c.b() as u16 / 4) as u8,
+                    )
+                })
+            };
+            let border = if is_active {
+                Color32::from_rgb(255, 173, 92)
+            } else {
+                zone_color.unwrap_or(Color32::from_rgb(111, 124, 136))
+            };
+            painter.rect_filled(
+                key_rect.translate(Vec2::new(0.0, 1.5)),
+                CornerRadius::same(5),
+                Color32::from_rgb(15, 19, 24),
+            );
+            painter.rect_filled(key_rect, CornerRadius::same(5), face);
+            painter.rect_stroke(
+                key_rect,
+                CornerRadius::same(5),
+                Stroke::new(if is_active { 1.8 } else { 1.0 }, border),
+                StrokeKind::Inside,
+            );
+            if !is_active && let Some(color) = zone_color {
+                let marker = Rect::from_min_max(
+                    Pos2::new(key_rect.left() + 2.0, key_rect.bottom() - 4.0),
+                    Pos2::new(key_rect.right() - 2.0, key_rect.bottom() - 1.0),
+                );
+                painter.rect_filled(marker, CornerRadius::same(1), color);
+            }
+            let main_font = FontId::proportional((key_h * 0.45).clamp(10.0, 28.0));
+            if !top.is_empty() && !bottom.is_empty() && top.chars().count() == 1 {
+                painter.text(
+                    Pos2::new(key_rect.center().x, key_rect.top() + key_h * 0.30),
+                    Align2::CENTER_CENTER,
+                    top,
+                    FontId::proportional((key_h * 0.24).clamp(8.0, 15.0)),
+                    Color32::from_rgb(190, 198, 205),
+                );
+                painter.text(
+                    Pos2::new(key_rect.center().x, key_rect.top() + key_h * 0.70),
+                    Align2::CENTER_CENTER,
+                    bottom,
+                    main_font,
+                    Color32::from_rgb(236, 239, 241),
+                );
+            } else {
+                let label = special_key_label(top, row_index, key_index);
+                painter.text(
+                    key_rect.center(),
+                    Align2::CENTER_CENTER,
+                    &label,
+                    FontId::proportional(
+                        (key_h * if key_units > 1.5 { 0.31 } else { 0.36 }).clamp(8.0, 21.0),
+                    ),
+                    Color32::from_rgb(236, 239, 241),
+                );
+            }
+            x += w + gap;
+        }
+    }
+
+    let legend_y = y0 + 5.0 * key_h + 4.0 * gap + 1.0;
+    let legend = [
+        ("keyboard.finger.left_little", 0),
+        ("keyboard.finger.left_ring", 1),
+        ("keyboard.finger.left_middle", 2),
+        ("keyboard.finger.left_index", 3),
+        ("keyboard.finger.right_index", 4),
+        ("keyboard.finger.right_middle", 5),
+        ("keyboard.finger.right_ring", 6),
+        ("keyboard.finger.right_little", 7),
+        ("keyboard.finger.left_thumb", 8),
+        ("keyboard.finger.right_thumb", 9),
+    ];
+    let item_w = (width - 2.0 * pad_x) / legend.len() as f32;
+    for (i, (label, color_index)) in legend.into_iter().enumerate() {
+        let left = x0 + i as f32 * item_w;
+        let swatch = Rect::from_min_size(Pos2::new(left, legend_y + 3.0), Vec2::new(7.0, 7.0));
+        painter.rect_filled(swatch, CornerRadius::same(2), finger_colors[color_index]);
+        painter.text(
+            Pos2::new(left + 10.0, legend_y + 6.5),
+            Align2::LEFT_CENTER,
+            crate::localization::tr(label),
+            FontId::proportional((height * 0.055).clamp(8.0, 11.0)),
+            Color32::from_rgb(201, 208, 214),
+        );
+    }
+}
+
+fn keyboard_rows(layout: KeyboardLayout) -> [&'static [(&'static str, &'static str, f32)]; 5] {
+    match layout {
         KeyboardLayout::English => [
             &[
                 ("~", "`", 1.),
@@ -177,7 +305,7 @@ pub fn draw_keyboard(ui: &mut Ui, layout: KeyboardLayout, active: Option<char>) 
                 ("Ь", "", 1.),
                 ("Б", "", 1.),
                 ("Ю", "", 1.),
-                ("?", ",", 1.),
+                (",", ".", 1.),
                 ("Shift", "", 2.8),
             ],
             &[
@@ -191,131 +319,34 @@ pub fn draw_keyboard(ui: &mut Ui, layout: KeyboardLayout, active: Option<char>) 
                 ("Ctrl", "", 1.3),
             ],
         ],
-    };
+    }
+}
 
-    let shift_key = active.and_then(|ch| {
-        let (finger, shifted) = rows.iter().enumerate().find_map(|(r, row)| {
-            row.iter().enumerate().find_map(|(k, &(top, bottom, _))| {
-                key_matches_character(ch, top, bottom)
-                    .then(|| (finger_for_key(r, k), requires_shift(ch, top, bottom)))
-            })
-        })?;
-        shifted.then(|| finger.map(opposite_shift_key)).flatten()
-    });
+/// Finger assignments for the next character, including the opposite Shift.
+pub fn active_fingers(layout: KeyboardLayout, active: Option<char>) -> Vec<usize> {
+    let Some(ch) = active else { return Vec::new() };
+    if ch == ' ' {
+        return vec![8, 9];
+    }
+    let rows = keyboard_rows(layout);
     for (row_index, row) in rows.iter().enumerate() {
-        let total_units: f32 = row.iter().map(|(_, _, w)| *w).sum();
-        let row_gaps = gap * (row.len().saturating_sub(1) as f32);
-        let offset_units = match row_index {
-            1 => 0.15,
-            2 => 0.35,
-            3 => 0.55,
-            _ => 0.0,
-        };
-        let row_unit = (width - 2.0 * pad_x - row_gaps) / (total_units + offset_units);
-        let mut x = x0 + offset_units * row_unit;
-        for (key_index, &(top, bottom, key_units)) in row.iter().enumerate() {
-            let w = row_unit * key_units;
-            let key_rect = Rect::from_min_size(
-                Pos2::new(x, y0 + row_index as f32 * step_y),
-                Vec2::new(w, key_h),
-            );
-            let is_active = active.is_some_and(|ch| key_matches_character(ch, top, bottom))
-                || shift_key == Some((row_index, key_index));
-            let finger = finger_for_key(row_index, key_index);
-            let zone_color = finger.map(|i| finger_colors[i]);
-            let face = if is_active {
-                Color32::from_rgb(205, 112, 43)
-            } else {
-                zone_color.map_or(Color32::from_rgb(64, 72, 81), |c| {
-                    Color32::from_rgb(
-                        (64 + c.r() as u16 / 4) as u8,
-                        (72 + c.g() as u16 / 4) as u8,
-                        (81 + c.b() as u16 / 4) as u8,
-                    )
-                })
-            };
-            let border = if is_active {
-                Color32::from_rgb(255, 173, 92)
-            } else {
-                zone_color.unwrap_or(Color32::from_rgb(111, 124, 136))
-            };
-            painter.rect_filled(
-                key_rect.translate(Vec2::new(0.0, 1.5)),
-                CornerRadius::same(5),
-                Color32::from_rgb(15, 19, 24),
-            );
-            painter.rect_filled(key_rect, CornerRadius::same(5), face);
-            painter.rect_stroke(
-                key_rect,
-                CornerRadius::same(5),
-                Stroke::new(if is_active { 1.8 } else { 1.0 }, border),
-                StrokeKind::Inside,
-            );
-            if !is_active && let Some(color) = zone_color {
-                let marker = Rect::from_min_max(
-                    Pos2::new(key_rect.left() + 2.0, key_rect.bottom() - 4.0),
-                    Pos2::new(key_rect.right() - 2.0, key_rect.bottom() - 1.0),
-                );
-                painter.rect_filled(marker, CornerRadius::same(1), color);
+        for (key_index, &(top, bottom, _)) in row.iter().enumerate() {
+            if key_matches_character(ch, top, bottom) {
+                let Some(finger) = finger_for_key(row_index, key_index) else {
+                    return Vec::new();
+                };
+                let mut fingers = vec![finger];
+                if requires_shift(ch, top, bottom) {
+                    let (row, key) = opposite_shift_key(finger);
+                    if let Some(shift) = finger_for_key(row, key) {
+                        fingers.push(shift);
+                    }
+                }
+                return fingers;
             }
-            let main_font = FontId::proportional((key_h * 0.45).clamp(10.0, 28.0));
-            if !top.is_empty() && !bottom.is_empty() && top.chars().count() == 1 {
-                painter.text(
-                    Pos2::new(key_rect.center().x, key_rect.top() + key_h * 0.30),
-                    Align2::CENTER_CENTER,
-                    top,
-                    FontId::proportional((key_h * 0.24).clamp(8.0, 15.0)),
-                    Color32::from_rgb(190, 198, 205),
-                );
-                painter.text(
-                    Pos2::new(key_rect.center().x, key_rect.top() + key_h * 0.70),
-                    Align2::CENTER_CENTER,
-                    bottom,
-                    main_font,
-                    Color32::from_rgb(236, 239, 241),
-                );
-            } else {
-                let label = special_key_label(top, row_index, key_index);
-                painter.text(
-                    key_rect.center(),
-                    Align2::CENTER_CENTER,
-                    &label,
-                    FontId::proportional(
-                        (key_h * if key_units > 1.5 { 0.31 } else { 0.36 }).clamp(8.0, 21.0),
-                    ),
-                    Color32::from_rgb(236, 239, 241),
-                );
-            }
-            x += w + gap;
         }
     }
-
-    let legend_y = y0 + 5.0 * key_h + 4.0 * gap + 1.0;
-    let legend = [
-        ("keyboard.finger.left_little", 0),
-        ("keyboard.finger.left_ring", 1),
-        ("keyboard.finger.left_middle", 2),
-        ("keyboard.finger.left_index", 3),
-        ("keyboard.finger.right_index", 4),
-        ("keyboard.finger.right_middle", 5),
-        ("keyboard.finger.right_ring", 6),
-        ("keyboard.finger.right_little", 7),
-        ("keyboard.finger.left_thumb", 8),
-        ("keyboard.finger.right_thumb", 9),
-    ];
-    let item_w = (width - 2.0 * pad_x) / legend.len() as f32;
-    for (i, (label, color_index)) in legend.into_iter().enumerate() {
-        let left = x0 + i as f32 * item_w;
-        let swatch = Rect::from_min_size(Pos2::new(left, legend_y + 3.0), Vec2::new(7.0, 7.0));
-        painter.rect_filled(swatch, CornerRadius::same(2), finger_colors[color_index]);
-        painter.text(
-            Pos2::new(left + 10.0, legend_y + 6.5),
-            Align2::LEFT_CENTER,
-            crate::localization::tr(label),
-            FontId::proportional((height * 0.055).clamp(8.0, 11.0)),
-            Color32::from_rgb(201, 208, 214),
-        );
-    }
+    Vec::new()
 }
 
 fn special_key_label(top: &str, row: usize, column: usize) -> String {
@@ -360,6 +391,9 @@ fn system_key_name(_scan: i32) -> Option<String> {
 }
 
 fn key_matches_character(ch: char, top: &str, bottom: &str) -> bool {
+    if top.chars().count() > 1 || bottom.chars().count() > 1 {
+        return false;
+    }
     let target = ch.to_lowercase().next().unwrap_or(ch);
     top.chars()
         .chain(bottom.chars())
@@ -368,7 +402,7 @@ fn key_matches_character(ch: char, top: &str, bottom: &str) -> bool {
 }
 
 fn requires_shift(ch: char, top: &str, bottom: &str) -> bool {
-    if ch == 'ё' || ch.is_ascii_lowercase() || ('а'..='я').contains(&ch) {
+    if ch == ' ' || ch == 'ё' || ch.is_ascii_lowercase() || ('а'..='я').contains(&ch) {
         return false;
     }
     if ch.is_ascii_uppercase() || ('А'..='Я').contains(&ch) {
@@ -471,6 +505,38 @@ mod tests {
         let shapes = format!("{:?}", output.shapes);
         output.textures_delta.clear();
         shapes
+    }
+
+    #[test]
+    fn hands_follow_expected_character_and_opposite_shift() {
+        use super::active_fingers;
+        assert_eq!(active_fingers(KeyboardLayout::English, Some('q')), vec![0]);
+        assert_eq!(
+            active_fingers(KeyboardLayout::English, Some('Q')),
+            vec![0, 7]
+        );
+        assert_eq!(
+            active_fingers(KeyboardLayout::English, Some('P')),
+            vec![7, 0]
+        );
+        assert_eq!(active_fingers(KeyboardLayout::Russian, Some('ф')), vec![0]);
+        assert_eq!(
+            active_fingers(KeyboardLayout::Russian, Some('Ф')),
+            vec![0, 7]
+        );
+        assert_eq!(active_fingers(KeyboardLayout::Russian, Some('.')), vec![7]);
+        assert_eq!(
+            active_fingers(KeyboardLayout::Russian, Some(',')),
+            vec![7, 0]
+        );
+        assert_eq!(
+            active_fingers(KeyboardLayout::English, Some(' ')),
+            vec![8, 9]
+        );
+        assert_eq!(active_fingers(KeyboardLayout::English, Some('4')), vec![3]);
+        assert_eq!(active_fingers(KeyboardLayout::English, Some('6')), vec![4]);
+        assert!(active_fingers(KeyboardLayout::English, Some('🦀')).is_empty());
+        assert!(active_fingers(KeyboardLayout::English, None).is_empty());
     }
 
     #[test]
