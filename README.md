@@ -16,9 +16,28 @@ This might sound excessive, but we have AI agents now, and they need typing prac
 
 ## Current status
 
-Staminator is a work in progress for Windows. It already has Russian and English exercises, five practice modes, user profiles, results, a lesson editor, and a separate on-screen keyboard. It also supports practice with an external UTF-8 text file.
+Staminator is a work in progress for Windows. It has lessons in ten languages, five practice modes, user profiles, results, a lesson editor, and a separate on-screen keyboard. It also supports practice with an external UTF-8 text file.
 
 The application does not yet match every feature or behavior of the original. See the [task plans](docs/plan/README.md) for progress and [research notes](docs/research.md) for details about Stamina.
+
+## Languages and default lessons
+
+The interface and lessons support the following languages. Each includes a default course adapted from KDE KTouch:
+
+| Language | Lessons |
+| --- | ---: |
+| English | 15 |
+| Russian | 16 |
+| Spanish | 15 |
+| Arabic | 13 |
+| French | 28 |
+| Portuguese (Brazil) | 11 |
+| German | 50 |
+| Italian | 60 |
+| Turkish | 15 |
+| Persian | 13 |
+
+The lesson language, interface language, and keyboard layout are selected independently. On-screen keyboard layouts are currently available for Russian and English; use a system layout for the other languages. Phrase content is not included for the other eight languages. See the [lesson documentation](docs/lessons.md) and [course sources and licensing](lessons/README.md) for details.
 
 ## Run from source
 
