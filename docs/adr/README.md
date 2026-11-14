@@ -13,4 +13,6 @@
 | 0005 | [Каталог уроков](0005-lessons.md) |
 | 0006 | [Хранение данных в SQLite](0006-sqlite-storage.md) |
 | 0007 | [Формат переводов интерфейса](0007-localization.md) |
-| 0008 | [Схемы клавиатур](0008-keyboard-schemas.md) |
+| 0008 | [Автоматизация issue через Codex](0008-issue-automation.md) |
+| 0009 | [Недоверенные ветки в CI](0009-untrusted-ci-branches.md) |
+| 0010 | [Схемы клавиатур](0010-keyboard-schemas.md) |

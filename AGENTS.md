@@ -36,3 +36,4 @@
 - Пользователи и хранение: `User.cpp`, `Options.cpp`, `Progress.cpp`, `Strings.cpp`.
 - Интерфейс: `Stamina.rc`, `MainWnd.cpp`, `TextField.cpp`, `KeybWnd.cpp`, `DlgOptions.cpp`.
 - Звук: `Sound.cpp`, `Music.cpp`, `DlgPlaylist.cpp`.
+- Автоматизация issue и локальный CI: `automation/README.md`, `automation/ci/jenkins-job.xml`.
