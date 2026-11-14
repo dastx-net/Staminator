@@ -44,6 +44,8 @@ DEFAULTS = {
     "stage_timeout_minutes": 120,
     "ci_results_dir": "/srv/data/staminator-ci/results",
     "ci_timeout_minutes": 90,
+    # How long a finished issue is still watched for new comments that start a follow-up round.
+    "followup_days": 14,
     "proxy": "http://127.0.0.1:18888",
     # Hosts that answer directly; everything else goes through the A&D proxy (same split as devuw).
     "no_proxy": "localhost,127.0.0.1,::1,github.com,api.github.com,objects.githubusercontent.com,"
@@ -171,6 +173,8 @@ def set_stage(st, stage, feedback=None):
     log(f"#{st['number']}: {st['stage']} -> {stage}")
     st["stage"] = stage
     st["feedback"] = feedback
+    if stage == "done":
+        st["done_at"] = time.time()
     save_state(st)
 
 
@@ -408,8 +412,9 @@ def ask(st, questions):
     lines = [f"**Stamibot has questions** (stage: {STAGE_LABEL.get(st['stage'], st['stage'])})", ""]
     lines += [f"{i}. {q}" for i, q in enumerate(questions, 1)]
     lines += ["", "Reply in a comment on this issue. Work resumes automatically after the answer."]
-    cid = post_comment(st["number"], "\n".join(lines))
-    st["waiting"] = {"comment_id": cid, "questions": questions}
+    target = st.get("pr_number") or st["number"]
+    cid = post_comment(target, "\n".join(lines).replace("on this issue", "here"))
+    st["waiting"] = {"comment_id": cid, "questions": questions, "target": target}
     save_state(st)
     log(f"#{st['number']}: waiting for answers")
 
@@ -417,9 +422,13 @@ def ask(st, questions):
 def take_answers(st):
     """Move the initiator's replies into feedback. False while there are none."""
     w = st["waiting"]
-    answers = human_comments(st["number"], after_id=w["comment_id"])
+    target = w.get("target") or st["number"]
+    answers = human_comments(target, after_id=w["comment_id"])
     if not answers:
         return False
+    if st.get("pr_seen"):  # answers are not review feedback: move the watermark past them
+        key = "conv" if target == st.get("pr_number") else "issue"
+        st["pr_seen"][key] = max(st["pr_seen"][key], max(c["id"] for c in answers))
     text = "\n\n".join(f"{c['user']['login']}: {c['body']}" for c in answers)
     qa = worktree(st) / ".stamibot" / "qa.md"
     with qa.open("a", encoding="utf-8") as f:
@@ -476,6 +485,7 @@ def stage_implement(st):
     commit_if_dirty(st, r["commit_message"])
     if commits_ahead(st) == 0:
         return block(st, "The implementation turn produced no changes.\n\n" + r["summary"])
+    st["last_summary"] = r["summary"]
     st["pr_title"] = r["pr_title"] or st.get("pr_title") or st["issue"]["title"]
     st["pr_body"] = r["pr_body"] or st.get("pr_body") or r["summary"]
     set_stage(st, "impl_review", "The implementation changed (new commit on the branch). Review it again.")
@@ -524,7 +534,13 @@ def stage_ci_wait(st):
 
 
 def stage_pr(st):
-    body = (f"{st['pr_body'].strip()}\n\nCloses #{st['number']}\n\n---\n"
+    if st.get("pr_number"):
+        post_comment(st["pr_number"], f"**Stamibot addressed the feedback** (head `{head_sha(st)[:12]}`).\n\n"
+                     f"{st.get('last_summary') or ''}\n\nReview notes left open (P2 and below):\n\n"
+                     f"{st.get('review_notes') or '- none'}")
+        return set_stage(st, "pr_open")
+    link = "Follow-up to" if st.get("followup") else "Closes"
+    body = (f"{st['pr_body'].strip()}\n\n{link} #{st['number']}\n\n---\n"
             f"Automated by stamibot: implementation `{CFG['impl_model']}`, review `{CFG['review_model']}`.\n\n"
             f"Review notes left open (P2 and below):\n\n{st.get('review_notes') or '- none'}\n")
     if st.get("ci", {}).get("url"):
@@ -541,8 +557,95 @@ def stage_pr(st):
             raise StageError("GitHub refused the pull request: " + e.read().decode("utf-8", "replace")[:500])
         pr = found[0]
     st["pr_url"] = pr["html_url"]
-    post_comment(st["number"], f"**Pull request is ready:** {pr['html_url']}")
-    set_stage(st, "done")
+    st["pr_number"] = pr["number"]
+    cid = post_comment(st["number"], f"**Pull request is ready:** {pr['html_url']}\n\n"
+                       "Review comments on the pull request and new comments here start another round.")
+    old = st.get("pr_seen") or {}
+    st["pr_seen"] = {"issue": max(cid, old.get("issue", 0)), "conv": 0, "inline": 0, "review": 0,
+                     "updated_at": None, "issue_updated_at": st.get("seen_updated_at")}
+    set_stage(st, "pr_open")
+
+
+def collect_feedback(st, pr):
+    """New review feedback from trusted people on the pull request and the issue, as prompt text parts."""
+    n = st["pr_number"]
+    seen = st["pr_seen"]
+    trusted = CFG["initiators"]
+    parts = []
+    if pr["updated_at"] != seen.get("updated_at"):
+        for r in gh("GET", repo_path(f"/pulls/{n}/reviews"), params={"per_page": 100}):
+            body = (r.get("body") or "").strip()
+            if (r["id"] > seen["review"] and r["user"]["login"] in trusted and body and MARK not in body
+                    and r["state"] in ("CHANGES_REQUESTED", "COMMENTED")):
+                parts.append(f"Review by {r['user']['login']} ({r['state']}):\n{body}")
+            seen["review"] = max(seen["review"], r["id"])
+        for c in gh("GET", repo_path(f"/pulls/{n}/comments"), params={"per_page": 100}):
+            body = c.get("body") or ""
+            if c["id"] > seen["inline"] and c["user"]["login"] in trusted and MARK not in body:
+                hunk = "\n".join((c.get("diff_hunk") or "").splitlines()[-8:])
+                line = c.get("line") or c.get("original_line") or "?"
+                parts.append(f"Inline comment by {c['user']['login']} on {c['path']}:{line}:\n{body}\n\n"
+                             f"Code context:\n```\n{hunk}\n```")
+            seen["inline"] = max(seen["inline"], c["id"])
+        for c in human_comments(n, after_id=seen["conv"]):
+            parts.append(f"Pull request comment by {c['user']['login']}:\n{c['body']}")
+            seen["conv"] = max(seen["conv"], c["id"])
+        seen["updated_at"] = pr["updated_at"]
+    if seen.get("issue_updated_at") != st.get("seen_updated_at"):
+        for c in human_comments(st["number"], after_id=seen["issue"]):
+            parts.append(f"Issue comment by {c['user']['login']}:\n{c['body']}")
+            seen["issue"] = max(seen["issue"], c["id"])
+        seen["issue_updated_at"] = st.get("seen_updated_at")
+    save_state(st)
+    return parts
+
+
+def start_feedback_round(st, parts):
+    log(f"#{st['number']}: {len(parts)} feedback item(s)")
+    st["rounds"] = {"plan_review": 0, "impl_review": 0, "ci": 0}
+    st["stage_started"] = None
+    set_stage(st, "implement",
+              "Reviewers left feedback on your work for this issue. Address every point: change the code where "
+              "needed; where you disagree or the point is a question, answer it in `summary` "
+              "(the summary is posted to the pull request).\n\n" + "\n\n---\n\n".join(parts))
+
+
+def stage_pr_open(st):
+    """Watch the open pull request. True when feedback started a new round or the PR was closed."""
+    pr = gh("GET", repo_path(f"/pulls/{st['pr_number']}"))
+    if pr["state"] != "open":
+        set_stage(st, "done")
+        return True
+    parts = collect_feedback(st, pr)
+    if not parts:
+        return False
+    start_feedback_round(st, parts)
+    return True
+
+
+def followup(st):
+    """A finished issue got new comments: start another round. True when a round started."""
+    pr = gh("GET", repo_path(f"/pulls/{st['pr_number']}"))
+    parts = collect_feedback(st, pr)
+    if not parts:
+        return False
+    st["followup"] = st.get("followup", 0) + 1
+    if pr["state"] != "open":
+        # The old branch is merged or abandoned: continue on a fresh one from the base branch, with a new PR.
+        ensure_repo()
+        wt = worktree(st)
+        if wt.exists():
+            git("worktree", "remove", "--force", str(wt))
+        st["branch"] = f"issue-{st['number']}-followup-{st['followup']}"
+        git("worktree", "add", "-B", st["branch"], str(wt), "origin/" + CFG["base_branch"])
+        (wt / ".stamibot").mkdir(exist_ok=True)
+        (wt / ".stamibot" / "plan.md").write_text(
+            f"Follow-up round after pull request #{st['pr_number']} ({pr['html_url']}) was closed.\n"
+            "There is no separate plan: the task is the reviewer feedback given in the prompt.\n", encoding="utf-8")
+        st["pr_number"] = None
+        st["pr_url"] = None
+    start_feedback_round(st, parts)
+    return True
 
 
 STAGES = {"plan": stage_plan, "plan_review": stage_plan_review, "implement": stage_implement,
@@ -556,6 +659,8 @@ def try_retry(st):
         if body.startswith("/retry"):
             st["errors"] = 0
             st["rounds"] = {"plan_review": 0, "impl_review": 0, "ci": 0}
+            if st.get("pr_seen"):
+                st["pr_seen"]["issue"] = max(st["pr_seen"]["issue"], c["id"])
             set_stage(st, st.get("blocked_from") or "plan", body[len("/retry"):].strip() or None)
             return True
     return False
@@ -573,6 +678,9 @@ def advance(st):
         try:
             if st["stage"] == "ci_wait":
                 if not stage_ci_wait(st):
+                    return
+            elif st["stage"] == "pr_open":
+                if not stage_pr_open(st):
                     return
             else:
                 STAGES[st["stage"]](st)
@@ -632,19 +740,39 @@ def tick():
                          "Questions will be asked here.")
         st["issue"] = {"title": issue["title"], "body": issue.get("body"), "author": issue["user"]["login"]}
         # Waiting and blocked issues only move on a new comment: skip them while nothing changed.
-        if (st.get("waiting") or st["stage"] == "blocked") and not changed:
+        on_pr = (st.get("waiting") or {}).get("target") not in (None, n)
+        if (st.get("waiting") or st["stage"] == "blocked") and not changed and not on_pr:
             continue
         st["seen_updated_at"] = issue["updated_at"]
         save_state(st)
         advance(st)
     for st in all_states():
-        if st["number"] not in open_numbers and st["stage"] not in TERMINAL:
+        n = st["number"]
+        if n in open_numbers:
+            continue
+        recent = time.time() - st.get("done_at", 0) < CFG["followup_days"] * 86400
+        if st.get("followup") and st["stage"] not in ("done", "cancelled", "ignored"):
+            # A follow-up round runs on a closed issue.
+            st["seen_updated_at"] = gh("GET", repo_path(f"/issues/{n}"))["updated_at"]
+            advance(st)
+        elif st["stage"] == "done" and st.get("pr_number") and recent:
+            st["seen_updated_at"] = gh("GET", repo_path(f"/issues/{n}"))["updated_at"]
+            try:
+                if followup(st):
+                    advance(st)
+            except Exception as e:
+                log(f"#{n}: follow-up check failed: {e}")
+        elif st["stage"] == "pr_open":
+            set_stage(st, "done")  # the issue was closed, normally by merging the pull request
+        elif st["stage"] not in TERMINAL:
             set_stage(st, "cancelled")  # closed or unassigned meanwhile
 
 
 def status():
     for st in all_states():
         extra = "waiting for answer" if st.get("waiting") else (st.get("paused") or "")
+        if st["stage"] == "pr_open":
+            extra = "watching the pull request for feedback"
         print(f"#{st['number']:<5} {st['stage']:<12} {st.get('branch') or '-':<40} {st.get('pr_url') or ''} {extra}")
     limits, ts = read_budget()
     if limits:
