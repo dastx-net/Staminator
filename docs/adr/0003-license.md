@@ -10,4 +10,4 @@
 
 **До публикации:** проверить происхождение и права на Stamina, FMOD, JPEG и прочие материалы, а также лицензии и уведомления всех распространяемых зависимостей; проверить состав и историю Git на закрытые материалы и личные данные. При неясных правах исключить соответствующие материалы из публичного состава и при необходимости получить разрешение правообладателя. Проверить допустимость распространения самой реализации и артефактов. Обычный Git ignore не удаляет файлы из истории. При сомнениях обратиться к юристу; лицензия не заменяет такую проверку.
 
-**Подробности:** [подготовка к публикации](../plan/todo/github-release.md), [лицензия MIT](https://opensource.org/license/mit), [GitHub: лицензирование репозитория](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository).
+**Подробности:** [подготовка к публикации](../plan/done/github-release.md), [лицензия MIT](https://opensource.org/license/mit), [GitHub: лицензирование репозитория](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository).
