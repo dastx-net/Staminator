@@ -29,6 +29,7 @@ Issue, назначенный кем-то другим, бот игнориру�
 - Лимит починок CI: 3. Дальше бот останавливается (`blocked`) и пишет причину. Продолжить: комментарий `/retry` с необязательными указаниями.
 - Упавший CI возвращает задачу на `implement` с хвостом лога.
 - Закрытие issue или снятие назначения до открытия pull request отменяет работу.
+- Ветку с правками в защищённых путях (`protected_paths`: `automation/`, `.github/`, `.cargo/`) бот не пушит и останавливается. `/retry allow-protected` разрешает push именно этого коммита. Любой другой `/retry` возвращает задачу на `implement` с требованием отменить эти правки.
 
 ## Замечания после открытия pull request
 
@@ -68,11 +69,25 @@ git -C ~/stamibot/bot pull                                 # обновить к
 
 ## CI в Jenkins
 
-Задача `staminator` на Jenkins easy-day (`http://192.168.1.98:8080`) опрашивает GitHub раз в минуту и собирает каждую новую ревизию любой ветки по `Jenkinsfile`:
+Задача `staminator` на Jenkins easy-day (`http://192.168.1.98:8080`) опрашивает GitHub раз в минуту и собирает каждую новую ревизию любой ветки. Pipeline хранится в конфигурации задачи; копия лежит в `automation/ci/jenkins-job.xml`. `Jenkinsfile` в ветке ничего не значит.
 
-1. Собирает образ `staminator-ci` из `automation/ci/Dockerfile` (версия Rust из `rust-toolchain.toml`).
-2. Запускает `automation/ci/run.sh`: UTF-8, fmt, clippy, тесты с покрытием 95%, сборка `x86_64-pc-windows-gnu`.
-3. `automation/ci/report.py` кладёт результат в `/srv/data/staminator-ci/results/<sha>.json`. Бот читает этот файл: учётка Jenkins ему не нужна.
+1. Собирает образ `staminator-ci:<версия>` из `automation/ci/Dockerfile` ветки `master`. Версию Rust берёт из `rust-toolchain.toml` собираемой ветки; допустим только номер вида `1.99.1`.
+2. Скачивает зависимости: `cargo fetch --locked` в сети Docker `staminator-ci`. Код ветки на этом шаге не выполняется.
+3. Запускает `automation/ci/run.sh` собираемой ветки в контейнере без сети: UTF-8, fmt, clippy, тесты с покрытием 95%, сборка `x86_64-pc-windows-gnu`.
+4. `automation/ci/report.py` из `master` кладёт результат в `/srv/data/staminator-ci/results/<sha>.json`. Бот читает этот файл: учётка Jenkins ему не нужна.
+
+### Граница доверия
+
+Ветка считается недоверенной: её пишет Codex, а он читает issue, зависимости и веб.
+
+- На хосте выполняется только pipeline из задачи и файлы `automation/ci` из `master`. Агент Jenkins состоит в группе `docker`, то есть равен root на сервере.
+- Код ветки работает только в контейнере: без сети, без `.git`, без привилегий (`--cap-drop ALL`, `no-new-privileges`), с лимитами памяти и числа процессов. Видит свою копию дерева, кеш зависимостей на чтение и кеш сборки своей ветки.
+- Кеш сборки отдельный на ветку (`cache/targets/<ветка>`), новая ветка получает копию кеша `master`. Каталоги старше 14 дней удаляются.
+- Из `ci-out` публикуются только обычные файлы `.exe`; ссылки пропускаются.
+- `master` защищён на GitHub: изменения только через pull request, без force push.
+- Сеть `staminator-ci` (`172.31.250.0/24`) отрезана от хоста, домашней сети и VM правилами из `automation/ci/host-firewall.sh`. Скрипт запускают один раз под root.
+
+Изменение pipeline: поправить `automation/ci/jenkins-job.xml`, после слияния в `master` применить файл к задаче (способы указаны в его заголовке).
 
 ## End-to-end в Windows VM
 
@@ -92,5 +107,5 @@ Windows 11 Pro держит одну активную сессию: при вх�
 
 - В VM нет наследуемых данных `src/stamina_setup` (фразы): e2e проверяет встроенные уроки из `lessons`, которые Codex копирует рядом с `.exe`.
 - Одобрение (`Approve`) и ревью без текста бот не обрабатывает. Мержит человек.
-- Codex и токен GitHub работают под одной учёткой. Изоляция держится на отдельном пользователе и списке доверенных инициаторов.
-- Каталог `/srv/data/staminator-ci` открыт на запись всем локальным пользователям (на сервере нет `setfacl`).
+- Codex и токен GitHub работают под одной учёткой, сеть у Codex включена. Codex может прочитать токен, ключ SSH и пароль тестовой VM. Изоляция держится на отдельном пользователе и списке доверенных инициаторов. Токен должен быть fine-grained: один репозиторий, права Contents, Issues и Pull requests, без Workflows и Administration. План разделения учёток: [docs/plan/todo/automation-hardening.md](../docs/plan/todo/automation-hardening.md).
+- Каталог `/srv/data/staminator-ci` открыт на запись всем локальным пользователям (на сервере нет `setfacl`); `results` и `artifacts` пишет только агент Jenkins.

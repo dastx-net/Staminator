@@ -64,7 +64,7 @@ cargo test --workspace
 
 ### Local CI and issue automation
 
-Every pushed branch is built and tested by our local Jenkins CI; see the [Jenkinsfile](Jenkinsfile). Jenkins is reachable only from the home network at `http://192.168.1.98:8080`. Issues assigned to `losinkatorf` can be picked up by the issue bot. Before opening a pull request, the bot checks the Windows build end to end in a test VM when available; see the [automation guide](automation/README.md).
+Every pushed branch is built and tested by our local Jenkins CI; see the [job definition](automation/ci/jenkins-job.xml). Jenkins is reachable only from the home network at `http://192.168.1.98:8080`. Issues assigned to `losinkatorf` can be picked up by the issue bot. Before opening a pull request, the bot checks the Windows build end to end in a test VM when available; see the [automation guide](automation/README.md).
 
 The original Stamina source is kept separately as local reference material at `../Stamina` on the project's development machine. It is not included in this repository and may not be available on other machines. The optional local installation is excluded from Git and may contain personal data and third-party media.
 

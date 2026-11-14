@@ -14,7 +14,6 @@ Cargo.lock text eol=lf
 *.sh text eol=lf
 *.py text eol=lf
 *.json text eol=lf
-Jenkinsfile text eol=lf
 Dockerfile text eol=lf
 *.service text eol=lf
 *.timer text eol=lf

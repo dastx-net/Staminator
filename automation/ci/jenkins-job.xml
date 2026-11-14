@@ -1,6 +1,8 @@
 <?xml version='1.1' encoding='UTF-8'?>
-<!-- Jenkins job "staminator" on easy-day. Create: POST this file to /createItem?name=staminator
-     (Content-Type: application/xml) or put it into $JENKINS_HOME/jobs/staminator/config.xml and reload. -->
+<!-- Jenkins job "staminator" on easy-day. The pipeline lives here, not in the repository tree:
+     a pushed branch must not be able to change what runs on the build host (automation/README.md).
+     Apply: POST this file to /job/staminator/config.xml (Content-Type: application/xml), or put it
+     into $JENKINS_HOME/jobs/staminator/config.xml and reload the configuration. -->
 <flow-definition plugin="workflow-job">
   <description>Staminator: checks and Windows build for every pushed branch. Results go to /srv/data/staminator-ci for the issue bot (automation/README.md).</description>
   <keepDependencies>false</keepDependencies>
@@ -14,31 +16,131 @@
       </triggers>
     </org.jenkinsci.plugins.workflow.job.properties.PipelineTriggersJobProperty>
   </properties>
-  <definition class="org.jenkinsci.plugins.workflow.cps.CpsScmFlowDefinition" plugin="workflow-cps">
-    <scm class="hudson.plugins.git.GitSCM" plugin="git">
-      <configVersion>2</configVersion>
-      <userRemoteConfigs>
-        <hudson.plugins.git.UserRemoteConfig>
-          <url>https://github.com/dastx-net/Staminator.git</url>
-        </hudson.plugins.git.UserRemoteConfig>
-      </userRemoteConfigs>
-      <branches>
-        <hudson.plugins.git.BranchSpec>
-          <name>**</name>
-        </hudson.plugins.git.BranchSpec>
-      </branches>
-      <doGenerateSubmoduleConfigurations>false</doGenerateSubmoduleConfigurations>
-      <submoduleCfg class="empty-list"/>
-      <extensions>
-        <hudson.plugins.git.extensions.impl.CloneOption>
-          <shallow>false</shallow>
-          <noTags>true</noTags>
-          <honorRefspec>false</honorRefspec>
-        </hudson.plugins.git.extensions.impl.CloneOption>
-      </extensions>
-    </scm>
-    <scriptPath>Jenkinsfile</scriptPath>
-    <lightweight>false</lightweight>
+  <definition class="org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition" plugin="workflow-cps">
+    <script><![CDATA[
+// Trust boundary: the branch under test is untrusted. Its files are never executed on the host and
+// never see the Git metadata. They run only inside a container without network. Everything the
+// host executes (this script, the image recipe, report.py) comes from the job or from master.
+pipeline {
+    agent { label 'easy-day' }
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        timeout(time: 60, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+    environment {
+        CI_DROP = '/srv/data/staminator-ci'
+        CI_NETWORK = 'staminator-ci'
+        CI_SUBNET = '172.31.250.0/24'
+    }
+    stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    def vars = dir('src') {
+                        checkout([$class: 'GitSCM',
+                            userRemoteConfigs: [[url: 'https://github.com/dastx-net/Staminator.git']],
+                            branches: [[name: '**']],
+                            extensions: [[$class: 'CloneOption', shallow: false, noTags: true, honorRefspec: false]]])
+                    }
+                    env.CI_SHA = vars.GIT_COMMIT
+                    env.CI_BRANCH = vars.GIT_BRANCH
+                    env.CI_SLUG = sh(returnStdout: true, script: '''
+                        printf '%s' "${CI_BRANCH#origin/}" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80
+                    ''').trim()
+                    env.RUST_VERSION = sh(returnStdout: true, script: '''
+                        git -C src show HEAD:rust-toolchain.toml \
+                            | sed -nE 's/^channel = "([0-9]+([.][0-9]+){1,2})"$/\\1/p' | head -n1
+                    ''').trim()
+                    if (!env.RUST_VERSION) {
+                        error('rust-toolchain.toml: channel must be a plain version such as 1.99.1')
+                    }
+                    env.CI_IMAGE = "staminator-ci:${env.RUST_VERSION}"
+                }
+                // build: the tree under test, without .git. trusted: CI files from master.
+                sh '''
+                    set -eu
+                    rm -rf build trusted ci.log
+                    mkdir build trusted
+                    git -C src archive --format=tar HEAD | tar -x -C build
+                    git -C src archive --format=tar origin/master -- automation/ci | tar -x -C trusted
+                '''
+            }
+        }
+        stage('CI image') {
+            steps {
+                sh '''
+                    set -eu
+                    docker build --build-arg RUST_VERSION="$RUST_VERSION" -t "$CI_IMAGE" trusted/automation/ci
+                    docker network inspect "$CI_NETWORK" >/dev/null 2>&1 \
+                        || docker network create --subnet "$CI_SUBNET" "$CI_NETWORK"
+                '''
+            }
+        }
+        stage('Caches') {
+            steps {
+                sh '''
+                    set -eu
+                    cache="$CI_DROP/cache"
+                    mkdir -p "$cache/registry" "$cache/git" "$cache/targets"
+                    rm -rf "$cache/target"  # layout before per-branch caches
+                    # One build cache per branch: a branch cannot plant objects into another branch's build.
+                    find "$cache/targets" -mindepth 1 -maxdepth 1 -type d -mtime +14 -exec rm -rf {} +
+                    if [ ! -d "$cache/targets/$CI_SLUG" ] && [ -d "$cache/targets/master" ]; then
+                        cp -a "$cache/targets/master" "$cache/targets/$CI_SLUG"
+                    fi
+                    mkdir -p "$cache/targets/$CI_SLUG"
+                    touch "$cache/targets/$CI_SLUG"
+                '''
+            }
+        }
+        stage('Fetch dependencies') {
+            steps {
+                // The only step with network. It runs cargo itself, no code from the branch.
+                sh '''
+                    set -eu
+                    docker run --rm -u "$(id -u):$(id -g)" --network "$CI_NETWORK" \
+                        --cap-drop ALL --security-opt no-new-privileges \
+                        -e HOME=/tmp \
+                        -v "$PWD/build":/work:ro \
+                        -v "$CI_DROP/cache/registry":/usr/local/cargo/registry \
+                        -v "$CI_DROP/cache/git":/usr/local/cargo/git \
+                        "$CI_IMAGE" cargo fetch --locked
+                '''
+            }
+        }
+        stage('Check and build') {
+            steps {
+                sh '''#!/bin/bash
+                    set -euo pipefail
+                    docker run --rm -u "$(id -u):$(id -g)" --network none \
+                        --cap-drop ALL --security-opt no-new-privileges --pids-limit 8192 --memory 24g \
+                        -e HOME=/tmp -e CARGO_TARGET_DIR=/cache/target -e CARGO_NET_OFFLINE=true \
+                        -v "$PWD/build":/work \
+                        -v "$CI_DROP/cache/registry":/usr/local/cargo/registry:ro \
+                        -v "$CI_DROP/cache/git":/usr/local/cargo/git:ro \
+                        -v "$CI_DROP/cache/targets/$CI_SLUG":/cache/target \
+                        "$CI_IMAGE" bash automation/ci/run.sh 2>&1 | tee ci.log
+                '''
+            }
+        }
+    }
+    post {
+        always {
+            script { env.CI_RESULT = currentBuild.currentResult }
+            sh '''
+                set -eu
+                [ -n "${CI_SHA:-}" ] || exit 0
+                python3 -I trusted/automation/ci/report.py "$CI_DROP" "$CI_SHA" "$CI_BRANCH" \
+                    "$CI_RESULT" "$BUILD_URL" ci.log build/ci-out || true
+            '''
+            archiveArtifacts artifacts: 'build/ci-out/*.exe', allowEmptyArchive: true, followSymlinks: false
+        }
+    }
+}
+]]></script>
+    <sandbox>true</sandbox>
   </definition>
   <triggers/>
   <disabled>false</disabled>
