@@ -252,5 +252,21 @@
   "background.error": "Arka plan yüklenemiyor",
   "background.builtin": "Varsayılan piksel sanatı",
   "keyboard.unsupported_layout": "Bu dil için ekran klavyesi kullanılamıyor. Sistem klavye düzenini kullanın.",
-  "language.partial_translation": "Bu çeviri eksik; eksik metin Rusça gösterilir."
+  "language.partial_translation": "Bu çeviri eksik; eksik metin Rusça gösterilir.",
+  "profile.search": "Ada göre ara",
+  "profile.no_matches": "Eşleşen profil yok",
+  "profile.current": "{name} · geçerli",
+  "profile.active": "Geçerli profil: {name}",
+  "profile.manage": "Yönet…",
+  "profile.management": "Profilleri yönet",
+  "profile.target": "Seçili profil: {name}",
+  "profile.back": "Seçime dön",
+  "profile.delete_title": "Profil silinsin mi?",
+  "profile.delete_warning": "“{name}” silinsin mi? Geçmiş ve ayarlar kaybolacak.",
+  "profile.delete_confirm": "Sil",
+  "cancel": "İptal",
+  "profile.active_marker": " · etkin",
+  "profile.selected_marker": " · hedef",
+  "profile.delete_active": "Etkin profili sil",
+  "profile.delete_selected": "Seçili profili sil"
 }

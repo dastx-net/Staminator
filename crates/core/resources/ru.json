@@ -256,5 +256,21 @@
   "background.error": "Не удалось загрузить фон",
   "background.builtin": "Стандартный пиксель-арт",
   "keyboard.unsupported_layout": "Экранная клавиатура для этого языка пока недоступна. Используйте системную раскладку.",
-  "language.partial_translation": "Перевод неполный: недостающие строки показаны по-русски."
+  "language.partial_translation": "Перевод неполный: недостающие строки показаны по-русски.",
+  "profile.search": "Поиск по имени",
+  "profile.no_matches": "Совпадений не найдено",
+  "profile.current": "{name} · текущий",
+  "profile.active": "Текущий профиль: {name}",
+  "profile.manage": "Управление…",
+  "profile.management": "Управление профилями",
+  "profile.target": "Выбранный профиль: {name}",
+  "profile.back": "Назад к выбору",
+  "profile.delete_title": "Удалить профиль?",
+  "profile.delete_warning": "Удалить «{name}»? История и настройки профиля будут потеряны.",
+  "profile.delete_confirm": "Удалить",
+  "cancel": "Отмена",
+  "profile.active_marker": " · активен",
+  "profile.selected_marker": " · цель",
+  "profile.delete_active": "Удалить активный профиль",
+  "profile.delete_selected": "Удалить выбранный профиль"
 }

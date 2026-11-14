@@ -252,5 +252,21 @@
   "storage.revision_conflict": "داده‌های نمایه در پنجرهٔ دیگری تغییر کرده‌اند (نسخهٔ مورد انتظار {expected}، نسخهٔ فعلی {actual}).",
   "storage.restore_conflict": "پایگاه داده هنگام آماده‌سازی بازیابی تغییر کرد.",
   "keyboard.unsupported_layout": "صفحه‌کلید روی صفحه برای این زبان در دسترس نیست. از چیدمان سیستم استفاده کنید.",
-  "language.partial_translation": "ترجمهٔ ناقص"
+  "language.partial_translation": "ترجمهٔ ناقص",
+  "profile.search": "جست‌وجو بر اساس نام",
+  "profile.no_matches": "نمایهٔ منطبقی پیدا نشد",
+  "profile.current": "{name} · فعلی",
+  "profile.active": "نمایهٔ فعلی: {name}",
+  "profile.manage": "مدیریت…",
+  "profile.management": "مدیریت نمایه‌ها",
+  "profile.target": "نمایهٔ انتخاب‌شده: {name}",
+  "profile.back": "بازگشت به انتخاب",
+  "profile.delete_title": "حذف نمایه؟",
+  "profile.delete_warning": "«{name}» حذف شود؟ تاریخچه و تنظیمات آن از بین می‌رود.",
+  "profile.delete_confirm": "حذف",
+  "cancel": "لغو",
+  "profile.active_marker": " · فعال",
+  "profile.selected_marker": " · هدف",
+  "profile.delete_active": "حذف نمایهٔ فعال",
+  "profile.delete_selected": "حذف نمایهٔ انتخاب‌شده"
 }

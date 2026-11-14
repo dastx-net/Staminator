@@ -252,5 +252,21 @@
   "background.error": "Impossibile caricare lo sfondo",
   "background.builtin": "Pixel art predefinita",
   "keyboard.unsupported_layout": "La tastiera su schermo non è disponibile per questa lingua. Usa un layout di sistema.",
-  "language.partial_translation": "La traduzione è incompleta; i testi mancanti vengono mostrati in russo."
+  "language.partial_translation": "La traduzione è incompleta; i testi mancanti vengono mostrati in russo.",
+  "profile.search": "Cerca per nome",
+  "profile.no_matches": "Nessun profilo corrispondente",
+  "profile.current": "{name} · attuale",
+  "profile.active": "Profilo attuale: {name}",
+  "profile.manage": "Gestisci…",
+  "profile.management": "Gestisci profili",
+  "profile.target": "Profilo selezionato: {name}",
+  "profile.back": "Torna alla selezione",
+  "profile.delete_title": "Eliminare il profilo?",
+  "profile.delete_warning": "Eliminare “{name}”? La cronologia e le impostazioni andranno perse.",
+  "profile.delete_confirm": "Elimina",
+  "cancel": "Annulla",
+  "profile.active_marker": " · attivo",
+  "profile.selected_marker": " · obiettivo",
+  "profile.delete_active": "Elimina profilo attivo",
+  "profile.delete_selected": "Elimina profilo selezionato"
 }

@@ -252,5 +252,21 @@
   "storage.revision_conflict": "Los datos del perfil cambiaron en otra ventana (revisión esperada {expected}, actual {actual}).",
   "storage.restore_conflict": "La base de datos cambió mientras se preparaba la restauración.",
   "keyboard.unsupported_layout": "El teclado en pantalla no está disponible para este idioma. Usa una distribución del sistema.",
-  "language.partial_translation": "Traducción parcial"
+  "language.partial_translation": "Traducción parcial",
+  "profile.search": "Buscar por nombre",
+  "profile.no_matches": "No hay perfiles coincidentes",
+  "profile.current": "{name} · actual",
+  "profile.active": "Perfil actual: {name}",
+  "profile.manage": "Administrar…",
+  "profile.management": "Administrar perfiles",
+  "profile.target": "Perfil seleccionado: {name}",
+  "profile.back": "Volver a la selección",
+  "profile.delete_title": "¿Eliminar perfil?",
+  "profile.delete_warning": "¿Eliminar «{name}»? Se perderán su historial y sus ajustes.",
+  "profile.delete_confirm": "Eliminar",
+  "cancel": "Cancelar",
+  "profile.active_marker": " · actual",
+  "profile.selected_marker": " · objetivo",
+  "profile.delete_active": "Eliminar perfil actual",
+  "profile.delete_selected": "Eliminar perfil seleccionado"
 }

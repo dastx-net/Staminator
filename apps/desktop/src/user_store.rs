@@ -199,6 +199,41 @@ pub struct UserStore {
 }
 
 impl UserStore {
+    /// Read a window scale for any profile ID without changing the active profile.
+    pub fn profile_window_scale(&self, profile_id: &str, id: &str) -> io::Result<f32> {
+        if profile_id.trim().is_empty() || id.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "profile and window IDs must not be empty",
+            ));
+        }
+        let profile = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    localization::tr("profile.not_found"),
+                )
+            })?;
+        if self.database {
+            let key = format!("window_scale:{id}");
+            if let Some(value) = self
+                .database()?
+                .expect("database flag")
+                .get_setting(profile_id, &key)
+                .map_err(storage_io_error)?
+                && let Ok(scale) = serde_json::from_str::<f32>(&value)
+                && scale.is_finite()
+                && (0.5..=3.0).contains(&scale)
+            {
+                return Ok(scale);
+            }
+        }
+        Ok(profile.window_scales.get(id).copied().unwrap_or(1.0))
+    }
+
     /// Read the scale for a stable window ID in the active profile.
     pub fn window_scale(&self, id: &str) -> io::Result<f32> {
         if id.trim().is_empty() {

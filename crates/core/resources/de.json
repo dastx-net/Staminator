@@ -252,5 +252,21 @@
   "background.error": "Hintergrund kann nicht geladen werden",
   "background.builtin": "Standard-Pixel-Art",
   "keyboard.unsupported_layout": "Die Bildschirmtastatur ist für diese Sprache nicht verfügbar. Verwenden Sie ein Systemlayout.",
-  "language.partial_translation": "Die Übersetzung ist unvollständig; fehlende Texte werden auf Russisch angezeigt."
+  "language.partial_translation": "Die Übersetzung ist unvollständig; fehlende Texte werden auf Russisch angezeigt.",
+  "profile.search": "Nach Namen suchen",
+  "profile.no_matches": "Keine passenden Profile",
+  "profile.current": "{name} · aktuell",
+  "profile.active": "Aktuelles Profil: {name}",
+  "profile.manage": "Verwalten…",
+  "profile.management": "Profile verwalten",
+  "profile.target": "Ausgewähltes Profil: {name}",
+  "profile.back": "Zurück zur Auswahl",
+  "profile.delete_title": "Profil löschen?",
+  "profile.delete_warning": "„{name}“ löschen? Verlauf und Einstellungen gehen verloren.",
+  "profile.delete_confirm": "Löschen",
+  "cancel": "Abbrechen",
+  "profile.active_marker": " · aktiv",
+  "profile.selected_marker": " · Ziel",
+  "profile.delete_active": "Aktives Profil löschen",
+  "profile.delete_selected": "Ausgewähltes Profil löschen"
 }

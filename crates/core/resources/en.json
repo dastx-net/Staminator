@@ -252,5 +252,21 @@
   "background.error": "Cannot load background",
   "background.builtin": "Default pixel art",
   "keyboard.unsupported_layout": "The on-screen keyboard for this language is not available yet. Use a system keyboard layout.",
-  "language.partial_translation": "This translation is incomplete; missing text is shown in Russian."
+  "language.partial_translation": "This translation is incomplete; missing text is shown in Russian.",
+  "profile.search": "Search by name",
+  "profile.no_matches": "No matching profiles",
+  "profile.current": "{name} · current",
+  "profile.active": "Current profile: {name}",
+  "profile.manage": "Manage…",
+  "profile.management": "Manage profiles",
+  "profile.target": "Selected profile: {name}",
+  "profile.back": "Back to profile selection",
+  "profile.delete_title": "Delete profile?",
+  "profile.delete_warning": "Delete “{name}”? Its history and settings will be lost.",
+  "profile.delete_confirm": "Delete",
+  "cancel": "Cancel",
+  "profile.active_marker": " · active",
+  "profile.selected_marker": " · selected target",
+  "profile.delete_active": "Delete active profile",
+  "profile.delete_selected": "Delete selected profile"
 }

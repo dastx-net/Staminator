@@ -183,6 +183,15 @@ fn localized_error(key: &str, error: impl std::fmt::Display) -> String {
     localization::format(key, &FormatArgs::new().insert("error", error))
 }
 
+fn filtered_profiles(profiles: &[user_store::Profile], query: &str) -> Vec<(String, String)> {
+    let query = query.trim().to_lowercase();
+    profiles
+        .iter()
+        .filter(|profile| query.is_empty() || profile.name.to_lowercase().contains(&query))
+        .map(|profile| (profile.id.clone(), profile.name.clone()))
+        .collect()
+}
+
 fn keyboard_setting_path() -> Option<PathBuf> {
     std::env::var_os("APPDATA")
         .map(PathBuf::from)
@@ -443,6 +452,10 @@ struct StaminatorApp {
     result_recorded: bool,
     users: UserStore,
     profiles_open: bool,
+    profile_management_open: bool,
+    profile_management_target: String,
+    profile_filter: String,
+    profile_delete_confirmation: Option<(String, String)>,
     progress_open: bool,
     profile_name_input: String,
     profile_error: String,
@@ -954,6 +967,10 @@ impl StaminatorApp {
             result_recorded: false,
             users,
             profiles_open: false,
+            profile_management_open: false,
+            profile_management_target: String::new(),
+            profile_filter: String::new(),
+            profile_delete_confirmation: None,
             progress_open: false,
             profile_name_input: String::new(),
             profile_error,
@@ -1727,6 +1744,8 @@ impl StaminatorApp {
             || self.background_open
             || self.chooser_open
             || self.profiles_open
+            || self.profile_management_open
+            || self.profile_delete_confirmation.is_some()
             || self.lesson_editor.is_some()
             || self.phrase_editor.is_some()
         {
@@ -2237,25 +2256,60 @@ impl StaminatorApp {
         self.sync_profile_training();
         self.restore_external_text();
         self.profile_error.clear();
+        self.profile_management_target = self.users.active_profile_id().to_owned();
+        self.profile_name_input.clear();
         Ok(())
     }
 
+    #[cfg(test)]
     fn export_profile_to(&self, path: &std::path::Path) -> Result<(), String> {
+        self.export_profile_id_to(self.users.active_profile_id(), path)
+    }
+
+    fn export_profile_id_to(&self, id: &str, path: &std::path::Path) -> Result<(), String> {
         let profile = self
             .users
-            .active_profile()
+            .profiles()
+            .iter()
+            .find(|profile| profile.id == id)
             .ok_or_else(|| localization::tr("profile.unselected"))?;
+        let scales = [MAIN_WINDOW, KEYBOARD_WINDOW, HANDS_WINDOW]
+            .into_iter()
+            .map(|window_id| {
+                self.users
+                    .profile_window_scale(id, window_id)
+                    .map(|scale| (window_id.to_owned(), scale))
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let value = serde_json::to_value(profile).map_err(|e| e.to_string())?;
-        let profile = serde_json::from_value(value).map_err(|e| e.to_string())?;
-        let mut scales = std::collections::BTreeMap::new();
-        for id in [MAIN_WINDOW, KEYBOARD_WINDOW, HANDS_WINDOW] {
-            let scale = self.users.window_scale(id).map_err(|e| e.to_string())?;
+        let profile: stamina_data::storage::Profile =
+            serde_json::from_value(value).map_err(|e| e.to_string())?;
+        let mut export_scales = std::collections::BTreeMap::new();
+        for (id, scale) in scales {
             if scale != 1.0 {
-                scales.insert(id.to_owned(), scale);
+                export_scales.insert(id, scale);
             }
         }
-        storage_transfer::export_profile_json_with_window_scales(&profile, &scales, path)
+        storage_transfer::export_profile_json_with_window_scales(&profile, &export_scales, path)
             .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn delete_profile(&mut self, id: &str) -> std::io::Result<()> {
+        let was_active = id == self.users.active_profile_id();
+        self.users.delete(id)?;
+        if was_active {
+            self.session = None;
+            self.last_result = None;
+            self.result_open = false;
+            self.sync_profile_language();
+            self.sync_profile_training();
+            self.restore_external_text();
+        }
+        self.profile_management_target = self.users.active_profile_id().to_owned();
+        self.profile_name_input.clear();
+        self.profile_filter.clear();
         Ok(())
     }
 
@@ -2300,117 +2354,237 @@ impl StaminatorApp {
 
     fn show_profiles(&mut self, ctx: &egui::Context) {
         let mut open = self.profiles_open;
+        let mut switched = false;
+        let mut management_requested = false;
         egui::Window::new(localization::tr("users"))
             .open(&mut open)
-            .default_width(380.0)
+            .default_width(420.0)
             .show(ctx, |ui| {
                 ui.heading(localization::tr("profiles"));
-                let profiles: Vec<_> = self
-                    .users
-                    .profiles()
-                    .iter()
-                    .map(|profile| (profile.id.clone(), profile.name.clone()))
-                    .collect();
-                for (id, name) in profiles {
-                    if ui
-                        .selectable_label(self.users.active_profile_id() == id, name)
-                        .clicked()
-                    {
-                        if !self.save_before_switch() || !self.flush_window_placement() {
-                            return;
-                        }
-                        match self.users.select(&id) {
-                            Ok(()) => {
-                                self.session = None;
-                                self.last_result = None;
-                                self.result_open = false;
-                                self.profile_error.clear();
-                                self.sync_profile_language();
-                                self.sync_profile_training();
-                                self.restore_external_text();
+                ui.label(localization::tr("profile.search"));
+                ui.text_edit_singleline(&mut self.profile_filter);
+                let profiles = filtered_profiles(self.users.profiles(), &self.profile_filter);
+                if profiles.is_empty() {
+                    ui.label(localization::tr("profile.no_matches"));
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            for (id, name) in profiles {
+                                let current = self.users.active_profile_id() == id;
+                                let label = if current {
+                                    format!("{name}{}", localization::tr("profile.active_marker"))
+                                } else {
+                                    name
+                                };
+                                if ui.selectable_label(current, label).clicked() && !current {
+                                    if !self.save_before_switch() || !self.flush_window_placement()
+                                    {
+                                        return;
+                                    }
+                                    match self.users.select(&id) {
+                                        Ok(()) => {
+                                            self.session = None;
+                                            self.last_result = None;
+                                            self.result_open = false;
+                                            self.profile_error.clear();
+                                            self.sync_profile_language();
+                                            self.sync_profile_training();
+                                            self.restore_external_text();
+                                            switched = true;
+                                        }
+                                        Err(error) => self.profile_error = error.to_string(),
+                                    }
+                                }
                             }
-                            Err(error) => self.profile_error = error.to_string(),
-                        }
-                    }
+                        });
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button(localization::tr("profile-import")).clicked()
-                        && let Some(path) = rfd::FileDialog::new()
-                            .add_filter("JSON", &["json"])
-                            .pick_file()
-                        && let Err(error) = self.import_profile_from(&path)
-                    {
-                        self.profile_error = localized_error("profile.import_error", error);
+                    if ui.button(localization::tr("profile.manage")).clicked() {
+                        management_requested = true;
                     }
-                    if ui.button(localization::tr("profile-export")).clicked()
-                        && let Some(path) = rfd::FileDialog::new()
-                            .add_filter("JSON", &["json"])
-                            .set_file_name("profile.json")
-                            .save_file()
-                        && let Err(error) = self.export_profile_to(&path)
-                    {
-                        self.profile_error = localized_error("profile.export_error", error);
-                    }
-                });
-                ui.separator();
-                ui.label(localization::tr("profile-name"));
-                ui.text_edit_singleline(&mut self.profile_name_input);
-                ui.horizontal(|ui| {
-                    if ui.button(localization::tr("create")).clicked() {
-                        if !self.save_before_switch() || !self.flush_window_placement() {
-                            return;
-                        }
-                        match self.users.create(&self.profile_name_input) {
-                            Ok(_) => {
-                                self.profile_name_input.clear();
-                                self.profile_error.clear();
-                                self.session = None;
-                                self.sync_profile_language();
-                                self.sync_profile_training();
-                                self.restore_external_text();
-                            }
-                            Err(error) => self.profile_error = error.to_string(),
-                        }
-                    }
-                    if ui.button(localization::tr("rename")).clicked() {
-                        let id = self.users.active_profile_id().to_owned();
-                        match self.users.rename(&id, &self.profile_name_input) {
-                            Ok(()) => {
-                                self.profile_name_input.clear();
-                                self.profile_error.clear();
-                            }
-                            Err(error) => self.profile_error = error.to_string(),
-                        }
-                    }
-                    if ui
-                        .add_enabled(
-                            self.users.profiles().len() > 1,
-                            egui::Button::new(localization::tr("delete-current")),
-                        )
-                        .clicked()
-                    {
-                        let id = self.users.active_profile_id().to_owned();
-                        if !self.flush_window_placement() {
-                            return;
-                        }
-                        match self.users.delete(&id) {
-                            Ok(()) => {
-                                self.profile_error.clear();
-                                self.session = None;
-                                self.sync_profile_language();
-                                self.sync_profile_training();
-                                self.restore_external_text();
-                            }
-                            Err(error) => self.profile_error = error.to_string(),
-                        }
-                    }
+                    ui.label(localization::format(
+                        "profile.active",
+                        &FormatArgs::new().insert("name", self.users.active_name()),
+                    ));
                 });
                 if !self.profile_error.is_empty() {
                     ui.colored_label(egui::Color32::RED, &self.profile_error);
                 }
             });
         self.profiles_open = open;
+        if management_requested {
+            self.profile_management_open = true;
+            self.profile_management_target = self.users.active_profile_id().to_owned();
+            self.profiles_open = false;
+        }
+        if switched {
+            self.profiles_open = false;
+        }
+
+        if self.profile_management_open {
+            let mut management_open = self.profile_management_open;
+            let mut return_to_chooser = false;
+            egui::Window::new(localization::tr("profile.management"))
+                .open(&mut management_open)
+                .default_width(440.0)
+                .show(ctx, |ui| {
+                    let target_name = self
+                        .users
+                        .profiles()
+                        .iter()
+                        .find(|p| p.id == self.profile_management_target)
+                        .map_or("", |p| p.name.as_str());
+                    ui.label(localization::format(
+                        "profile.target",
+                        &FormatArgs::new().insert("name", target_name),
+                    ));
+                    egui::ScrollArea::vertical()
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            for profile in self.users.profiles() {
+                                let selected = profile.id == self.profile_management_target;
+                                let mut label = profile.name.clone();
+                                if profile.id == self.users.active_profile_id() {
+                                    label.push_str(&localization::tr("profile.active_marker"));
+                                }
+                                if selected {
+                                    label.push_str(&localization::tr("profile.selected_marker"));
+                                }
+                                if ui.selectable_label(selected, label).clicked() {
+                                    self.profile_management_target = profile.id.clone();
+                                    self.profile_name_input = profile.name.clone();
+                                    self.profile_error.clear();
+                                }
+                            }
+                        });
+                    ui.horizontal(|ui| {
+                        if ui.button(localization::tr("profile-import")).clicked()
+                            && let Some(path) = rfd::FileDialog::new()
+                                .add_filter("JSON", &["json"])
+                                .pick_file()
+                            && let Err(error) = self.import_profile_from(&path)
+                        {
+                            self.profile_error = localized_error("profile.import_error", error);
+                        }
+                        if ui.button(localization::tr("profile-export")).clicked()
+                            && let Some(path) = rfd::FileDialog::new()
+                                .add_filter("JSON", &["json"])
+                                .set_file_name("profile.json")
+                                .save_file()
+                            && let Err(error) =
+                                self.export_profile_id_to(&self.profile_management_target, &path)
+                        {
+                            self.profile_error = localized_error("profile.export_error", error);
+                        }
+                    });
+                    ui.separator();
+                    ui.label(localization::tr("profile-name"));
+                    ui.text_edit_singleline(&mut self.profile_name_input);
+                    ui.horizontal(|ui| {
+                        if ui.button(localization::tr("create")).clicked() {
+                            if !self.save_before_switch() || !self.flush_window_placement() {
+                                return;
+                            }
+                            match self.users.create(&self.profile_name_input) {
+                                Ok(_) => {
+                                    self.profile_name_input.clear();
+                                    self.profile_error.clear();
+                                    self.profile_management_target =
+                                        self.users.active_profile_id().to_owned();
+                                    self.session = None;
+                                    self.sync_profile_language();
+                                    self.sync_profile_training();
+                                    self.restore_external_text();
+                                }
+                                Err(error) => self.profile_error = error.to_string(),
+                            }
+                        }
+                        if ui.button(localization::tr("rename")).clicked() {
+                            let id = self.profile_management_target.clone();
+                            match self.users.rename(&id, &self.profile_name_input) {
+                                Ok(()) => {
+                                    self.profile_name_input.clear();
+                                    self.profile_error.clear();
+                                }
+                                Err(error) => self.profile_error = error.to_string(),
+                            }
+                        }
+                        if ui
+                            .add_enabled(
+                                self.users.profiles().len() > 1,
+                                egui::Button::new(localization::tr(
+                                    if self.profile_management_target
+                                        == self.users.active_profile_id()
+                                    {
+                                        "profile.delete_active"
+                                    } else {
+                                        "profile.delete_selected"
+                                    },
+                                )),
+                            )
+                            .clicked()
+                        {
+                            if let Some(profile) = self
+                                .users
+                                .profiles()
+                                .iter()
+                                .find(|p| p.id == self.profile_management_target)
+                            {
+                                self.profile_error.clear();
+                                self.profile_delete_confirmation =
+                                    Some((profile.id.clone(), profile.name.clone()));
+                            }
+                        }
+                    });
+                    if ui.button(localization::tr("profile.back")).clicked() {
+                        return_to_chooser = true;
+                    }
+                    if !self.profile_error.is_empty() {
+                        ui.colored_label(egui::Color32::RED, &self.profile_error);
+                    }
+                });
+            self.profile_management_open = management_open && !return_to_chooser;
+            if return_to_chooser || !management_open {
+                self.profiles_open = true;
+            }
+        }
+        if let Some((id, name)) = self.profile_delete_confirmation.clone() {
+            #[allow(deprecated)]
+            let modal = egui::Modal::new(egui::Id::new("profile-delete-confirmation"));
+            modal.show(ctx, |ui| {
+                ui.heading(localization::tr("profile.delete_title"));
+                ui.label(localization::format(
+                    "profile.delete_warning",
+                    &FormatArgs::new().insert("name", &name),
+                ));
+                if !self.profile_error.is_empty() {
+                    ui.colored_label(egui::Color32::RED, &self.profile_error);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button(localization::tr("cancel")).clicked() {
+                        self.profile_delete_confirmation = None;
+                    }
+                    if ui
+                        .button(localization::tr("profile.delete_confirm"))
+                        .clicked()
+                    {
+                        if self.flush_window_placement() {
+                            match self.delete_profile(&id) {
+                                Ok(()) => {
+                                    self.profile_error.clear();
+                                }
+                                Err(error) => self.profile_error = error.to_string(),
+                            }
+                        }
+                        if self.profile_error.is_empty() {
+                            self.profile_delete_confirmation = None;
+                        }
+                    }
+                });
+            });
+        }
     }
 }
 
@@ -3108,7 +3282,10 @@ impl StaminatorApp {
         if self.background_open {
             self.show_background_window(root.ctx());
         }
-        if self.profiles_open {
+        if self.profiles_open
+            || self.profile_management_open
+            || self.profile_delete_confirmation.is_some()
+        {
             self.show_profiles(root.ctx());
         }
         if self.progress_open {
@@ -3983,7 +4160,7 @@ mod tests {
         drop(app);
         let reopened = UserStore::load_from(&path).unwrap();
         assert_eq!(reopened.window_scale(MAIN_WINDOW).unwrap(), 1.1);
-        fs::remove_file(path).unwrap();
+        let _ = fs::remove_file(path);
     }
 
     fn scale_wheel() -> egui::Event {
@@ -6471,7 +6648,7 @@ mod tests {
                 .content_language,
             "ES"
         );
-        let _ = fs::remove_file(path);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -6654,6 +6831,13 @@ mod tests {
             .0;
         draw_accessible(&mut app, &ctx, vec![accessible_click(profiles)]);
         assert!(app.profiles_open);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let manage = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Управление…"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(manage)]);
         app.profile_name_input = "Alice".into();
         let nodes = draw_accessible(&mut app, &ctx, vec![]);
         let create = nodes
@@ -6676,6 +6860,15 @@ mod tests {
             222.0
         );
         let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let back = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Назад к выбору"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(back)]);
+        assert!(app.profiles_open);
+        app.profiles_open = true;
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
         let original = nodes
             .iter()
             .find(|(_, n)| n.label() == Some("Пользователь"))
@@ -6683,14 +6876,77 @@ mod tests {
             .0;
         draw_accessible(&mut app, &ctx, vec![accessible_click(original)]);
         assert_eq!(app.users.active_name(), "Пользователь");
+        app.profiles_open = true;
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let manage = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Управление…"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(manage)]);
+        assert!(!app.profiles_open && app.profile_management_open);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        assert!(
+            nodes
+                .iter()
+                .any(|(_, n)| n.label().is_some_and(|label| label.contains("Alice")))
+        );
+        app.profile_management_target = app
+            .users
+            .profiles()
+            .iter()
+            .find(|profile| profile.name == "Alice")
+            .unwrap()
+            .id
+            .clone();
+        app.profile_name_input = "Alice Updated".into();
+        let rename = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Переименовать"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(rename)]);
+        assert_eq!(app.users.active_name(), "Пользователь");
+        assert_eq!(
+            app.users
+                .profiles()
+                .iter()
+                .find(|profile| profile.id == app.profile_management_target)
+                .unwrap()
+                .name,
+            "Alice Updated"
+        );
         let nodes = draw_accessible(&mut app, &ctx, vec![]);
         let delete = nodes
             .iter()
-            .find(|(_, n)| n.label() == Some("Удалить текущий"))
+            .find(|(_, n)| n.label() == Some("Удалить выбранный профиль"))
             .unwrap()
             .0;
         draw_accessible(&mut app, &ctx, vec![accessible_click(delete)]);
-        assert_eq!(app.users.active_name(), "Alice");
+        assert_eq!(app.users.profiles().len(), 2);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let cancel = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Отмена"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(cancel)]);
+        assert_eq!(app.users.profiles().len(), 2);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let delete = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Удалить выбранный профиль"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(delete)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let confirm = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Удалить"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(confirm)]);
+        assert_eq!(app.users.active_name(), "Пользователь");
         assert_eq!(UserStore::load_from(&path).unwrap().profiles().len(), 1);
         fs::remove_file(path).unwrap();
     }
@@ -6704,6 +6960,13 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         draw_accessible(&mut app, &ctx, vec![]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let manage = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Управление…"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(manage)]);
         let nodes = draw_accessible(&mut app, &ctx, vec![]);
         let create = nodes
             .iter()
@@ -7011,6 +7274,118 @@ mod tests {
         drop(source);
         drop(destination);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn export_reads_window_scales_from_nonactive_sqlite_profile() {
+        let root = test_path().with_extension("profile-export-scales");
+        fs::create_dir_all(&root).unwrap();
+        let mut app = database_test_app(root.join("profiles.sqlite3"));
+        let active_id = app.users.active_profile_id().to_owned();
+        let target_id = app.users.create("Export target").unwrap().id.clone();
+        app.users.set_window_scale(MAIN_WINDOW, 2.25).unwrap();
+        app.users.set_window_scale(KEYBOARD_WINDOW, 0.75).unwrap();
+        app.users.select(&active_id).unwrap();
+
+        let output = root.join("target-profile.json");
+        app.export_profile_id_to(&target_id, &output).unwrap();
+        let (exported, scales) =
+            storage_transfer::import_profile_json_with_window_scales(&output).unwrap();
+        assert_eq!(exported.name, "Export target");
+        assert_eq!(scales.get(MAIN_WINDOW), Some(&2.25));
+        assert_eq!(scales.get(KEYBOARD_WINDOW), Some(&0.75));
+        assert_eq!(app.users.active_profile_id(), active_id);
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deleting_active_profile_syncs_new_profile_settings() {
+        let root = test_path().with_extension("profile-delete-active");
+        fs::create_dir_all(&root).unwrap();
+        let mut app = database_test_app(root.join("profiles.sqlite3"));
+        let old_id = app.users.active_profile_id().to_owned();
+        let replacement_id = app.users.create("Replacement").unwrap().id.clone();
+        app.users.set_content_language("EN").unwrap();
+        app.users.set_interface_language("EN").unwrap();
+        app.users.select(&old_id).unwrap();
+
+        app.delete_profile(&old_id).unwrap();
+        assert_eq!(app.users.active_profile_id(), replacement_id);
+        assert_eq!(app.content_language, ContentLanguage::English);
+        assert_eq!(app.users.active_profile().unwrap().interface_language, "EN");
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deleting_active_profile_clears_its_session_and_result() {
+        let root = test_path().with_extension("profile-delete-state");
+        fs::create_dir_all(&root).unwrap();
+        let mut app = database_test_app(root.join("profiles.sqlite3"));
+        let old_id = app.users.active_profile_id().to_owned();
+        app.users.create("Replacement").unwrap();
+        app.users.select(&old_id).unwrap();
+        app.session = Some(Session::new("unfinished"));
+        app.last_result = Some(staminator_core::SessionStats {
+            correct: 3,
+            errors: 1,
+            elapsed_ms: 1000,
+            cpm: 180,
+            error_percent: 25.0,
+        });
+        app.result_open = true;
+
+        app.delete_profile(&old_id).unwrap();
+
+        assert!(app.session.is_none());
+        assert!(app.last_result.is_none());
+        assert!(!app.result_open);
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn profile_management_and_delete_confirmation_block_session_input() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.start();
+        let ctx = egui::Context::default();
+        app.profile_management_open = true;
+        app.handle_input_events(&ctx, vec![egui::Event::Text("a".into())]);
+        assert_eq!(
+            app.session
+                .as_ref()
+                .unwrap()
+                .snapshot(app.now_ms())
+                .position,
+            0
+        );
+
+        app.profile_management_open = false;
+        app.profile_delete_confirmation = Some(("profile-id".into(), "Profile".into()));
+        app.handle_input_events(&ctx, vec![egui::Event::Text("a".into())]);
+        assert_eq!(
+            app.session
+                .as_ref()
+                .unwrap()
+                .snapshot(app.now_ms())
+                .position,
+            0
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn profile_search_matches_case_insensitively_and_reports_no_match() {
+        let path = test_path();
+        let mut users = UserStore::load_from(&path).unwrap();
+        users.create("Alice Example").unwrap();
+        let found = filtered_profiles(users.profiles(), " ALICE ");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, "Alice Example");
+        assert!(filtered_profiles(users.profiles(), "no match").is_empty());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

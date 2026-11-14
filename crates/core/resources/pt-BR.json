@@ -252,5 +252,21 @@
   "background.error": "Não foi possível carregar o plano de fundo",
   "background.builtin": "Pixel art padrão",
   "keyboard.unsupported_layout": "O teclado virtual não está disponível para este idioma. Use um layout do sistema.",
-  "language.partial_translation": "Esta tradução está incompleta; o texto ausente será exibido em russo."
+  "language.partial_translation": "Esta tradução está incompleta; o texto ausente será exibido em russo.",
+  "profile.search": "Buscar por nome",
+  "profile.no_matches": "Nenhum perfil correspondente",
+  "profile.current": "{name} · atual",
+  "profile.active": "Perfil atual: {name}",
+  "profile.manage": "Gerenciar…",
+  "profile.management": "Gerenciar perfis",
+  "profile.target": "Perfil selecionado: {name}",
+  "profile.back": "Voltar à seleção",
+  "profile.delete_title": "Excluir perfil?",
+  "profile.delete_warning": "Excluir “{name}”? O histórico e as configurações serão perdidos.",
+  "profile.delete_confirm": "Excluir",
+  "cancel": "Cancelar",
+  "profile.active_marker": " · ativo",
+  "profile.selected_marker": " · destino",
+  "profile.delete_active": "Excluir perfil ativo",
+  "profile.delete_selected": "Excluir perfil selecionado"
 }

@@ -260,5 +260,21 @@
   "background.error": "تعذر تحميل الخلفية",
   "background.builtin": "فن البكسل الافتراضي",
   "keyboard.unsupported_layout": "لوحة المفاتيح على الشاشة غير متاحة لهذه اللغة. استخدم تخطيط النظام.",
-  "language.partial_translation": "هذه الترجمة غير مكتملة؛ سيظهر النص الناقص بالروسية."
+  "language.partial_translation": "هذه الترجمة غير مكتملة؛ سيظهر النص الناقص بالروسية.",
+  "profile.search": "البحث بالاسم",
+  "profile.no_matches": "لا توجد ملفات شخصية مطابقة",
+  "profile.current": "{name} · الحالي",
+  "profile.active": "الملف الشخصي الحالي: {name}",
+  "profile.manage": "إدارة…",
+  "profile.management": "إدارة الملفات الشخصية",
+  "profile.target": "الملف الشخصي المحدد: {name}",
+  "profile.back": "العودة إلى الاختيار",
+  "profile.delete_title": "حذف الملف الشخصي؟",
+  "profile.delete_warning": "هل تريد حذف «{name}»؟ سيُفقد السجل والإعدادات.",
+  "profile.delete_confirm": "حذف",
+  "cancel": "إلغاء",
+  "profile.active_marker": " · نشط",
+  "profile.selected_marker": " · الهدف",
+  "profile.delete_active": "حذف الملف النشط",
+  "profile.delete_selected": "حذف الملف المحدد"
 }
