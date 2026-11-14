@@ -39,7 +39,8 @@ DEFAULTS = {
     "probe_model": "gpt-6-luna",
     "budget_limit_percent": 75,
     "budget_max_age_minutes": 30,
-    "max_review_rounds": 3,
+    # 0 = no cap: review rounds repeat until no P0/P1 finding is left (the usage limit still applies).
+    "max_review_rounds": 0,
     "max_ci_rounds": 3,
     "stage_timeout_minutes": 120,
     "ci_results_dir": "/srv/data/staminator-ci/results",
@@ -444,7 +445,8 @@ def findings_text(findings):
 
 
 def needs_revision(review):
-    return review["verdict"] == "revise" or any(f["severity"] in ("P0", "P1") for f in review["findings"])
+    """Only findings worse than P2 send the work back; P2 and P3 are reported and left open."""
+    return any(f["severity"] in ("P0", "P1") for f in review["findings"])
 
 
 def stage_plan(st):
@@ -464,7 +466,7 @@ def stage_plan_review(st):
         return ask(st, r["questions"])
     if needs_revision(r):
         st["rounds"]["plan_review"] += 1
-        if st["rounds"]["plan_review"] > CFG["max_review_rounds"]:
+        if 0 < CFG["max_review_rounds"] < st["rounds"]["plan_review"]:
             return block(st, "The plan did not pass review after "
                          f"{CFG['max_review_rounds']} rounds. Open findings:\n\n{findings_text(r['findings'])}")
         return set_stage(st, "plan", "The plan reviewer asks for changes. Update .stamibot/plan.md.\n\n"
@@ -498,7 +500,7 @@ def stage_impl_review(st):
     st["review_notes"] = findings_text(r["findings"])
     if needs_revision(r):
         st["rounds"]["impl_review"] += 1
-        if st["rounds"]["impl_review"] > CFG["max_review_rounds"]:
+        if 0 < CFG["max_review_rounds"] < st["rounds"]["impl_review"]:
             return block(st, "The implementation did not pass review after "
                          f"{CFG['max_review_rounds']} rounds. Open findings:\n\n{st['review_notes']}")
         return set_stage(st, "implement", "The code reviewer asks for changes. Fix them.\n\n" + st["review_notes"])
