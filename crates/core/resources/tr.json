@@ -268,5 +268,6 @@
   "profile.active_marker": " · etkin",
   "profile.selected_marker": " · hedef",
   "profile.delete_active": "Etkin profili sil",
-  "profile.delete_selected": "Seçili profili sil"
+  "profile.delete_selected": "Seçili profili sil",
+  "keyboard.manage": "Keyboards"
 }

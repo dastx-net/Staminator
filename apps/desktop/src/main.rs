@@ -1,10 +1,15 @@
 mod background;
+mod bundled_keyboards;
 mod content;
 mod content_editor;
 mod external_text;
 mod generated_modes;
 mod hands;
+#[path = "custom_keyboard_view.rs"]
 mod keyboard;
+mod keyboard_editor;
+mod keyboard_manager;
+mod keyboard_settings;
 mod lesson_generator;
 mod localization;
 mod progress_view;
@@ -437,6 +442,7 @@ struct StaminatorApp {
     started_at: Instant,
     last_result: Option<staminator_core::SessionStats>,
     show_keyboard: bool,
+    keyboard_manager: keyboard_manager::KeyboardManager,
     show_hands: bool,
     hands_input: Arc<Mutex<KeyboardInputQueue>>,
     last_hands_state: Option<(keyboard::KeyboardLayout, Option<char>, bool, u32)>,
@@ -907,6 +913,7 @@ impl StaminatorApp {
         profile_error: String,
         play_sound: fn(SoundEvent),
     ) -> Self {
+        let keyboard_manager = keyboard_manager::KeyboardManager::new(users.keyboard_directory());
         Self {
             play_sound,
             selected_mode: users
@@ -952,6 +959,7 @@ impl StaminatorApp {
             started_at: Instant::now(),
             last_result: None,
             show_keyboard,
+            keyboard_manager,
             show_hands: false,
             hands_input: Arc::default(),
             last_hands_state: None,
@@ -1742,6 +1750,7 @@ impl StaminatorApp {
     fn handle_input_events(&mut self, _ctx: &egui::Context, events: Vec<egui::Event>) {
         if self.result_open
             || self.background_open
+            || self.keyboard_manager.editing()
             || self.chooser_open
             || self.profiles_open
             || self.profile_management_open
@@ -2525,17 +2534,15 @@ impl StaminatorApp {
                                 )),
                             )
                             .clicked()
-                        {
-                            if let Some(profile) = self
+                            && let Some(profile) = self
                                 .users
                                 .profiles()
                                 .iter()
                                 .find(|p| p.id == self.profile_management_target)
-                            {
-                                self.profile_error.clear();
-                                self.profile_delete_confirmation =
-                                    Some((profile.id.clone(), profile.name.clone()));
-                            }
+                        {
+                            self.profile_error.clear();
+                            self.profile_delete_confirmation =
+                                Some((profile.id.clone(), profile.name.clone()));
                         }
                     });
                     if ui.button(localization::tr("profile.back")).clicked() {
@@ -2622,6 +2629,10 @@ impl StaminatorApp {
             self.scale_profile_id = self.users.active_profile_id().to_owned();
             self.window_scales = [MAIN_WINDOW, KEYBOARD_WINDOW, HANDS_WINDOW]
                 .map(|id| self.users.window_scale(id).unwrap_or(1.0));
+        }
+        if self.keyboard_manager.sync(&mut self.users) {
+            self.last_keyboard_state = None;
+            self.last_hands_state = None;
         }
         self.apply_scale_actions(MAIN_WINDOW, take_scale_actions(root.ctx()));
         for (id, queue) in [
@@ -2896,6 +2907,10 @@ impl StaminatorApp {
                             }
                         }
                     });
+                    if ui.button(localization::tr("keyboard.manage")).clicked() {
+                        self.keyboard_manager.open();
+                        ui.close();
+                    }
                     if ui.button(localization::tr("background.title")).clicked() {
                         self.background_open = true;
                         let _ = fs::create_dir_all(background::directory());
@@ -3158,6 +3173,8 @@ impl StaminatorApp {
                 root.ctx().request_repaint_of(viewport_id);
                 self.last_keyboard_state = Some(state);
             }
+            let schema = self.keyboard_manager.schema.clone();
+            let assignments = self.keyboard_manager.assignments();
             let input_queue = Arc::clone(&self.keyboard_input);
             let unsupported = !matches!(
                 self.language(),
@@ -3191,7 +3208,7 @@ impl StaminatorApp {
                         });
                     } else {
                         scaled_content(ui, keyboard_scale, |ui| {
-                            keyboard::draw_keyboard(ui, layout, next_char)
+                            keyboard::draw_keyboard(ui, &schema, layout, &assignments, next_char)
                         });
                     }
                 });
@@ -3238,8 +3255,12 @@ impl StaminatorApp {
                 self.language(),
                 ContentLanguage::Russian | ContentLanguage::English
             ) && self.selected_mode == TrainingMode::Lessons;
-            let fingers =
-                keyboard::active_fingers(layout, if unsupported { None } else { next_char });
+            let fingers = keyboard::active_fingers(
+                &self.keyboard_manager.schema,
+                layout,
+                &self.keyboard_manager.assignments(),
+                if unsupported { None } else { next_char },
+            );
             let queue = Arc::clone(&self.hands_input);
             let state = (layout, next_char, unsupported, hands_scale.to_bits());
             if self.last_hands_state != Some(state) {
@@ -3274,6 +3295,11 @@ impl StaminatorApp {
                 });
         } else {
             self.last_hands_state = None;
+        }
+        if self.keyboard_manager.show(root.ctx(), &mut self.users) {
+            self.last_keyboard_state = None;
+            self.last_hands_state = None;
+            root.ctx().request_repaint();
         }
         if self.chooser_open {
             self.show_content_chooser(root.ctx());
@@ -6990,6 +7016,61 @@ mod tests {
             "Renamed"
         );
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn keyboard_settings_menu_changes_fingers_for_both_layouts() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.show_keyboard = false;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let options = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Опции"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(options)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let settings = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Клавиатуры"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(settings)]);
+        let nodes = draw_accessible(&mut app, &ctx, vec![]);
+        let alternate = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Альтернативная / Alternative"))
+            .unwrap()
+            .0;
+        draw_accessible(&mut app, &ctx, vec![accessible_click(alternate)]);
+        for layout in [
+            keyboard::KeyboardLayout::Russian,
+            keyboard::KeyboardLayout::English,
+        ] {
+            assert_eq!(
+                keyboard::active_fingers(
+                    &app.keyboard_manager.schema,
+                    layout,
+                    &app.keyboard_manager.assignments(),
+                    Some('4')
+                ),
+                vec![2]
+            );
+            assert_eq!(
+                keyboard::active_fingers(
+                    &app.keyboard_manager.schema,
+                    layout,
+                    &app.keyboard_manager.assignments(),
+                    Some('6')
+                ),
+                vec![3]
+            );
+        }
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(path.with_extension("keyboards"));
     }
 
     #[test]

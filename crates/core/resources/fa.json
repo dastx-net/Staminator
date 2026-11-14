@@ -268,5 +268,6 @@
   "profile.active_marker": " · فعال",
   "profile.selected_marker": " · هدف",
   "profile.delete_active": "حذف نمایهٔ فعال",
-  "profile.delete_selected": "حذف نمایهٔ انتخاب‌شده"
+  "profile.delete_selected": "حذف نمایهٔ انتخاب‌شده",
+  "keyboard.manage": "Keyboards"
 }

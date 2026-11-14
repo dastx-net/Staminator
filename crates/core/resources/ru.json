@@ -272,5 +272,6 @@
   "profile.active_marker": " · активен",
   "profile.selected_marker": " · цель",
   "profile.delete_active": "Удалить активный профиль",
-  "profile.delete_selected": "Удалить выбранный профиль"
+  "profile.delete_selected": "Удалить выбранный профиль",
+  "keyboard.manage": "Клавиатуры"
 }

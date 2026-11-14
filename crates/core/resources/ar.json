@@ -276,5 +276,6 @@
   "profile.active_marker": " · نشط",
   "profile.selected_marker": " · الهدف",
   "profile.delete_active": "حذف الملف النشط",
-  "profile.delete_selected": "حذف الملف المحدد"
+  "profile.delete_selected": "حذف الملف المحدد",
+  "keyboard.manage": "Keyboards"
 }

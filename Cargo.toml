@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/stamina-data", "apps/desktop"]
+members = ["crates/core", "crates/stamina-data", "crates/keyboard-schema", "apps/desktop"]
 resolver = "2"
 
 [workspace.package]

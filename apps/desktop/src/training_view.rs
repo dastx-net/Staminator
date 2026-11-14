@@ -6,6 +6,7 @@ use std::{
 };
 
 const TEXT_FONT: &str = "Stamina Text";
+pub const KEYBOARD_SOFT_FONT: &str = "Staminator Soft Keyboard";
 
 // Keep one shaped glyph per input scalar so the training cursor still refers
 // to the original text. Bidi ordering is computed from the unshaped text.
@@ -60,6 +61,25 @@ pub fn install_text_font(ctx: &egui::Context) {
             .or_default()
             .push("Segoe UI".into());
     }
+    let mut soft_family = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(path) = std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .map(|p| p.join("Fonts").join("segoeuil.ttf"))
+        && let Ok(bytes) = fs::read(path)
+    {
+        fonts.font_data.insert(
+            KEYBOARD_SOFT_FONT.into(),
+            Arc::new(FontData::from_owned(bytes)),
+        );
+        soft_family.insert(0, KEYBOARD_SOFT_FONT.into());
+    }
+    fonts
+        .families
+        .insert(FontFamily::Name(KEYBOARD_SOFT_FONT.into()), soft_family);
     let font_path = std::env::var_os("WINDIR")
         .map(PathBuf::from)
         .map(|windir| windir.join("Fonts").join("cour.ttf"));

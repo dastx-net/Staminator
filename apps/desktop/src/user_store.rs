@@ -60,6 +60,9 @@ pub struct Profile {
     pub selected_mode: Option<String>,
     #[serde(default)]
     pub selected_layout: Option<String>,
+    /// Keyboard selection and finger schemes for this profile.
+    #[serde(default)]
+    pub keyboard_settings: String,
     #[serde(default, deserialize_with = "deserialize_background")]
     pub background: BackgroundImageSettings,
     /// JSON fallback for window geometry; SQLite stores these in profile settings.
@@ -398,6 +401,65 @@ impl UserStore {
         } else {
             profile.window_geometry.remove(id);
         }
+        self.commit_or_restore(original)
+    }
+
+    pub fn keyboard_directory(&self) -> PathBuf {
+        #[cfg(test)]
+        {
+            self.path.with_extension("keyboards")
+        }
+        #[cfg(not(test))]
+        {
+            self.path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("Keyboards")
+        }
+    }
+
+    /// Get keyboard preferences of the active profile.
+    pub fn keyboard_settings(&self) -> io::Result<String> {
+        let profile = self
+            .active_profile()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "profile not found"))?;
+        if self.database
+            && let Some(value) = self
+                .database()?
+                .expect("database flag")
+                .get_setting(&profile.id, "keyboard_settings")
+                .map_err(storage_io_error)?
+        {
+            return Ok(value);
+        }
+        Ok(profile.keyboard_settings.clone())
+    }
+
+    /// Persist keyboard preferences without changing another profile.
+    pub fn set_keyboard_settings(&mut self, value: &str) -> io::Result<()> {
+        if value.len() > 1_048_576 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "keyboard settings are too large",
+            ));
+        }
+        let id = self.active_profile_id.clone();
+        if self.active_profile().is_none() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "profile not found"));
+        }
+        if self.database {
+            self.database()?
+                .expect("database flag")
+                .set_setting(&id, "keyboard_settings", value)
+                .map_err(storage_io_error)?;
+            return Ok(());
+        }
+        let original = self.clone();
+        self.profiles
+            .iter_mut()
+            .find(|p| p.id == id)
+            .expect("active profile")
+            .keyboard_settings = value.to_owned();
         self.commit_or_restore(original)
     }
 
@@ -922,6 +984,7 @@ impl UserStore {
             selected_lessons: BTreeMap::new(),
             selected_mode: None,
             selected_layout: None,
+            keyboard_settings: String::new(),
             background: BackgroundImageSettings::default(),
             window_geometry: BTreeMap::new(),
             window_scales: BTreeMap::new(),
@@ -1160,6 +1223,7 @@ impl UserStore {
                 selected_lessons: BTreeMap::new(),
                 selected_mode: None,
                 selected_layout: None,
+                keyboard_settings: String::new(),
                 background: BackgroundImageSettings::default(),
                 window_geometry: BTreeMap::new(),
                 window_scales: BTreeMap::new(),
@@ -1253,6 +1317,36 @@ mod tests {
     type FailureOperation = (&'static str, Box<dyn Fn(&mut UserStore) -> io::Result<()>>);
 
     #[test]
+    fn keyboard_settings_follow_profile_and_survive_reopen_in_both_stores() {
+        for sqlite in [false, true] {
+            let path = test_path();
+            let legacy = path.with_extension("legacy");
+            let mut store = if sqlite {
+                UserStore::load_database(path.clone(), &legacy).unwrap()
+            } else {
+                UserStore::new_at(&path)
+            };
+            let first = store.active_profile_id().to_owned();
+            store.set_keyboard_settings("first").unwrap();
+            let second = store.create("Second").unwrap().id.clone();
+            assert_eq!(store.keyboard_settings().unwrap(), "");
+            store.set_keyboard_settings("second").unwrap();
+            store.select(&first).unwrap();
+            assert_eq!(store.keyboard_settings().unwrap(), "first");
+            drop(store);
+            let mut reopened = if sqlite {
+                UserStore::load_database(path.clone(), &legacy).unwrap()
+            } else {
+                UserStore::load_from(&path).unwrap()
+            };
+            assert_eq!(reopened.keyboard_settings().unwrap(), "first");
+            reopened.select(&second).unwrap();
+            assert_eq!(reopened.keyboard_settings().unwrap(), "second");
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
     fn storage_revision_conflict_keeps_kind_and_typed_source_with_localized_text() {
         let error = storage_io_error(stamina_data::storage::StorageError::RevisionConflict {
             expected: 3,
@@ -1309,6 +1403,7 @@ mod tests {
             selected_lessons: BTreeMap::new(),
             selected_mode: None,
             selected_layout: None,
+            keyboard_settings: String::new(),
             background: BackgroundImageSettings::default(),
             window_geometry: BTreeMap::new(),
             window_scales: BTreeMap::new(),
@@ -1367,6 +1462,7 @@ mod tests {
             selected_lessons: BTreeMap::new(),
             selected_mode: None,
             selected_layout: None,
+            keyboard_settings: String::new(),
             background: BackgroundImageSettings::default(),
             window_geometry: BTreeMap::new(),
             window_scales: BTreeMap::new(),

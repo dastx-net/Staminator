@@ -268,5 +268,6 @@
   "profile.active_marker": " · ativo",
   "profile.selected_marker": " · destino",
   "profile.delete_active": "Excluir perfil ativo",
-  "profile.delete_selected": "Excluir perfil selecionado"
+  "profile.delete_selected": "Excluir perfil selecionado",
+  "keyboard.manage": "Keyboards"
 }
