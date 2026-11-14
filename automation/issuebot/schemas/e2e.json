@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "summary", "problems"],
+  "properties": {
+    "status": { "type": "string", "enum": ["pass", "fail", "skipped"] },
+    "summary": { "type": "string" },
+    "problems": { "type": "array", "items": { "type": "string" } }
+  }
+}
