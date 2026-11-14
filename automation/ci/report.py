@@ -32,4 +32,11 @@ with open(tmp, "w", encoding="utf-8") as f:
     json.dump({"sha": sha, "branch": branch, "result": result, "build_url": build_url,
                "artifacts": artifacts, "log_tail": tail}, f, ensure_ascii=False, indent=2)
 os.replace(tmp, os.path.join(results, sha + ".json"))
+
+# The bot runs under another account and the agent's umask is restrictive: open the results for reading.
+for folder in (results, os.path.join(drop, "artifacts"), os.path.join(drop, "artifacts", sha)):
+    if os.path.isdir(folder):
+        os.chmod(folder, 0o755)
+for path in artifacts + [os.path.join(results, sha + ".json")]:
+    os.chmod(path, 0o644)
 print(f"CI result {result} for {sha} published to {results}")
