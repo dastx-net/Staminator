@@ -123,6 +123,8 @@ def main():
     elif cmd == "put":
         remote = rest[1].replace("\\", "/")
         ps(f"New-Item -ItemType Directory -Force -Path (Split-Path -Parent '{remote}') | Out-Null")
+        if os.path.isdir(rest[0]):  # scp would nest the folder inside an existing one
+            ps(f"Remove-Item -Recurse -Force -ErrorAction SilentlyContinue '{remote}'")
         subprocess.run(["scp", "-q", "-r", *SSH_OPTS, rest[0], f"{SSH_HOST}:{remote}"], check=True, timeout=900)
         print(remote)
     elif cmd == "run":

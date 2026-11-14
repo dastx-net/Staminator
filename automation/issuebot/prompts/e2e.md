@@ -9,7 +9,9 @@ Context: `.stamibot/issue.md` (the issue), `.stamibot/plan.md` (the plan), and t
 Windows build to test: `{exe}`
 
 Tool for the VM (screen and input over the VM console, files and commands over SSH): `{vm}`
-- `{vm} put {exe} C:/e2e/staminator-desktop.exe` - copy the build (`put` also copies folders)
+- `{vm} put {exe} C:/e2e/staminator-desktop.exe` - copy the build
+- `{vm} put lessons C:/e2e/lessons` - copy the bundled lessons of this branch next to the build (the program
+  loads `lessons` from the folder of its executable); do this before starting the program
 - `{vm} run C:/e2e/staminator-desktop.exe` - start it on the visible desktop
 - `{vm} shot .stamibot/screen.png` - screenshot (1280x800); then look at the PNG with your image viewer tool
 - `{vm} click X Y [--right] [--double]`, `{vm} type TEXT`, `{vm} key enter|esc|alt-f4|ctrl-s|...`
@@ -24,8 +26,8 @@ Rules:
 - Keep it short: at most about 25 actions. Verify what this issue changed. If the change has no visible
   effect in the UI (docs, refactoring, CI), do only a smoke test: the main window opens, a menu opens, the
   program closes.
-- Known limitation, not a failure: the build may show "no text for the selected language" because lesson
-  data is looked up at a build-machine path.
+- Known limitation, not a failure: legacy phrase data (`src/stamina_setup`) is not available in the VM, so
+  phrase modes may report missing material. Bundled lessons from `lessons` must work.
 - When finished, stop the program with the `kill` command.
 
 Final answer (JSON):
