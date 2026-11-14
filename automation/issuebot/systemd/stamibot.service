@@ -1,0 +1,10 @@
+[Unit]
+Description=Staminator issue bot: one polling tick
+After=network-online.target
+
+[Service]
+Type=oneshot
+# A tick may run Codex stages for hours; the timer does not start a second one meanwhile.
+TimeoutStartSec=infinity
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/stamibot/bot/automation/issuebot/bot.py tick
