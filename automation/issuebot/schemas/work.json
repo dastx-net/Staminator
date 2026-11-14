@@ -1,0 +1,13 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "summary", "questions", "commit_message", "pr_title", "pr_body"],
+  "properties": {
+    "status": { "type": "string", "enum": ["ok", "questions", "blocked"] },
+    "summary": { "type": "string" },
+    "questions": { "type": "array", "items": { "type": "string" } },
+    "commit_message": { "type": "string" },
+    "pr_title": { "type": "string" },
+    "pr_body": { "type": "string" }
+  }
+}

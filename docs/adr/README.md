@@ -13,3 +13,4 @@
 | 0005 | [Каталог уроков](0005-lessons.md) |
 | 0006 | [Хранение данных в SQLite](0006-sqlite-storage.md) |
 | 0007 | [Формат переводов интерфейса](0007-localization.md) |
+| 0008 | [Автоматизация issue через Codex](0008-issue-automation.md) |
