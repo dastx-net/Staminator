@@ -22,7 +22,11 @@ if result == "SUCCESS" and artifact_dir and os.path.isdir(artifact_dir):
     target = os.path.join(drop, "artifacts", sha)
     os.makedirs(target, exist_ok=True)
     for name in sorted(os.listdir(artifact_dir)):
-        shutil.copy2(os.path.join(artifact_dir, name), os.path.join(target, name))
+        source = os.path.join(artifact_dir, name)
+        # The build under test wrote this folder: a link could point at any file of the build host.
+        if not name.endswith(".exe") or os.path.islink(source) or not os.path.isfile(source):
+            continue
+        shutil.copy2(source, os.path.join(target, name), follow_symlinks=False)
         artifacts.append(os.path.join(target, name))
 
 results = os.path.join(drop, "results")

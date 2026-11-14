@@ -58,6 +58,9 @@ DEFAULTS = {
     "token_file": "~/.config/stamibot/gh-token",
     "git_name": "stamibot",
     "git_email": "losinkatorf@users.noreply.github.com",
+    # Paths people change: the bot's own code and prompts, CI, GitHub workflows, cargo configuration.
+    # A branch that touches them is pushed only after an initiator comments `/retry allow-protected`.
+    "protected_paths": ["automation/", ".github/", ".cargo/"],
 }
 
 
@@ -202,11 +205,15 @@ def run(cmd, cwd=None, check=True, env=None, timeout=600):
 
 
 def git(*args, cwd=None, check=True, auth=False):
-    cmd = ["git"]
+    env = None
     if auth:
+        # Through the environment, not the command line: other local accounts can read process arguments.
         basic = base64.b64encode(("x-access-token:" + token()).encode()).decode()
-        cmd += ["-c", "credential.helper=", "-c", f"http.https://github.com/.extraheader=Authorization: Basic {basic}"]
-    return run(cmd + list(args), cwd=cwd or REPO_DIR, check=check)
+        env = dict(os.environ, GIT_CONFIG_COUNT="2",
+                   GIT_CONFIG_KEY_0="credential.helper", GIT_CONFIG_VALUE_0="",
+                   GIT_CONFIG_KEY_1="http.https://github.com/.extraheader",
+                   GIT_CONFIG_VALUE_1=f"Authorization: Basic {basic}")
+    return run(["git", *args], cwd=cwd or REPO_DIR, check=check, env=env)
 
 
 def ensure_repo():
@@ -260,6 +267,13 @@ def commit_if_dirty(st, message):
 
 def head_sha(st):
     return git("rev-parse", "HEAD", cwd=worktree(st)).stdout.strip()
+
+
+def protected_changes(st):
+    """Files of the branch under `protected_paths`, compared with the base branch."""
+    out = git("diff", "--name-only", "--no-renames", f"origin/{CFG['base_branch']}...HEAD", cwd=worktree(st)).stdout
+    return sorted(p for p in out.splitlines()
+                  if any(p == x.rstrip("/") or p.startswith(x) for x in CFG["protected_paths"]))
 
 
 def commits_ahead(st):
@@ -510,6 +524,15 @@ def stage_impl_review(st):
 
 
 def stage_ci_push(st):
+    touched = protected_changes(st)
+    if touched and st.get("protected_ok") != head_sha(st):
+        block(st, "The branch changes protected paths, which only people change:\n\n"
+              + "\n".join(f"- `{p}`" for p in touched)
+              + "\n\nNothing was pushed. Comment `/retry allow-protected` to push this commit as it is. "
+              "Any other `/retry` sends the work back to implementation to undo these changes.")
+        st["protected_block"] = touched
+        save_state(st)
+        return
     git("push", "--force-with-lease", "origin", f"HEAD:refs/heads/{st['branch']}", cwd=worktree(st), auth=True)
     st["ci"] = {"sha": head_sha(st), "since": time.time()}
     set_stage(st, "ci_wait" if CFG["ci_results_dir"] else "pr")
@@ -709,7 +732,16 @@ def try_retry(st):
             st["rounds"] = {"plan_review": 0, "impl_review": 0, "ci": 0}
             if st.get("pr_seen"):
                 st["pr_seen"]["issue"] = max(st["pr_seen"]["issue"], c["id"])
-            set_stage(st, st.get("blocked_from") or "plan", body[len("/retry"):].strip() or None)
+            note = body[len("/retry"):].strip()
+            stage = st.get("blocked_from") or "plan"
+            touched = st.pop("protected_block", None)
+            if touched and note == "allow-protected":
+                st["protected_ok"], note = head_sha(st), None  # the approval covers this commit only
+            elif touched:
+                stage = "implement"
+                note = ("People did not approve your changes to protected paths. Undo every change to: "
+                        + ", ".join(touched) + ".\n\n" + note).strip()
+            set_stage(st, stage, note or None)
             return True
     return False
 
