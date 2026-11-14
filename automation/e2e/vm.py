@@ -4,8 +4,8 @@
 Screen and input go through the VM's VNC console (hypervisor level, nothing installed in the guest);
 files and commands go through SSH. See automation/README.md.
 
-  vm.py status                 is the VM reachable, who is logged in, is RDP in use
-  vm.py console                move the logged-in desktop to the VNC console (drops an RDP connection)
+  vm.py status                 is the VM reachable, is the test user logged in, is RDP in use
+  vm.py console                put the test user's desktop on the VNC console (drops an RDP connection)
   vm.py shot [FILE]            screenshot to FILE (default ./.stamibot/screen.png); prints the path
   vm.py click X Y [--right] [--double]
   vm.py move X Y
@@ -29,6 +29,8 @@ SSH_KEY = os.environ.get("VM_KEY", str(Path.home() / ".ssh" / "win11_vm"))
 VNCDO = os.environ.get("VNCDO", str(Path.home() / "stamibot" / "venv" / "bin" / "vncdo"))
 SSH_OPTS = ["-i", SSH_KEY, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR",
             "-o", "StrictHostKeyChecking=accept-new"]
+# Tests run on the desktop of a separate unprivileged Windows user; SSH_HOST is the administrator who controls it.
+DESKTOP_USER = os.environ.get("VM_USER", "e2e")
 TASK = "stamibot-e2e"
 
 
@@ -55,19 +57,24 @@ def reachable(host, port):
 
 
 def status():
-    """Dict: ssh, vnc, session (id of the logged-in desktop or None), rdp (an RDP connection is live)."""
+    """Dict: ssh, vnc, session (id of the test user's desktop or None), console (id of the session shown
+    on the VNC console), rdp (an RDP connection is live)."""
     host = SSH_HOST.split("@")[-1]
     vnc_host, vnc_port = VNC.split("::")
-    info = {"ssh": reachable(host, 22), "vnc": reachable(vnc_host, int(vnc_port)), "session": None, "rdp": False}
+    info = {"ssh": reachable(host, 22), "vnc": reachable(vnc_host, int(vnc_port)), "session": None,
+            "console": None, "rdp": False}
     if info["ssh"]:
-        user = SSH_HOST.split("@")[0]
         out = ps("$p = Get-Process explorer -IncludeUserName -ErrorAction SilentlyContinue | "
-                 f"Where-Object {{ $_.UserName -like '*\\{user}' }} | Select-Object -First 1; "
-                 "if ($p) { 'session=' + $p.SessionId }; if (qwinsta | Select-String 'rdp-tcp#') { 'rdp=1' }",
+                 f"Where-Object {{ $_.UserName -like '*\\{DESKTOP_USER}' }} | Select-Object -First 1; "
+                 "if ($p) { 'session=' + $p.SessionId }; if (qwinsta | Select-String 'rdp-tcp#') { 'rdp=1' }; "
+                 "$c = qwinsta | Select-String '^.console\\s+(\\S+\\s+)?(\\d+)'; "
+                 "if ($c) { 'console=' + $c.Matches[0].Groups[2].Value }",
                  check=False)
         for line in out.splitlines():
             if line.startswith("session="):
                 info["session"] = int(line.split("=")[1])
+            if line.startswith("console="):
+                info["console"] = int(line.split("=")[1])
             if line.strip() == "rdp=1":
                 info["rdp"] = True
     return info
@@ -84,10 +91,16 @@ def main():
     elif cmd == "console":
         info = status()
         if info["session"] is None:
-            sys.exit("vm: nobody is logged in to the VM desktop")
-        ps(f"tscon {info['session']} /dest:console")
+            sys.exit(f"vm: user {DESKTOP_USER} is not logged in to the VM (it logs in automatically at boot)")
+        if info["console"] != info["session"]:
+            # Only SYSTEM may attach another user's session without its password.
+            ps(f"$a = New-ScheduledTaskAction -Execute 'tscon.exe' -Argument '{info['session']} /dest:console'; "
+               "Register-ScheduledTask -TaskName stamibot-console -Action $a -User 'SYSTEM' -RunLevel Highest "
+               "-Force | Out-Null; Start-ScheduledTask -TaskName stamibot-console; Start-Sleep -Seconds 4")
+            if status()["console"] != info["session"]:
+                sys.exit("vm: could not move the test desktop to the console")
         vnc("move", 640, 400)  # wake the display
-        print("desktop is on the console")
+        print(f"desktop of {DESKTOP_USER} is on the console")
     elif cmd == "shot":
         target = Path(rest[0] if rest else ".stamibot/screen.png")
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -115,7 +128,7 @@ def main():
     elif cmd == "run":
         # SSH sessions have no desktop: a scheduled task marked "interactive" starts the program on it.
         exe, exe_args = rest[0].replace("/", "\\"), " ".join(rest[1:])
-        user = SSH_HOST.split("@")[0]
+        user = DESKTOP_USER
         folder = exe.rsplit("\\", 1)[0]
         action = (f"New-ScheduledTaskAction -Execute '{exe}' -WorkingDirectory '{folder}'"
                   + (f" -Argument '{exe_args}'" if exe_args else ""))
