@@ -2525,17 +2525,15 @@ impl StaminatorApp {
                                 )),
                             )
                             .clicked()
-                        {
-                            if let Some(profile) = self
+                            && let Some(profile) = self
                                 .users
                                 .profiles()
                                 .iter()
                                 .find(|p| p.id == self.profile_management_target)
-                            {
-                                self.profile_error.clear();
-                                self.profile_delete_confirmation =
-                                    Some((profile.id.clone(), profile.name.clone()));
-                            }
+                        {
+                            self.profile_error.clear();
+                            self.profile_delete_confirmation =
+                                Some((profile.id.clone(), profile.name.clone()));
                         }
                     });
                     if ui.button(localization::tr("profile.back")).clicked() {
