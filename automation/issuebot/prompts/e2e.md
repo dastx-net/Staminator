@@ -17,8 +17,8 @@ Tool for the VM (screen and input over the VM console, files and commands over S
 - `{vm} kill staminator-desktop` - stop the program
 
 Rules:
-- Touch only the Staminator windows. The VM is shared: do not open, read or click Microsoft Teams or any
-  other application, and do not change Windows settings.
+- You work on the desktop of the dedicated Windows user `e2e`. Touch only the Staminator windows: do not
+  open other applications and do not change Windows settings. If a Windows pop-up covers the program, close it.
 - Always take a fresh screenshot after an action before deciding the next one; coordinates come from the
   latest screenshot only.
 - Keep it short: at most about 25 actions. Verify what this issue changed. If the change has no visible

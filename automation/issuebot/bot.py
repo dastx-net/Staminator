@@ -556,9 +556,11 @@ def stage_e2e(st):
     elif vm.get("ssh") != "True" or vm.get("vnc") != "True":
         reason = "the test VM is not reachable"
     elif vm.get("session") in (None, "None"):
-        reason = "nobody is logged in to the test VM desktop"
+        reason = "the test user is not logged in to the test VM"
     elif vm.get("rdp") == "True":
         reason = "the test VM is in use over RDP"
+    elif subprocess.run([sys.executable, str(VM_TOOL), "console"], capture_output=True, timeout=180).returncode != 0:
+        reason = "could not put the test desktop on the VM console"
     if reason:
         st["e2e_notes"] = "skipped: " + reason
         log(f"#{st['number']}: e2e {st['e2e_notes']}")
