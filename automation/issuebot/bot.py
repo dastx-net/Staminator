@@ -45,6 +45,8 @@ DEFAULTS = {
     "stage_timeout_minutes": 120,
     "ci_results_dir": "/srv/data/staminator-ci/results",
     "ci_timeout_minutes": 90,
+    # End-to-end check of the Windows build in the test VM (automation/e2e/vm.py). Skipped when the VM is busy or off.
+    "e2e_enabled": True,
     # How long a finished issue is still watched for new comments that start a follow-up round.
     "followup_days": 14,
     "proxy": "http://127.0.0.1:18888",
@@ -523,8 +525,9 @@ def stage_ci_wait(st):
         return False
     ci = json.loads(result.read_text(encoding="utf-8"))
     st["ci"]["url"] = ci.get("build_url")
+    st["ci"]["artifacts"] = ci.get("artifacts") or []
     if ci.get("result") == "SUCCESS":
-        set_stage(st, "pr")
+        set_stage(st, "e2e" if CFG["e2e_enabled"] else "pr")
         return True
     st["rounds"]["ci"] += 1
     if st["rounds"]["ci"] > CFG["max_ci_rounds"]:
@@ -535,11 +538,51 @@ def stage_ci_wait(st):
     return True
 
 
+VM_TOOL = HERE.parent / "e2e" / "vm.py"
+
+
+def vm_status():
+    res = subprocess.run([sys.executable, str(VM_TOOL), "status"], text=True, capture_output=True, timeout=120)
+    return dict(pair.split("=", 1) for pair in res.stdout.split() if "=" in pair)
+
+
+def stage_e2e(st):
+    """Codex runs the Windows build in the test VM and looks at it. Never blocks on an unavailable VM."""
+    exe = next((a for a in st["ci"].get("artifacts", []) if a.endswith(".exe")), None)
+    vm = vm_status() if exe else {}
+    reason = None
+    if not exe:
+        reason = "CI published no Windows build"
+    elif vm.get("ssh") != "True" or vm.get("vnc") != "True":
+        reason = "the test VM is not reachable"
+    elif vm.get("session") in (None, "None"):
+        reason = "nobody is logged in to the test VM desktop"
+    elif vm.get("rdp") == "True":
+        reason = "the test VM is in use over RDP"
+    if reason:
+        st["e2e_notes"] = "skipped: " + reason
+        log(f"#{st['number']}: e2e {st['e2e_notes']}")
+        return set_stage(st, "pr")
+    st["sessions"].pop("e2e", None)  # every check is a fresh session
+    write_issue_file(st)
+    r = codex_turn(st, "e2e", prompt_text("e2e.md", st, exe=exe, vm=f"python3 {VM_TOOL}",
+                                          summary=st.get("last_summary") or ""), "e2e.json", "workspace-write")
+    st["e2e_notes"] = f"{r['status']}: {r['summary']}"
+    if r["status"] == "fail":
+        st["rounds"]["ci"] += 1
+        if st["rounds"]["ci"] > CFG["max_ci_rounds"]:
+            return block(st, f"The end-to-end check still fails after {CFG['max_ci_rounds']} fix rounds.\n\n"
+                         + st["e2e_notes"])
+        return set_stage(st, "implement", "The end-to-end check of the Windows build in the test VM failed. "
+                         "Fix the problems.\n\n" + r["summary"] + "\n\n" + "\n".join(f"- {p}" for p in r["problems"]))
+    set_stage(st, "pr")
+
+
 def stage_pr(st):
     if st.get("pr_number"):
         post_comment(st["pr_number"], f"**Stamibot addressed the feedback** (head `{head_sha(st)[:12]}`).\n\n"
                      f"{st.get('last_summary') or ''}\n\nReview notes left open (P2 and below):\n\n"
-                     f"{st.get('review_notes') or '- none'}")
+                     f"{st.get('review_notes') or '- none'}\n\nEnd-to-end check: {st.get('e2e_notes') or 'not run'}")
         return set_stage(st, "pr_open")
     link = "Follow-up to" if st.get("followup") else "Closes"
     body = (f"{st['pr_body'].strip()}\n\n{link} #{st['number']}\n\n---\n"
@@ -547,6 +590,7 @@ def stage_pr(st):
             f"Review notes left open (P2 and below):\n\n{st.get('review_notes') or '- none'}\n")
     if st.get("ci", {}).get("url"):
         body += f"\nCI: {st['ci']['url']}\n"
+    body += f"\nEnd-to-end check in the Windows VM: {st.get('e2e_notes') or 'not run'}\n"
     try:
         pr = gh("POST", repo_path("/pulls"), {"title": st["pr_title"], "head": st["branch"],
                                                "base": CFG["base_branch"], "body": body})
@@ -651,7 +695,7 @@ def followup(st):
 
 
 STAGES = {"plan": stage_plan, "plan_review": stage_plan_review, "implement": stage_implement,
-          "impl_review": stage_impl_review, "ci_push": stage_ci_push, "pr": stage_pr}
+          "impl_review": stage_impl_review, "ci_push": stage_ci_push, "e2e": stage_e2e, "pr": stage_pr}
 
 
 def try_retry(st):
