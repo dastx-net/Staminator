@@ -27,6 +27,7 @@ use eframe::egui;
 use result_view::ResultAction;
 use staminator_core::{FormatArgs, Keystroke, Session, SessionState, StopReason};
 use staminator_desktop::audio_resources::AudioResources;
+use staminator_desktop::music::MusicService;
 use staminator_desktop::sound::{self, SoundEvent};
 use std::{
     collections::VecDeque,
@@ -417,6 +418,11 @@ impl TrainingMode {
 
 struct StaminatorApp {
     play_sound: fn(SoundEvent),
+    sound_effects: Option<sound::SoundEffects>,
+    sound_profile_id: String,
+    music: Option<MusicService>,
+    music_profile_id: String,
+    music_available: bool,
     selected_mode: TrainingMode,
     english_layout: bool,
     content_language: ContentLanguage,
@@ -472,6 +478,9 @@ struct StaminatorApp {
     background_texture: Option<egui::TextureHandle>,
     background_error: String,
     background_files: Vec<PathBuf>,
+    audio_open: bool,
+    audio_counts: Option<(usize, usize)>,
+    audio_error: String,
 }
 
 impl StaminatorApp {
@@ -910,6 +919,7 @@ impl StaminatorApp {
             profile_error,
             sound::play,
         );
+        app.music_available = true;
         app.sync_profile_training();
         app.restore_external_text();
         app
@@ -926,6 +936,11 @@ impl StaminatorApp {
         let keyboard_manager = keyboard_manager::KeyboardManager::new(users.keyboard_directory());
         Self {
             play_sound,
+            sound_effects: None,
+            sound_profile_id: String::new(),
+            music: None,
+            music_profile_id: String::new(),
+            music_available: false,
             selected_mode: users
                 .active_profile()
                 .and_then(|profile| profile.selected_mode.as_deref())
@@ -998,6 +1013,241 @@ impl StaminatorApp {
             background_texture: None,
             background_error: String::new(),
             background_files: Vec::new(),
+            audio_open: false,
+            audio_counts: None,
+            audio_error: String::new(),
+        }
+    }
+
+    fn refresh_audio_counts(&mut self) {
+        let sound_directory = self.audio_resource_paths().sounds();
+        #[cfg(test)]
+        let resources = AudioResources::new(self.users.keyboard_directory());
+        #[cfg(not(test))]
+        let resources = {
+            let Some(root) = self.users.keyboard_directory().parent().map(PathBuf::from) else {
+                self.audio_error = localization::tr("audio.path_error").to_owned();
+                return;
+            };
+            AudioResources::new(root)
+        };
+        let result = resources.ensure_directories().and_then(|()| {
+            Ok((
+                AudioResources::files(&resources.sounds())?.len(),
+                AudioResources::files(&resources.music())?.len(),
+            ))
+        });
+        match result {
+            Ok(counts) => {
+                self.audio_counts = Some(counts);
+                self.audio_error.clear();
+            }
+            Err(error) => self.audio_error = localized_error("audio.scan_error", error),
+        }
+        if let Some(effects) = &mut self.sound_effects {
+            effects.refresh(sound_directory);
+        }
+        if let Some(music) = &self.music
+            && let Err(error) = music.refresh()
+        {
+            self.audio_error = error;
+        }
+    }
+
+    fn sync_music(&mut self) {
+        if !self.music_available {
+            return;
+        }
+        let profile_id = self.users.active_profile_id().to_owned();
+        if self.music_profile_id != profile_id || self.music.is_none() {
+            let settings = match self.users.audio_settings() {
+                Ok(settings) => settings,
+                Err(error) => {
+                    self.audio_error = localized_error("settings.load_error", error);
+                    return;
+                }
+            };
+            let volume = f32::from(settings.music_volume) / 100.0;
+            if let Some(music) = &self.music {
+                if let Err(error) = music
+                    .set_volume(volume)
+                    .and_then(|()| music.set_enabled(settings.music_enabled))
+                {
+                    self.audio_error = error;
+                    return;
+                }
+            } else {
+                self.music = Some(MusicService::new(
+                    self.audio_resource_paths().music(),
+                    settings.music_enabled,
+                    volume,
+                ));
+            }
+            self.music_profile_id = profile_id;
+        }
+        if let Some(error) = self.music.as_ref().and_then(MusicService::try_error) {
+            self.audio_error = error;
+        }
+        if let Some(error) = self
+            .sound_effects
+            .as_ref()
+            .and_then(sound::SoundEffects::try_error)
+        {
+            self.audio_error = error;
+        }
+    }
+
+    fn play_event(&mut self, event: SoundEvent) {
+        let profile_id = self.users.active_profile_id().to_owned();
+        if self.sound_effects.is_none() || self.sound_profile_id != profile_id {
+            let settings = match self.users.audio_settings() {
+                Ok(settings) => settings,
+                Err(error) => {
+                    self.audio_error = localized_error("settings.load_error", error);
+                    return;
+                }
+            };
+            let mut effects = sound::SoundEffects::with_system_player(
+                self.audio_resource_paths().sounds(),
+                self.play_sound,
+            );
+            effects.set_enabled(settings.effects_enabled);
+            let _ = effects.set_volume(f32::from(settings.effects_volume) / 100.0);
+            self.sound_effects = Some(effects);
+            self.sound_profile_id = profile_id;
+        }
+        if let Some(effects) = &mut self.sound_effects {
+            if let Some(error) = effects.try_error() {
+                self.audio_error = error;
+            }
+            effects.play(event);
+        }
+    }
+
+    fn show_audio_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.audio_open;
+        let mut settings = match self.users.audio_settings() {
+            Ok(settings) => settings,
+            Err(error) => {
+                self.audio_error = localized_error("settings.load_error", error);
+                egui::Window::new(localization::tr("audio.title"))
+                    .open(&mut open)
+                    .show(ctx, |ui| {
+                        ui.colored_label(ui.visuals().error_fg_color, &self.audio_error);
+                    });
+                self.audio_open = open;
+                return;
+            }
+        };
+        let mut changed = false;
+        egui::Window::new(localization::tr("audio.title"))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                crate::ui_style::apply(ui);
+                ui.push_id("audio.effects", |ui| {
+                    ui.heading(localization::tr("audio.effects"));
+                    changed |= ui
+                        .checkbox(
+                            &mut settings.effects_enabled,
+                            localization::tr("audio.enabled"),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut settings.effects_volume, 0..=100)
+                                .text(localization::tr("audio.volume")),
+                        )
+                        .changed();
+                });
+                ui.separator();
+                ui.push_id("audio.music", |ui| {
+                    ui.heading(localization::tr("audio.music"));
+                    changed |= ui
+                        .checkbox(
+                            &mut settings.music_enabled,
+                            localization::tr("audio.enabled"),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut settings.music_volume, 0..=100)
+                                .text(localization::tr("audio.volume")),
+                        )
+                        .changed();
+                });
+                ui.label(localization::tr("audio.system_volume_note"));
+                let resources = self.audio_resource_paths();
+                ui.label(localization::format(
+                    "audio.effects_path",
+                    &FormatArgs::new().insert("path", resources.sounds().display()),
+                ));
+                ui.label(localization::format(
+                    "audio.music_path",
+                    &FormatArgs::new().insert("path", resources.music().display()),
+                ));
+                if let Some((effects, music)) = self.audio_counts {
+                    ui.label(localization::format(
+                        "audio.file_counts",
+                        &FormatArgs::new()
+                            .insert("effects", effects)
+                            .insert("music", music),
+                    ));
+                }
+                if ui.button(localization::tr("audio.refresh")).clicked() {
+                    self.refresh_audio_counts();
+                }
+                if !self.audio_error.is_empty() {
+                    ui.colored_label(ui.visuals().error_fg_color, &self.audio_error);
+                }
+            });
+        self.audio_open = open;
+        if changed {
+            match self.users.set_audio_settings(settings) {
+                Ok(()) => {
+                    let profile_id = self.users.active_profile_id().to_owned();
+                    self.apply_cached_audio_settings(&profile_id, settings);
+                }
+                Err(error) => self.audio_error = localized_error("settings.save_error", error),
+            }
+        }
+    }
+
+    fn audio_resource_paths(&self) -> AudioResources {
+        #[cfg(test)]
+        {
+            AudioResources::new(self.users.keyboard_directory())
+        }
+        #[cfg(not(test))]
+        {
+            AudioResources::new(
+                self.users
+                    .keyboard_directory()
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(".")),
+            )
+        }
+    }
+
+    fn apply_cached_audio_settings(
+        &mut self,
+        profile_id: &str,
+        settings: user_store::AudioSettings,
+    ) {
+        if self.sound_profile_id == profile_id
+            && let Some(effects) = &mut self.sound_effects
+        {
+            effects.set_enabled(settings.effects_enabled);
+            if let Err(error) = effects.set_volume(f32::from(settings.effects_volume) / 100.0) {
+                self.audio_error = error;
+            }
+        }
+        if self.music_profile_id == profile_id
+            && let Some(music) = &self.music
+            && let Err(error) = music
+                .set_volume(f32::from(settings.music_volume) / 100.0)
+                .and_then(|()| music.set_enabled(settings.music_enabled))
+        {
+            self.audio_error = error;
         }
     }
 
@@ -1546,7 +1796,7 @@ impl StaminatorApp {
         self.result_open = false;
         self.result_completed = false;
         self.result_recorded = false;
-        (self.play_sound)(SoundEvent::Start);
+        self.play_event(SoundEvent::Start);
     }
 
     fn stop(&mut self) {
@@ -1732,7 +1982,7 @@ impl StaminatorApp {
         }
         if let Some(session) = &mut self.session {
             match session.type_char(ch, now) {
-                Keystroke::Incorrect => (self.play_sound)(SoundEvent::Error),
+                Keystroke::Incorrect => self.play_event(SoundEvent::Error),
                 Keystroke::Correct
                     if self.selected_mode == TrainingMode::ExternalText
                         && self.external_positions.pop_front().is_some() =>
@@ -1755,11 +2005,11 @@ impl StaminatorApp {
             match session.snapshot(now).state {
                 SessionState::Ready | SessionState::Running => {
                     session.pause(now);
-                    (self.play_sound)(SoundEvent::Pause);
+                    self.play_event(SoundEvent::Pause);
                 }
                 SessionState::Paused => {
                     session.resume(now);
-                    (self.play_sound)(SoundEvent::Start);
+                    self.play_event(SoundEvent::Start);
                 }
                 _ => {}
             }
@@ -1775,6 +2025,7 @@ impl StaminatorApp {
     fn handle_input_events(&mut self, _ctx: &egui::Context, events: Vec<egui::Event>) {
         if self.result_open
             || self.background_open
+            || self.audio_open
             || self.keyboard_manager.editing()
             || self.chooser_open
             || self.profiles_open
@@ -1824,7 +2075,7 @@ impl StaminatorApp {
                         }
                         Some(SessionState::Paused) => {
                             self.session.as_mut().unwrap().resume(now);
-                            (self.play_sound)(SoundEvent::Start);
+                            self.play_event(SoundEvent::Start);
                             consume_space_text = true;
                         }
                         _ => {}
@@ -1842,7 +2093,7 @@ impl StaminatorApp {
                         .is_some_and(|s| s.snapshot(now).state == SessionState::Paused)
                     {
                         self.session.as_mut().unwrap().resume(now);
-                        (self.play_sound)(SoundEvent::Start);
+                        self.play_event(SoundEvent::Start);
                         continue;
                     }
                     for ch in text.chars() {
@@ -2388,6 +2639,9 @@ impl StaminatorApp {
             return Err(self.profile_error.clone());
         }
         let safety = self.users.restore_backup(path).map_err(|e| e.to_string())?;
+        self.sound_effects = None;
+        self.sound_profile_id.clear();
+        self.music_profile_id.clear();
         self.window_placement = None;
         self.scale_profile_id.clear();
         self.sync_profile_language();
@@ -2975,6 +3229,11 @@ impl StaminatorApp {
                     self.progress_open = true;
                 }
                 ui.menu_button(localization::tr("options"), |ui| {
+                    if ui.button(localization::tr("audio.title")).clicked() {
+                        self.audio_open = true;
+                        self.refresh_audio_counts();
+                        ui.close();
+                    }
                     ui.menu_button(localization::tr("interface-language"), |ui| {
                         let language = self
                             .users
@@ -3397,6 +3656,9 @@ impl StaminatorApp {
         if self.background_open {
             self.show_background_window(root.ctx());
         }
+        if self.audio_open {
+            self.show_audio_window(root.ctx());
+        }
         if self.profiles_open
             || self.profile_management_open
             || self.profile_delete_confirmation.is_some()
@@ -3468,6 +3730,9 @@ impl StaminatorApp {
 
 impl eframe::App for StaminatorApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.sync_music();
+        root.ctx()
+            .request_repaint_after(std::time::Duration::from_secs(1));
         self.update_window_placement(root.ctx());
         if root.ctx().input(|input| input.viewport().close_requested())
             && !self.flush_window_placement()
@@ -4231,6 +4496,226 @@ mod tests {
         app.external_path = Some(PathBuf::from("example.txt"));
         app.external_text = "ab".into();
         app
+    }
+
+    #[test]
+    fn music_starts_with_active_profile_and_updates_after_profile_switch() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        let resources = app.audio_resource_paths();
+        resources.ensure_directories().unwrap();
+        fs::write(resources.music().join("broken.mp3"), b"not an mp3").unwrap();
+        let first = app.users.active_profile_id().to_owned();
+        app.users
+            .set_audio_settings(user_store::AudioSettings {
+                music_enabled: false,
+                ..Default::default()
+            })
+            .unwrap();
+        app.music_available = true;
+        app.sync_music();
+        assert_eq!(app.music_profile_id, first);
+        let second = app.users.create("Music enabled").unwrap().id.clone();
+        app.sync_music();
+        assert_eq!(app.music_profile_id, second);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while app.audio_error.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            app.sync_music();
+        }
+        assert!(
+            app.audio_error.contains("broken.mp3"),
+            "{}",
+            app.audio_error
+        );
+        drop(app);
+        let _ = fs::remove_dir_all(resources.music().parent().unwrap());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn audio_refresh_reports_unusable_resource_folder() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        let resources = app.audio_resource_paths();
+        fs::create_dir_all(resources.music().parent().unwrap()).unwrap();
+        fs::write(resources.sounds(), b"blocks the Sound directory").unwrap();
+
+        app.refresh_audio_counts();
+
+        assert!(app.audio_counts.is_none());
+        assert!(app.audio_error.contains("Sound"), "{}", app.audio_error);
+        drop(app);
+        let _ = fs::remove_dir_all(resources.music().parent().unwrap());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sound_player_decode_errors_reach_the_audio_status() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        let resources = app.audio_resource_paths();
+        resources.ensure_directories().unwrap();
+        fs::write(resources.sounds().join("broken.wav"), b"not a wave file").unwrap();
+
+        app.play_event(SoundEvent::Error);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while app.audio_error.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            app.play_event(SoundEvent::Error);
+        }
+
+        assert!(
+            app.audio_error.contains("broken.wav"),
+            "{}",
+            app.audio_error
+        );
+        drop(app);
+        let _ = fs::remove_dir_all(resources.sounds().parent().unwrap());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sound_events_follow_profile_settings_and_refreshed_folder() {
+        use std::sync::{Mutex, OnceLock, mpsc};
+        static TONE_SENDER: OnceLock<Mutex<Option<mpsc::Sender<SoundEvent>>>> = OnceLock::new();
+        fn tone(event: SoundEvent) {
+            if let Some(sender) = TONE_SENDER.get().unwrap().lock().unwrap().as_ref() {
+                let _ = sender.send(event);
+            }
+        }
+        let (sender, receiver) = mpsc::channel();
+        *TONE_SENDER.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(sender);
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.play_sound = tone;
+        let resources = app.audio_resource_paths();
+        resources.ensure_directories().unwrap();
+        app.play_event(SoundEvent::Error);
+        assert_eq!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            SoundEvent::Error
+        );
+        fs::write(resources.sounds().join("unsupported.txt"), b"x").unwrap();
+        app.refresh_audio_counts();
+        app.play_event(SoundEvent::Error);
+        let first = app.users.active_profile_id().to_owned();
+        app.users.create("Silent").unwrap();
+        let settings = user_store::AudioSettings {
+            effects_enabled: false,
+            ..Default::default()
+        };
+        app.users.set_audio_settings(settings).unwrap();
+        app.play_event(SoundEvent::Error);
+        app.users.select(&first).unwrap();
+        app.play_event(SoundEvent::Start);
+        assert_eq!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            SoundEvent::Start
+        );
+        *TONE_SENDER.get().unwrap().lock().unwrap() = None;
+        let _ = fs::remove_dir_all(app.users.keyboard_directory());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn changing_another_profiles_audio_settings_does_not_mute_cached_profile() {
+        use std::sync::{Mutex, OnceLock, mpsc};
+        static TONE_SENDER: OnceLock<Mutex<Option<mpsc::Sender<SoundEvent>>>> = OnceLock::new();
+        fn tone(event: SoundEvent) {
+            if let Some(sender) = TONE_SENDER.get().unwrap().lock().unwrap().as_ref() {
+                let _ = sender.send(event);
+            }
+        }
+        let (sender, receiver) = mpsc::channel();
+        *TONE_SENDER.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(sender);
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        app.play_sound = tone;
+        app.audio_resource_paths().ensure_directories().unwrap();
+        let profile_a = app.users.active_profile_id().to_owned();
+
+        app.play_event(SoundEvent::Error);
+        assert_eq!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            SoundEvent::Error
+        );
+        assert_eq!(app.sound_profile_id, profile_a);
+
+        app.users.create("Profile B").unwrap();
+        let profile_b = app.users.active_profile_id().to_owned();
+        let settings_b = user_store::AudioSettings {
+            effects_enabled: false,
+            effects_volume: 0,
+            ..Default::default()
+        };
+        app.users.set_audio_settings(settings_b).unwrap();
+        app.apply_cached_audio_settings(&profile_b, settings_b);
+
+        app.users.select(&profile_a).unwrap();
+        app.play_event(SoundEvent::Error);
+        assert_eq!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            SoundEvent::Error
+        );
+        *TONE_SENDER.get().unwrap().lock().unwrap() = None;
+
+        let _ = fs::remove_dir_all(app.users.keyboard_directory());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn audio_settings_window_scans_isolated_resources_and_renders_controls() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        let resources = AudioResources::new(app.users.keyboard_directory());
+        resources.ensure_directories().unwrap();
+        fs::write(resources.sounds().join("click.wav"), b"wav").unwrap();
+        fs::write(resources.music().join("song.mp3"), b"mp3").unwrap();
+        app.refresh_audio_counts();
+        assert_eq!(app.audio_counts, Some((1, 1)));
+        app.audio_open = true;
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| app.show_audio_window(ui.ctx()),
+        );
+        assert!(!output.shapes.is_empty());
+        output.textures_delta.clear();
+        let settings = user_store::AudioSettings {
+            effects_volume: 37,
+            music_volume: 64,
+            effects_enabled: false,
+            ..Default::default()
+        };
+        app.users.set_audio_settings(settings).unwrap();
+        assert_eq!(
+            UserStore::load_from(&path)
+                .unwrap()
+                .audio_settings()
+                .unwrap(),
+            settings
+        );
+        app.start();
+        let expected_char = app.session_text.chars().next().unwrap();
+        app.handle_input_events(&ctx, vec![egui::Event::Text(expected_char.to_string())]);
+        assert_eq!(app.session.as_ref().unwrap().retained_position(), 0);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(app.users.keyboard_directory());
     }
 
     #[test]
@@ -7640,6 +8125,56 @@ mod tests {
         assert!(app.accept_result());
         assert_eq!(app.users.active_records()[2].stop_reason, "time_limit");
         drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn backup_restore_reloads_cached_sound_settings_for_same_profile_id() {
+        use std::sync::{Mutex, OnceLock, mpsc};
+        static TONE_SENDER: OnceLock<Mutex<Option<mpsc::Sender<SoundEvent>>>> = OnceLock::new();
+        fn tone(event: SoundEvent) {
+            if let Some(sender) = TONE_SENDER.get().unwrap().lock().unwrap().as_ref() {
+                let _ = sender.send(event);
+            }
+        }
+
+        let root = test_path().with_extension("restore-audio-cache");
+        fs::create_dir_all(&root).unwrap();
+        let mut app = database_test_app(root.join("profiles.sqlite3"));
+        app.audio_resource_paths().ensure_directories().unwrap();
+        let profile_id = app.users.active_profile_id().to_owned();
+        let backup = root.join("sound-settings.sqlite3");
+        app.export_backup_to(&backup).unwrap();
+        app.users
+            .set_audio_settings(user_store::AudioSettings {
+                effects_enabled: false,
+                ..Default::default()
+            })
+            .unwrap();
+        app.play_sound = tone;
+        app.play_event(SoundEvent::Start);
+        assert_eq!(app.sound_profile_id, profile_id);
+        assert!(app.sound_effects.is_some());
+
+        let (sender, receiver) = mpsc::channel();
+        *TONE_SENDER.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(sender);
+        let safety = app.restore_backup_from(&backup).unwrap();
+        assert_eq!(app.users.active_profile_id(), profile_id);
+        assert!(app.sound_effects.is_none());
+        assert!(app.sound_profile_id.is_empty());
+        assert!(app.users.audio_settings().unwrap().effects_enabled);
+
+        app.play_event(SoundEvent::Start);
+        assert_eq!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            SoundEvent::Start
+        );
+        *TONE_SENDER.get().unwrap().lock().unwrap() = None;
+
+        drop(app);
+        let _ = fs::remove_file(safety);
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -63,6 +63,9 @@ pub struct Profile {
     /// Keyboard selection and finger schemes for this profile.
     #[serde(default)]
     pub keyboard_settings: String,
+    /// Per-profile music and sound effect preferences.
+    #[serde(default)]
+    pub audio_settings: AudioSettings,
     #[serde(default, deserialize_with = "deserialize_background")]
     pub background: BackgroundImageSettings,
     /// JSON fallback for window geometry; SQLite stores these in profile settings.
@@ -71,6 +74,33 @@ pub struct Profile {
     /// Per-window scale factors, stored in JSON or profile settings in SQLite.
     #[serde(default, deserialize_with = "deserialize_window_scales")]
     pub window_scales: BTreeMap<String, f32>,
+}
+
+/// Music and sound effect levels and switches for one profile.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AudioSettings {
+    pub music_volume: u8,
+    pub effects_volume: u8,
+    pub music_enabled: bool,
+    pub effects_enabled: bool,
+}
+
+impl Default for AudioSettings {
+    fn default() -> Self {
+        Self {
+            music_volume: 100,
+            effects_volume: 100,
+            music_enabled: true,
+            effects_enabled: true,
+        }
+    }
+}
+
+impl AudioSettings {
+    fn is_valid(self) -> bool {
+        self.music_volume <= 100 && self.effects_volume <= 100
+    }
 }
 
 fn deserialize_window_scales<'de, D>(deserializer: D) -> Result<BTreeMap<String, f32>, D::Error>
@@ -463,6 +493,72 @@ impl UserStore {
         self.commit_or_restore(original)
     }
 
+    /// Read music and sound effect preferences for the active profile.
+    pub fn audio_settings(&self) -> io::Result<AudioSettings> {
+        let profile = self.active_profile().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                localization::tr("profile.not_found"),
+            )
+        })?;
+        if self.database
+            && let Some(value) = self
+                .database()?
+                .expect("database flag")
+                .get_setting(&profile.id, "audio_settings")
+                .map_err(storage_io_error)?
+            && let Ok(settings) = serde_json::from_str::<AudioSettings>(&value)
+            && settings.is_valid()
+        {
+            return Ok(settings);
+        }
+        Ok(if profile.audio_settings.is_valid() {
+            profile.audio_settings
+        } else {
+            AudioSettings::default()
+        })
+    }
+
+    /// Save music and sound effect preferences for the active profile.
+    pub fn set_audio_settings(&mut self, settings: AudioSettings) -> io::Result<()> {
+        if !settings.is_valid() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "audio volumes must be between 0 and 100",
+            ));
+        }
+        let id = self.active_profile_id.clone();
+        if self.active_profile().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                localization::tr("profile.not_found"),
+            ));
+        }
+        if self.database {
+            self.database()?
+                .expect("database flag")
+                .set_setting(
+                    &id,
+                    "audio_settings",
+                    &serde_json::to_string(&settings).map_err(invalid_data)?,
+                )
+                .map_err(storage_io_error)?;
+            self.profiles
+                .iter_mut()
+                .find(|profile| profile.id == id)
+                .expect("active profile")
+                .audio_settings = settings;
+            return Ok(());
+        }
+        let original = self.clone();
+        self.profiles
+            .iter_mut()
+            .find(|profile| profile.id == id)
+            .expect("active profile")
+            .audio_settings = settings;
+        self.commit_or_restore(original)
+    }
+
     pub fn background_settings(&self) -> Option<&BackgroundImageSettings> {
         self.active_profile().map(|profile| &profile.background)
     }
@@ -524,6 +620,14 @@ impl UserStore {
         restored.revision.set(loaded.revision);
         for profile in &mut restored.profiles {
             if let Some(value) = database
+                .get_setting(&profile.id, "audio_settings")
+                .map_err(storage_io_error)?
+                && let Ok(settings) = serde_json::from_str::<AudioSettings>(&value)
+                && settings.is_valid()
+            {
+                profile.audio_settings = settings;
+            }
+            if let Some(value) = database
                 .get_setting(&profile.id, "selected_lessons")
                 .map_err(storage_io_error)?
             {
@@ -560,6 +664,7 @@ impl UserStore {
             fs::create_dir_all(parent)?;
         }
         let mut legacy_selections = BTreeMap::new();
+        let mut legacy_audio_settings = BTreeMap::new();
         let mut database =
             stamina_data::storage::Database::open(&path).map_err(storage_io_error)?;
         let backup = sibling_path(legacy, "bak");
@@ -574,6 +679,12 @@ impl UserStore {
             if let Ok(bytes) = fs::read(source)
                 && let Ok(legacy_store) = serde_json::from_slice::<Self>(&bytes)
             {
+                legacy_audio_settings = legacy_store
+                    .profiles
+                    .iter()
+                    .filter(|profile| profile.audio_settings.is_valid())
+                    .map(|profile| (profile.id.clone(), profile.audio_settings))
+                    .collect();
                 legacy_selections = legacy_store
                     .profiles
                     .into_iter()
@@ -605,6 +716,25 @@ impl UserStore {
         store.background_default_version = 1;
         store.revision.set(loaded.revision);
         for profile in &mut store.profiles {
+            if let Some(value) = database
+                .get_setting(&profile.id, "audio_settings")
+                .map_err(storage_io_error)?
+            {
+                if let Ok(settings) = serde_json::from_str::<AudioSettings>(&value)
+                    && settings.is_valid()
+                {
+                    profile.audio_settings = settings;
+                }
+            } else if let Some(settings) = legacy_audio_settings.get(&profile.id) {
+                profile.audio_settings = *settings;
+                database
+                    .set_setting(
+                        &profile.id,
+                        "audio_settings",
+                        &serde_json::to_string(settings).map_err(invalid_data)?,
+                    )
+                    .map_err(storage_io_error)?;
+            }
             let key = "selected_lessons";
             let stored = database
                 .get_setting(&profile.id, key)
@@ -985,6 +1115,7 @@ impl UserStore {
             selected_mode: None,
             selected_layout: None,
             keyboard_settings: String::new(),
+            audio_settings: AudioSettings::default(),
             background: BackgroundImageSettings::default(),
             window_geometry: BTreeMap::new(),
             window_scales: BTreeMap::new(),
@@ -1224,6 +1355,7 @@ impl UserStore {
                 selected_mode: None,
                 selected_layout: None,
                 keyboard_settings: String::new(),
+                audio_settings: AudioSettings::default(),
                 background: BackgroundImageSettings::default(),
                 window_geometry: BTreeMap::new(),
                 window_scales: BTreeMap::new(),
@@ -1347,6 +1479,149 @@ mod tests {
     }
 
     #[test]
+    fn audio_settings_are_profile_scoped_and_survive_json_restart() {
+        let path = test_path();
+        let mut store = UserStore::new_at(&path);
+        let first_id = store.active_profile_id().to_owned();
+        let first = AudioSettings {
+            music_volume: 23,
+            effects_volume: 81,
+            music_enabled: false,
+            effects_enabled: true,
+        };
+        store.set_audio_settings(first).unwrap();
+        let second_id = store.create("Second").unwrap().id.clone();
+        assert_eq!(store.audio_settings().unwrap(), AudioSettings::default());
+        let second = AudioSettings {
+            music_volume: 0,
+            effects_volume: 100,
+            music_enabled: true,
+            effects_enabled: false,
+        };
+        store.set_audio_settings(second).unwrap();
+        store.select(&first_id).unwrap();
+        assert_eq!(store.audio_settings().unwrap(), first);
+
+        let mut reopened = UserStore::load_from(&path).unwrap();
+        assert_eq!(reopened.audio_settings().unwrap(), first);
+        reopened.select(&second_id).unwrap();
+        assert_eq!(reopened.audio_settings().unwrap(), second);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn audio_settings_are_profile_scoped_and_survive_sqlite_restart() {
+        let path = test_path().with_extension("sqlite3");
+        let legacy = path.with_extension("json");
+        let mut store = UserStore::load_database(path.clone(), &legacy).unwrap();
+        let first_id = store.active_profile_id().to_owned();
+        let first = AudioSettings {
+            music_volume: 12,
+            effects_volume: 34,
+            music_enabled: true,
+            effects_enabled: false,
+        };
+        store.set_audio_settings(first).unwrap();
+        let second_id = store.create("Second").unwrap().id.clone();
+        assert_eq!(store.audio_settings().unwrap(), AudioSettings::default());
+        let second = AudioSettings {
+            music_volume: 56,
+            effects_volume: 78,
+            music_enabled: false,
+            effects_enabled: true,
+        };
+        store.set_audio_settings(second).unwrap();
+
+        let mut reopened = UserStore::load_database(path.clone(), &legacy).unwrap();
+        assert_eq!(reopened.audio_settings().unwrap(), second);
+        reopened.select(&first_id).unwrap();
+        assert_eq!(reopened.audio_settings().unwrap(), first);
+        reopened.select(&second_id).unwrap();
+        assert_eq!(reopened.audio_settings().unwrap(), second);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sqlite_audio_settings_update_profile_cache_after_persisting() {
+        let path = test_path().with_extension("sqlite3");
+        let legacy = path.with_extension("json");
+        let mut store = UserStore::load_database(path.clone(), &legacy).unwrap();
+        let settings = AudioSettings {
+            music_volume: 29,
+            effects_volume: 71,
+            music_enabled: false,
+            effects_enabled: true,
+        };
+
+        store.set_audio_settings(settings).unwrap();
+        assert_eq!(
+            store.active_profile().unwrap().audio_settings,
+            settings,
+            "successful SQLite write should also update the in-memory profile"
+        );
+        let reopened = UserStore::load_database(path.clone(), &legacy).unwrap();
+        assert_eq!(reopened.active_profile().unwrap().audio_settings, settings);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn audio_settings_reject_volumes_over_one_hundred() {
+        let path = test_path();
+        let mut store = UserStore::new_at(&path);
+        let invalid = AudioSettings {
+            music_volume: 101,
+            ..AudioSettings::default()
+        };
+        assert_eq!(
+            store.set_audio_settings(invalid).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn invalid_audio_settings_loaded_from_json_fall_back_to_defaults() {
+        let path = test_path();
+        fs::write(
+            &path,
+            br#"{"active_profile_id":"p","profiles":[{"id":"p","name":"P","audio_settings":{"music_volume":101,"effects_volume":100,"music_enabled":false,"effects_enabled":false}}]}"#,
+        )
+        .unwrap();
+
+        let store = UserStore::load_from(&path).unwrap();
+
+        assert_eq!(store.audio_settings().unwrap(), AudioSettings::default());
+        assert_eq!(
+            store.active_profile().unwrap().audio_settings.music_volume,
+            101
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn malformed_and_invalid_sqlite_audio_settings_fall_back_to_profile_defaults() {
+        let path = test_path().with_extension("sqlite3");
+        let legacy = path.with_extension("json");
+        let store = UserStore::load_database(path.clone(), &legacy).unwrap();
+        let profile_id = store.active_profile_id().to_owned();
+        let mut database = stamina_data::storage::Database::open(&path).unwrap();
+
+        for value in [
+            "not json",
+            r#"{"music_volume":101,"effects_volume":100,"music_enabled":true,"effects_enabled":true}"#,
+        ] {
+            database
+                .set_setting(&profile_id, "audio_settings", value)
+                .unwrap();
+            assert_eq!(store.audio_settings().unwrap(), AudioSettings::default());
+        }
+
+        drop(database);
+        drop(store);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn storage_revision_conflict_keeps_kind_and_typed_source_with_localized_text() {
         let error = storage_io_error(stamina_data::storage::StorageError::RevisionConflict {
             expected: 3,
@@ -1404,6 +1679,7 @@ mod tests {
             selected_mode: None,
             selected_layout: None,
             keyboard_settings: String::new(),
+            audio_settings: AudioSettings::default(),
             background: BackgroundImageSettings::default(),
             window_geometry: BTreeMap::new(),
             window_scales: BTreeMap::new(),
@@ -1463,6 +1739,7 @@ mod tests {
             selected_mode: None,
             selected_layout: None,
             keyboard_settings: String::new(),
+            audio_settings: AudioSettings::default(),
             background: BackgroundImageSettings::default(),
             window_geometry: BTreeMap::new(),
             window_scales: BTreeMap::new(),
@@ -1529,6 +1806,13 @@ mod tests {
         store.set_content_language("FA").unwrap();
         store.set_selected_lesson("ktouch.ir.002").unwrap();
         store.set_training_selection("Text", "FA").unwrap();
+        let audio = AudioSettings {
+            music_volume: 31,
+            effects_volume: 84,
+            music_enabled: false,
+            effects_enabled: true,
+        };
+        store.set_audio_settings(audio).unwrap();
         store
             .database()
             .unwrap()
@@ -1555,6 +1839,8 @@ mod tests {
             store.active_profile().unwrap().selected_layout.as_deref(),
             Some("FA")
         );
+        assert_eq!(store.audio_settings().unwrap(), audio);
+        assert_eq!(store.active_profile().unwrap().audio_settings, audio);
         let saved = stamina_data::storage::Database::open(&safety)
             .unwrap()
             .load_snapshot()
@@ -2416,6 +2702,43 @@ mod tests {
         );
         let _ = fs::remove_file(legacy);
         let _ = fs::remove_file(database);
+    }
+
+    #[test]
+    fn imports_legacy_json_audio_settings_into_sqlite_settings() {
+        let legacy = test_path();
+        let database = legacy.with_extension("sqlite3");
+        let mut source = UserStore::new_at(&legacy);
+        let expected = AudioSettings {
+            music_volume: 17,
+            effects_volume: 63,
+            music_enabled: false,
+            effects_enabled: true,
+        };
+        source.set_audio_settings(expected).unwrap();
+        let profile_id = source.active_profile_id().to_owned();
+
+        let imported = UserStore::load_database(database.clone(), &legacy).unwrap();
+        assert_eq!(imported.active_profile_id(), profile_id);
+        assert_eq!(imported.audio_settings().unwrap(), expected);
+
+        // The migrated values are kept in SQLite's profile settings table too.
+        let stored = imported
+            .database()
+            .unwrap()
+            .unwrap()
+            .get_setting(&profile_id, "audio_settings")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<AudioSettings>(&stored).unwrap(),
+            expected
+        );
+        drop(imported);
+        let reopened = UserStore::load_database(database.clone(), &legacy).unwrap();
+        assert_eq!(reopened.audio_settings().unwrap(), expected);
+        let _ = fs::remove_file(database);
+        let _ = fs::remove_file(legacy);
     }
 
     #[test]
