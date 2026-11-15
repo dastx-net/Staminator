@@ -25,6 +25,7 @@ pub struct KeyboardManager {
     error: String,
     scheme_name: String,
     scheme_draft: Option<Assignments>,
+    draft_error: String,
 }
 
 impl KeyboardManager {
@@ -42,6 +43,7 @@ impl KeyboardManager {
             error: String::new(),
             scheme_name: String::new(),
             scheme_draft: None,
+            draft_error: String::new(),
         }
     }
     pub fn sync(&mut self, users: &mut UserStore) -> bool {
@@ -78,6 +80,7 @@ impl KeyboardManager {
         self.editor = None;
         self.editor_base_schema = None;
         self.scheme_draft = None;
+        self.draft_error.clear();
         self.scheme_name.clear();
         self.profile_id = users.active_profile_id().to_owned();
         self.prefs = match users.keyboard_settings() {
@@ -133,6 +136,17 @@ impl KeyboardManager {
             Err(e) => self.error = e.to_string(),
         }
     }
+    fn delete_custom_scheme(&mut self, name: &str, users: &mut UserStore) -> bool {
+        if self.prefs.schemes.remove(name).is_none() {
+            return false;
+        }
+        if self.prefs.finger_scheme == name {
+            self.prefs.finger_scheme = "default".into();
+        }
+        self.error.clear();
+        self.persist(users);
+        true
+    }
     pub fn assignments(&self) -> Assignments {
         let builtin = self.prefs.finger_scheme.is_empty()
             || matches!(self.prefs.finger_scheme.as_str(), "default" | "alternate");
@@ -165,79 +179,351 @@ impl KeyboardManager {
         let mut changed = false;
         if self.open {
             let mut open = self.open;
-            egui::Window::new("Клавиатуры / Keyboards").open(&mut open).default_width(620.0).show(ctx, |ui| {
-                ui.label(format!("Папка / Folder: {}", self.root.display()));
-                ui.heading("Клавиатуры / Keyboards");
-                egui::ScrollArea::vertical().id_salt("keyboard_entries").max_height(180.0).show(ui, |ui| {
-                for entry in self.entries.clone() {
-                    ui.horizontal(|ui| {
-                        if ui.selectable_label(self.prefs.keyboard == entry.id, &entry.name).clicked() {
-                            self.error.clear(); self.prefs.keyboard = entry.id.clone(); self.load_selected(); self.persist(users); changed = true;
-                        }
-                        if ui.button("Экспорт ZIP / Export").clicked()
-                            && let Some(path) = rfd::FileDialog::new().add_filter("ZIP", &["zip"]).set_file_name(format!("{}.zip", entry.id)).save_file()
-                                && let Some(c) = &self.collection { match c.export_zip(&entry.id, path) { Ok(()) => self.error.clear(), Err(e) => self.error = e.to_string() } }
-                        if ui.add_enabled(self.entries.len() > 1, egui::Button::new("Удалить / Delete")).clicked() {
-                            let confirm = rfd::MessageDialog::new().set_title("Delete keyboard?").set_description(format!("Удалить клавиатуру / Delete keyboard: {}?", entry.name)).set_buttons(rfd::MessageButtons::YesNo).show();
-                            if confirm == rfd::MessageDialogResult::Yes
-                                && let Some(c) = &self.collection { if let Err(e) = c.remove(&entry.id) { self.error = e.to_string(); } else { self.error.clear(); self.refresh(); self.load_selected(); self.persist(users); changed = true; } }
-                        }
-                    });
-                }
-                });
-                ui.horizontal(|ui| {
-                    if ui.button("Импорт ZIP / Import ZIP").clicked()
-                        && let Some(path) = rfd::FileDialog::new().add_filter("ZIP", &["zip"]).pick_file()
-                            && let Some(c) = &self.collection { match c.import_zip(path) { Ok(entry) => { self.error.clear(); self.refresh(); self.prefs.keyboard = entry.id; self.load_selected(); self.persist(users); changed = true; }, Err(e) => self.error = e.to_string() } }
-                    if ui.button("Новая / New").clicked() { let schema=crate::keyboard_editor::blank_schema("New keyboard", 16.0, 5.0); self.editor_base_schema=Some(schema.clone()); self.editor = Some(KeyboardEditor::new(schema)); }
-                    if ui.button("Редактировать копию / Edit copy").clicked() { self.editor_base_schema=Some(self.schema.clone()); self.editor = Some(KeyboardEditor::new(self.schema.clone())); }
-                });
-                ui.separator();
-                ui.heading("Пальцы / Finger assignments");
-                ui.horizontal_wrapped(|ui| {
-                    for (id, label) in [("default", "Обычная / Standard"), ("alternate", "Альтернативная / Alternative")] {
-                        if ui.selectable_label((self.prefs.finger_scheme.is_empty() && id == "default") || self.prefs.finger_scheme == id, label).clicked() { self.error.clear(); self.prefs.finger_scheme = id.into(); self.persist(users); changed = true; }
-                    }
-                    for name in self.prefs.schemes.keys().cloned().collect::<Vec<_>>() {
-                        if ui.selectable_label(self.prefs.finger_scheme == name, &name).clicked() { self.error.clear(); self.prefs.finger_scheme = name; self.persist(users); changed = true; }
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Новая схема / New scheme").clicked() { self.scheme_name.clear(); self.scheme_draft = Some(self.assignments()); }
-                    if ui.button("Импорт схемы / Import scheme").clicked()
-                        && let Some(path) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
-                            match FingerScheme::load(&path) { Ok(s) if s.name != "default" && s.name != "alternate" && !self.prefs.schemes.contains_key(&s.name) => { self.error.clear(); self.prefs.finger_scheme = s.name.clone(); self.prefs.schemes.insert(s.name.clone(), s); self.persist(users); changed = true; }, Ok(_) => self.error = "Схема с таким именем уже существует / Scheme name already exists".into(), Err(e) => self.error = e }
-                        }
-                    if let Some(scheme) = self.prefs.schemes.get(&self.prefs.finger_scheme).cloned() {
-                        if ui.button("Экспорт схемы / Export scheme").clicked() && let Some(path) = rfd::FileDialog::new().add_filter("JSON", &["json"]).set_file_name("fingers.json").save_file() { match scheme.export(&path) { Ok(()) => self.error.clear(), Err(e) => self.error = e } }
-                        if ui.button("Удалить схему / Delete scheme").clicked() { self.error.clear(); self.prefs.schemes.remove(&scheme.name); self.prefs.finger_scheme = "default".into(); self.persist(users); changed = true; }
-                    }
-                });
-                if let Some(draft) = &mut self.scheme_draft {
-                    ui.horizontal(|ui| { ui.label("Имя / Name:"); ui.text_edit_singleline(&mut self.scheme_name); });
-                    egui::ScrollArea::vertical().id_salt("finger_editor").max_height(200.0).show(ui, |ui| {
-                        for key in &self.schema.keys {
-                            ui.horizontal(|ui| {
-                                ui.label(&key.physical_id);
-                                let mut value = draft.get(&key.physical_id).copied();
-                                egui::ComboBox::from_id_salt(("finger", &key.physical_id)).selected_text(finger_label(value)).show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut value, None, "—");
-                                    for finger in fingers() { ui.selectable_value(&mut value, Some(finger), finger_label(Some(finger))); }
-                                });
-                                if let Some(f) = value { draft.insert(key.physical_id.clone(), f); } else { draft.remove(&key.physical_id); }
+            use crate::localization::tr;
+            egui::Window::new(tr("keyboard_manager.title"))
+                .open(&mut open)
+                .default_width(500.0)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    crate::ui_style::apply(ui);
+                    egui::ScrollArea::vertical()
+                        .id_salt("keyboard_manager_content")
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.label(tr("keyboard_manager.intro"));
+                            ui.add_space(12.0);
+                            ui.heading(tr("keyboard_manager.title"));
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button(tr("keyboard_manager.import")).clicked()
+                                    && let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("ZIP", &["zip"])
+                                        .pick_file()
+                                    && let Some(c) = &self.collection
+                                {
+                                    match c.import_zip(path) {
+                                        Ok(entry) => {
+                                            self.error.clear();
+                                            self.refresh();
+                                            self.prefs.keyboard = entry.id;
+                                            self.load_selected();
+                                            self.persist(users);
+                                            changed = true;
+                                        }
+                                        Err(e) => self.error = e.to_string(),
+                                    }
+                                }
+                                if ui.button(tr("keyboard_manager.new")).clicked() {
+                                    let schema = crate::keyboard_editor::blank_schema(
+                                        "New keyboard",
+                                        16.0,
+                                        5.0,
+                                    );
+                                    self.editor_base_schema = Some(schema.clone());
+                                    self.editor = Some(KeyboardEditor::new(schema));
+                                }
                             });
-                        }
-                    });
-                    if ui.button("Сохранить схему / Save scheme").clicked() {
-                        let s = FingerScheme { version: 1, name: self.scheme_name.trim().into(), assignments: draft.clone() };
-                        if s.name == "default" || s.name == "alternate" || self.prefs.schemes.contains_key(&s.name) { self.error = "Имя уже занято / Name already exists".into(); }
-                        else if let Err(e) = s.validate() { self.error = e; }
-                        else { self.error.clear(); self.prefs.finger_scheme = s.name.clone(); self.prefs.schemes.insert(s.name.clone(), s); self.scheme_draft = None; self.persist(users); changed = true; }
-                    }
-                }
-                if !self.error.is_empty() { ui.colored_label(egui::Color32::RED, &self.error); }
-            });
+                            egui::Frame::group(ui.style())
+                                .inner_margin(egui::Margin::same(4))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    for (index, entry) in
+                                        self.entries.clone().into_iter().enumerate()
+                                    {
+                                        let selected = self.prefs.keyboard == entry.id;
+                                        let label = if selected {
+                                            format!(
+                                                "✓ {} — {}",
+                                                entry.name,
+                                                tr("keyboard_manager.selected")
+                                            )
+                                        } else {
+                                            entry.name.clone()
+                                        };
+                                        if ui
+                                            .add_sized(
+                                                [ui.available_width(), 30.0],
+                                                egui::Button::selectable(selected, label).wrap(),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.error.clear();
+                                            self.prefs.keyboard = entry.id;
+                                            self.load_selected();
+                                            self.persist(users);
+                                            changed = true;
+                                        }
+                                        if index + 1 < self.entries.len() {
+                                            ui.separator();
+                                        }
+                                    }
+                                });
+                            if let Some(entry) = self
+                                .entries
+                                .iter()
+                                .find(|e| e.id == self.prefs.keyboard)
+                                .cloned()
+                            {
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button(tr("keyboard_manager.edit")).clicked() {
+                                        self.editor_base_schema = Some(self.schema.clone());
+                                        self.editor =
+                                            Some(KeyboardEditor::new(self.schema.clone()));
+                                    }
+                                    if ui.button(tr("keyboard_manager.export")).clicked()
+                                        && let Some(path) = rfd::FileDialog::new()
+                                            .add_filter("ZIP", &["zip"])
+                                            .set_file_name(format!("{}.zip", entry.id))
+                                            .save_file()
+                                        && let Some(c) = &self.collection
+                                    {
+                                        match c.export_zip(&entry.id, path) {
+                                            Ok(()) => self.error.clear(),
+                                            Err(e) => self.error = e.to_string(),
+                                        }
+                                    }
+                                    let delete = ui.add_enabled(
+                                        self.entries.len() > 1,
+                                        egui::Button::new(tr("keyboard_manager.delete")),
+                                    );
+                                    let delete =
+                                        delete.on_disabled_hover_text(tr("keyboard_manager.last"));
+                                    if delete.clicked() {
+                                        let prompt = crate::localization::format(
+                                            "keyboard_manager.delete_prompt",
+                                            &staminator_core::FormatArgs::new()
+                                                .insert("name", &entry.name),
+                                        );
+                                        let confirm = rfd::MessageDialog::new()
+                                            .set_title(tr("keyboard_manager.delete_title"))
+                                            .set_description(prompt)
+                                            .set_buttons(rfd::MessageButtons::YesNo)
+                                            .show();
+                                        if confirm == rfd::MessageDialogResult::Yes
+                                            && let Some(c) = &self.collection
+                                        {
+                                            if let Err(e) = c.remove(&entry.id) {
+                                                self.error = e.to_string();
+                                            } else {
+                                                self.error.clear();
+                                                self.refresh();
+                                                self.load_selected();
+                                                self.persist(users);
+                                                changed = true;
+                                            }
+                                        }
+                                    }
+                                });
+                                if self.entries.len() <= 1 {
+                                    ui.label(tr("keyboard_manager.last"));
+                                }
+                            }
+                            ui.add_space(16.0);
+                            ui.heading(tr("keyboard_manager.fingers"));
+                            ui.horizontal_wrapped(|ui| {
+                                for (id, label) in [
+                                    ("default", "keyboard_manager.standard"),
+                                    ("alternate", "keyboard_manager.alternate"),
+                                ] {
+                                    let selected = (self.prefs.finger_scheme.is_empty()
+                                        && id == "default")
+                                        || self.prefs.finger_scheme == id;
+                                    let label = tr(label);
+                                    if ui
+                                        .selectable_label(
+                                            selected,
+                                            if selected {
+                                                format!("✓ {label}")
+                                            } else {
+                                                label
+                                            },
+                                        )
+                                        .clicked()
+                                    {
+                                        self.error.clear();
+                                        self.prefs.finger_scheme = id.into();
+                                        self.persist(users);
+                                        changed = true;
+                                    }
+                                }
+                                for name in self.prefs.schemes.keys().cloned().collect::<Vec<_>>() {
+                                    let selected = self.prefs.finger_scheme == name;
+                                    if ui
+                                        .selectable_label(
+                                            selected,
+                                            if selected {
+                                                format!("✓ {name}")
+                                            } else {
+                                                name.clone()
+                                            },
+                                        )
+                                        .clicked()
+                                    {
+                                        self.error.clear();
+                                        self.prefs.finger_scheme = name;
+                                        self.persist(users);
+                                        changed = true;
+                                    }
+                                }
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button(tr("keyboard_manager.new_scheme")).clicked() {
+                                    self.scheme_name.clear();
+                                    self.draft_error.clear();
+                                    self.scheme_draft = Some(self.assignments());
+                                }
+                                if ui.button(tr("keyboard_manager.import_scheme")).clicked()
+                                    && let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("JSON", &["json"])
+                                        .pick_file()
+                                {
+                                    match FingerScheme::load(&path) {
+                                        Ok(s)
+                                            if s.name != "default"
+                                                && s.name != "alternate"
+                                                && !self.prefs.schemes.contains_key(&s.name) =>
+                                        {
+                                            self.error.clear();
+                                            self.prefs.finger_scheme = s.name.clone();
+                                            self.prefs.schemes.insert(s.name.clone(), s);
+                                            self.persist(users);
+                                            changed = true;
+                                        }
+                                        Ok(_) => self.error = tr("keyboard_manager.duplicate"),
+                                        Err(e) => self.error = e,
+                                    }
+                                }
+                                if let Some(scheme) =
+                                    self.prefs.schemes.get(&self.prefs.finger_scheme).cloned()
+                                {
+                                    if ui.button(tr("keyboard_manager.export_scheme")).clicked()
+                                        && let Some(path) = rfd::FileDialog::new()
+                                            .add_filter("JSON", &["json"])
+                                            .set_file_name("fingers.json")
+                                            .save_file()
+                                    {
+                                        match scheme.export(&path) {
+                                            Ok(()) => self.error.clear(),
+                                            Err(e) => self.error = e,
+                                        }
+                                    }
+                                    if ui.button(tr("keyboard_manager.delete_scheme")).clicked() {
+                                        let prompt = crate::localization::format(
+                                            "keyboard_manager.delete_scheme_prompt",
+                                            &staminator_core::FormatArgs::new()
+                                                .insert("name", &scheme.name),
+                                        );
+                                        if rfd::MessageDialog::new()
+                                            .set_title(tr("keyboard_manager.delete_scheme_title"))
+                                            .set_description(prompt)
+                                            .set_buttons(rfd::MessageButtons::YesNo)
+                                            .show()
+                                            == rfd::MessageDialogResult::Yes
+                                        {
+                                            changed |=
+                                                self.delete_custom_scheme(&scheme.name, users);
+                                        }
+                                    }
+                                } else {
+                                    ui.label(tr("keyboard_manager.builtin"));
+                                }
+                            });
+                            ui.add_space(16.0);
+                            ui.collapsing(tr("keyboard_manager.folder"), |ui| {
+                                ui.add(
+                                    egui::Label::new(self.root.display().to_string())
+                                        .selectable(true),
+                                );
+                            });
+                            if !self.error.is_empty() {
+                                ui.colored_label(ui.visuals().error_fg_color, &self.error);
+                            }
+                        });
+                });
             self.open = open;
+            if !open {
+                self.scheme_draft = None;
+                self.scheme_name.clear();
+            }
+        }
+        if self.scheme_draft.is_some() {
+            use crate::localization::tr;
+            let mut draft_open = true;
+            let mut cancel = false;
+            let mut save = false;
+            egui::Window::new(tr("keyboard_manager.scheme_editor"))
+                .open(&mut draft_open)
+                .default_width(420.0)
+                .show(ctx, |ui| {
+                    crate::ui_style::apply(ui);
+                    ui.label(tr("keyboard_manager.draft_note"));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(tr("keyboard_manager.name"));
+                        ui.text_edit_singleline(&mut self.scheme_name);
+                    });
+                    egui::ScrollArea::vertical()
+                        .id_salt("finger_editor")
+                        .max_height(300.0)
+                        .show(ui, |ui| {
+                            if let Some(draft) = &mut self.scheme_draft {
+                                for key in &self.schema.keys {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(&key.physical_id);
+                                        let mut value = draft.get(&key.physical_id).copied();
+                                        egui::ComboBox::from_id_salt(("finger", &key.physical_id))
+                                            .selected_text(finger_label(value))
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(&mut value, None, "—");
+                                                for finger in fingers() {
+                                                    ui.selectable_value(
+                                                        &mut value,
+                                                        Some(finger),
+                                                        finger_label(Some(finger)),
+                                                    );
+                                                }
+                                            });
+                                        if let Some(f) = value {
+                                            draft.insert(key.physical_id.clone(), f);
+                                        } else {
+                                            draft.remove(&key.physical_id);
+                                        }
+                                    });
+                                }
+                            }
+                        });
+                    ui.horizontal_wrapped(|ui| {
+                        save = ui.button(tr("keyboard_manager.save_scheme")).clicked();
+                        cancel = ui.button(tr("keyboard_manager.cancel")).clicked();
+                    });
+                    if !self.draft_error.is_empty() {
+                        ui.colored_label(ui.visuals().error_fg_color, &self.draft_error);
+                    }
+                });
+            if cancel || !draft_open {
+                self.scheme_draft = None;
+                self.scheme_name.clear();
+                self.draft_error.clear();
+            } else if save && let Some(draft) = &self.scheme_draft {
+                let scheme = FingerScheme {
+                    version: 1,
+                    name: self.scheme_name.trim().into(),
+                    assignments: draft.clone(),
+                };
+                if scheme.name == "default"
+                    || scheme.name == "alternate"
+                    || self.prefs.schemes.contains_key(&scheme.name)
+                {
+                    self.draft_error = tr("keyboard_manager.duplicate");
+                } else if let Err(e) = scheme.validate() {
+                    self.draft_error = e;
+                } else {
+                    self.draft_error.clear();
+                    self.prefs.finger_scheme = scheme.name.clone();
+                    self.prefs.schemes.insert(scheme.name.clone(), scheme);
+                    self.scheme_draft = None;
+                    self.persist(users);
+                    changed = true;
+                }
+            }
         }
         let current_assignments = self.assignments();
         if let Some(editor) = &mut self.editor {
@@ -381,20 +667,21 @@ fn fingers() -> [Finger; 10] {
         Finger::RightThumb,
     ]
 }
-fn finger_label(f: Option<Finger>) -> &'static str {
-    match f {
-        None => "—",
-        Some(Finger::LeftLittle) => "Л миз. / L little",
-        Some(Finger::LeftRing) => "Л без. / L ring",
-        Some(Finger::LeftMiddle) => "Л сред. / L middle",
-        Some(Finger::LeftIndex) => "Л указ. / L index",
-        Some(Finger::RightIndex) => "П указ. / R index",
-        Some(Finger::RightMiddle) => "П сред. / R middle",
-        Some(Finger::RightRing) => "П без. / R ring",
-        Some(Finger::RightLittle) => "П миз. / R little",
-        Some(Finger::LeftThumb) => "Л больш. / L thumb",
-        Some(Finger::RightThumb) => "П больш. / R thumb",
-    }
+fn finger_label(f: Option<Finger>) -> String {
+    let key = match f {
+        None => return "—".into(),
+        Some(Finger::LeftLittle) => "left_little",
+        Some(Finger::LeftRing) => "left_ring",
+        Some(Finger::LeftMiddle) => "left_middle",
+        Some(Finger::LeftIndex) => "left_index",
+        Some(Finger::RightIndex) => "right_index",
+        Some(Finger::RightMiddle) => "right_middle",
+        Some(Finger::RightRing) => "right_ring",
+        Some(Finger::RightLittle) => "right_little",
+        Some(Finger::LeftThumb) => "left_thumb",
+        Some(Finger::RightThumb) => "right_thumb",
+    };
+    crate::localization::tr(&format!("keyboard_manager.{key}"))
 }
 
 #[cfg(test)]
@@ -624,9 +911,13 @@ mod tests {
         assert_eq!(manager.schema.name, "Other board");
 
         manager.error = "Previous failure".into();
-        click_accessible(&ctx, "Альтернативная / Alternative", |ctx| {
-            manager.show(ctx, &mut users);
-        });
+        click_accessible(
+            &ctx,
+            &crate::localization::tr("keyboard_manager.alternate"),
+            |ctx| {
+                manager.show(ctx, &mut users);
+            },
+        );
         assert!(manager.error.is_empty());
         assert_eq!(manager.prefs.finger_scheme, "alternate");
         assert_eq!(
@@ -638,7 +929,7 @@ mod tests {
         let mut draft = manager.assignments();
         draft.insert("KeyQ".into(), Finger::RightLittle);
         manager.scheme_draft = Some(draft);
-        click_accessible(&ctx, "Сохранить схему / Save scheme", |ctx| {
+        click_accessible(&ctx, "Сохранить схему", |ctx| {
             manager.show(ctx, &mut users);
         });
         assert_eq!(manager.prefs.finger_scheme, "Custom scheme");
@@ -652,7 +943,7 @@ mod tests {
         manager.editor = Some(KeyboardEditor::new(edited));
         click_accessible(
             &ctx,
-            "Validate & save copy / Сохранить копию",
+            "Проверить и сохранить копию",
             |ctx| {
                 manager.show(ctx, &mut users);
             },
@@ -776,7 +1067,7 @@ mod tests {
         let ctx = Context::default();
         click_accessible(
             &ctx,
-            "Validate & save copy / Сохранить копию",
+            "Проверить и сохранить копию",
             |ctx| {
                 manager.show(ctx, &mut users);
             },
@@ -904,6 +1195,157 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_finger_draft_keeps_profile_unchanged() {
+        let root = std::env::temp_dir().join(format!(
+            "staminator-cancel-draft-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut users = UserStore::new_at(root.join("profiles.json"));
+        let mut manager = KeyboardManager::new(root.join("Keyboards"));
+        manager.sync(&mut users);
+        manager.open();
+        let before = manager.assignments();
+        manager.scheme_name = "Draft".into();
+        manager.scheme_draft = Some(before.clone());
+        manager
+            .scheme_draft
+            .as_mut()
+            .unwrap()
+            .insert("KeyQ".into(), Finger::RightLittle);
+        let ctx = Context::default();
+        click_accessible(&ctx, "Отмена", |ctx| {
+            manager.show(ctx, &mut users);
+        });
+        assert!(manager.scheme_draft.is_none());
+        assert_eq!(manager.assignments(), before);
+        assert!(!manager.prefs.schemes.contains_key("Draft"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scheme_validation_error_does_not_replace_collection_error() {
+        let root = std::env::temp_dir().join(format!(
+            "staminator-draft-error-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut users = UserStore::new_at(root.join("profiles.json"));
+        let mut manager = KeyboardManager::new(root.join("Keyboards"));
+        manager.sync(&mut users);
+        manager.open();
+        manager.error = "Collection error".into();
+        manager.scheme_name = "default".into();
+        manager.scheme_draft = Some(manager.assignments());
+        let ctx = Context::default();
+        click_accessible(&ctx, "Сохранить схему", |ctx| {
+            manager.show(ctx, &mut users);
+        });
+        assert_eq!(manager.error, "Collection error");
+        assert!(!manager.draft_error.is_empty());
+        click_accessible(&ctx, "Отмена", |ctx| {
+            manager.show(ctx, &mut users);
+        });
+        assert_eq!(manager.error, "Collection error");
+        assert!(manager.draft_error.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn last_keyboard_delete_is_disabled_and_explained() {
+        let root = std::env::temp_dir().join(format!(
+            "staminator-last-keyboard-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut users = UserStore::new_at(root.join("profiles.json"));
+        let mut manager = KeyboardManager::new(root.join("Keyboards"));
+        manager.sync(&mut users);
+        for entry in manager.entries.iter().skip(1) {
+            manager
+                .collection
+                .as_ref()
+                .unwrap()
+                .remove(&entry.id)
+                .unwrap();
+        }
+        manager.open();
+        manager.prefs.keyboard = manager.entries[0].id.clone();
+        manager.load_selected();
+        let ctx = Context::default();
+        ctx.enable_accesskit();
+        let mut disabled = false;
+        let mut explained = false;
+        for _ in 0..3 {
+            let mut output = ctx.run_pass(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(1200.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|_| {
+                        manager.show(ctx, &mut users);
+                    })
+                },
+            );
+            if let Some(update) = &output.platform_output.accesskit_update {
+                for (_, node) in &update.nodes {
+                    if node.label() == Some("Удалить клавиатуру") {
+                        disabled |= node.is_disabled();
+                    }
+                    if node.value() == Some("Последнюю клавиатуру удалить нельзя.")
+                    {
+                        explained = true;
+                    }
+                }
+            }
+            output.textures_delta.clear();
+        }
+        assert!(
+            disabled && explained,
+            "disabled={disabled} explained={explained}"
+        );
+        assert_eq!(
+            manager.collection.as_ref().unwrap().list().unwrap().len(),
+            1
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deleting_custom_scheme_restores_default_after_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "staminator-delete-scheme-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = root.join("profiles.json");
+        let mut users = UserStore::new_at(&path);
+        let mut manager = KeyboardManager::new(root.join("Keyboards"));
+        manager.sync(&mut users);
+        let scheme = FingerScheme {
+            version: 1,
+            name: "Custom".into(),
+            assignments: manager.assignments(),
+        };
+        manager.prefs.schemes.insert(scheme.name.clone(), scheme);
+        manager.prefs.finger_scheme = "Custom".into();
+        manager.persist(&mut users);
+        assert!(!manager.delete_custom_scheme("default", &mut users));
+        assert!(manager.delete_custom_scheme("Custom", &mut users));
+        drop(manager);
+        let mut users = UserStore::load_from(&path).unwrap();
+        let mut reopened = KeyboardManager::new(root.join("Keyboards"));
+        reopened.sync(&mut users);
+        assert_eq!(reopened.prefs.finger_scheme, "default");
+        assert!(!reopened.prefs.schemes.contains_key("Custom"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn selection_fallback_and_invalid_custom_scheme_save_are_reported() {
         let root = std::env::temp_dir().join(format!(
             "staminator-manager-fallback-{}-{}",
@@ -923,17 +1365,17 @@ mod tests {
         manager.scheme_name = "default".into();
         manager.scheme_draft = Some(manager.assignments());
         let ctx = Context::default();
-        click_accessible(&ctx, "Сохранить схему / Save scheme", |ctx| {
+        click_accessible(&ctx, "Сохранить схему", |ctx| {
             manager.show(ctx, &mut users);
         });
-        assert!(manager.error.contains("already"));
+        assert!(!manager.draft_error.is_empty());
         assert!(manager.scheme_draft.is_some());
         assert!(!manager.prefs.schemes.contains_key("default"));
 
         let count = manager.entries.len();
         manager.editor_base_schema = Some(manager.schema.clone());
         manager.editor = Some(KeyboardEditor::new(manager.schema.clone()));
-        click_accessible(&ctx, "Close / Закрыть", |ctx| {
+        click_accessible(&ctx, "Закрыть", |ctx| {
             manager.show(ctx, &mut users);
         });
         assert!(manager.editor.is_none());

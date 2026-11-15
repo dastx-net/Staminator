@@ -18,6 +18,7 @@ mod scaling;
 mod sound;
 mod storage_transfer;
 mod training_view;
+mod ui_style;
 mod user_store;
 mod window_geometry;
 mod window_monitors;
@@ -1033,91 +1034,106 @@ impl StaminatorApp {
         egui::Window::new(localization::tr("background.title"))
             .open(&mut open)
             .show(ctx, |ui| {
-                if ui
-                    .selectable_label(settings.use_builtin, localization::tr("background.builtin"))
-                    .clicked()
-                {
-                    settings.use_builtin = true;
-                    settings.image_path = None;
-                    changed = true;
-                }
-                if ui
-                    .selectable_label(
-                        !settings.use_builtin && settings.image_path.is_none(),
-                        localization::tr("background.color"),
-                    )
-                    .clicked()
-                {
-                    settings.image_path = None;
-                    settings.use_builtin = false;
-                    changed = true;
-                }
-                if ui.button(localization::tr("background.choose")).clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("PNG / JPEG", &["png", "jpg", "jpeg"])
-                        .pick_file()
-                {
-                    settings.image_path = Some(path);
-                    settings.use_builtin = false;
-                    changed = true;
-                }
-                if let Some(path) = &settings.image_path {
-                    ui.label(path.display().to_string());
-                }
-                ui.horizontal(|ui| {
-                    if ui.button(localization::tr("background.refresh")).clicked() {
-                        let _ = fs::create_dir_all(background::directory());
-                        self.background_files = background::images_in(&background::directory());
-                        self.background_selection = None;
-                    }
-                    ui.small(background::directory().display().to_string());
-                });
-                for path in &self.background_files {
-                    if ui
-                        .selectable_label(
-                            settings.image_path.as_ref() == Some(path),
-                            path.file_name().unwrap_or_default().to_string_lossy(),
-                        )
-                        .clicked()
-                    {
-                        settings.image_path = Some(path.clone());
-                        settings.use_builtin = false;
-                        changed = true;
-                    }
-                }
-                ui.horizontal(|ui| {
-                    for (value, key) in [
-                        (user_store::BackgroundPlacement::Fit, "background.fit"),
-                        (user_store::BackgroundPlacement::Fill, "background.fill"),
-                        (user_store::BackgroundPlacement::Tile, "background.tile"),
-                    ] {
+                crate::ui_style::apply(ui);
+                egui::ScrollArea::vertical()
+                    .id_salt("show_background_window_content")
+                    .show(ui, |ui| {
+                        if ui
+                            .selectable_label(
+                                settings.use_builtin,
+                                localization::tr("background.builtin"),
+                            )
+                            .clicked()
+                        {
+                            settings.use_builtin = true;
+                            settings.image_path = None;
+                            changed = true;
+                        }
+                        if ui
+                            .selectable_label(
+                                !settings.use_builtin && settings.image_path.is_none(),
+                                localization::tr("background.color"),
+                            )
+                            .clicked()
+                        {
+                            settings.image_path = None;
+                            settings.use_builtin = false;
+                            changed = true;
+                        }
+                        if ui.button(localization::tr("background.choose")).clicked()
+                            && let Some(path) = rfd::FileDialog::new()
+                                .add_filter("PNG / JPEG", &["png", "jpg", "jpeg"])
+                                .pick_file()
+                        {
+                            settings.image_path = Some(path);
+                            settings.use_builtin = false;
+                            changed = true;
+                        }
+                        if let Some(path) = &settings.image_path {
+                            ui.label(path.display().to_string());
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button(localization::tr("background.refresh")).clicked() {
+                                let _ = fs::create_dir_all(background::directory());
+                                self.background_files =
+                                    background::images_in(&background::directory());
+                                self.background_selection = None;
+                            }
+                            ui.small(background::directory().display().to_string());
+                        });
+                        for path in &self.background_files {
+                            if ui
+                                .selectable_label(
+                                    settings.image_path.as_ref() == Some(path),
+                                    path.file_name().unwrap_or_default().to_string_lossy(),
+                                )
+                                .clicked()
+                            {
+                                settings.image_path = Some(path.clone());
+                                settings.use_builtin = false;
+                                changed = true;
+                            }
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            for (value, key) in [
+                                (user_store::BackgroundPlacement::Fit, "background.fit"),
+                                (user_store::BackgroundPlacement::Fill, "background.fill"),
+                                (user_store::BackgroundPlacement::Tile, "background.tile"),
+                            ] {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut settings.placement,
+                                        value,
+                                        localization::tr(key),
+                                    )
+                                    .changed();
+                            }
+                        });
                         changed |= ui
-                            .selectable_value(&mut settings.placement, value, localization::tr(key))
+                            .add(
+                                egui::Slider::new(&mut settings.dim_percent, 0..=100)
+                                    .text(localization::tr("background.dim")),
+                            )
                             .changed();
-                    }
-                });
-                changed |= ui
-                    .add(
-                        egui::Slider::new(&mut settings.dim_percent, 0..=100)
-                            .text(localization::tr("background.dim")),
-                    )
-                    .changed();
-                if !self.background_error.is_empty() {
-                    ui.colored_label(egui::Color32::RED, &self.background_error);
-                }
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(320.0, 120.0), egui::Sense::hover());
-                ui.painter()
-                    .rect_filled(rect, 0.0, egui::Color32::from_rgb(67, 76, 82));
-                if let Some(texture) = &self.background_texture {
-                    background::paint(
-                        ui,
-                        rect,
-                        texture,
-                        background_mode(settings.placement),
-                        (u16::from(settings.dim_percent.min(100)) * 255 / 100) as u8,
-                    );
-                }
+                        if !self.background_error.is_empty() {
+                            ui.colored_label(ui.visuals().error_fg_color, &self.background_error);
+                        }
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width().min(320.0), 120.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter()
+                            .rect_filled(rect, 0.0, egui::Color32::from_rgb(67, 76, 82));
+                        if let Some(texture) = &self.background_texture {
+                            background::paint(
+                                ui,
+                                rect,
+                                texture,
+                                background_mode(settings.placement),
+                                (u16::from(settings.dim_percent.min(100)) * 255 / 100) as u8,
+                            );
+                        }
+                    });
             });
         self.background_open = open;
         if changed {
@@ -1890,7 +1906,7 @@ impl StaminatorApp {
             .iter()
             .enumerate()
             .filter(|(_, item)| filter.is_empty() || item.name.to_lowercase().contains(&filter))
-            .map(|(index, item)| (index, item.name.chars().take(85).collect::<String>()))
+            .map(|(index, item)| (index, item.name.clone()))
             .collect();
         let current = self
             .chooser_preview
@@ -1905,89 +1921,125 @@ impl StaminatorApp {
         .open(&mut open)
         .default_size([620.0, 470.0])
         .show(ctx, |ui| {
-            if self.selected_mode == TrainingMode::Lessons {
-                if !self.lesson_transfer_error.is_empty() {
-                    ui.colored_label(egui::Color32::RED, &self.lesson_transfer_error);
-                    clear_error = ui.button(localization::tr("clear-message")).clicked();
-                }
-                ui.horizontal(|ui| {
-                    refresh = ui.button(localization::tr("refresh-lessons")).clicked();
-                    create = ui.button(localization::tr("create-lesson")).clicked();
-                    edit = ui
-                        .add_enabled(
-                            current.is_some(),
-                            egui::Button::new(localization::tr("edit-lesson")),
-                        )
-                        .clicked();
-                });
-                ui.horizontal(|ui| {
-                    import_lesson = ui.button(localization::tr("lesson-import")).clicked();
-                    export_lesson = ui
-                        .add_enabled(
-                            current.is_some(),
-                            egui::Button::new(localization::tr("lesson-export")),
-                        )
-                        .clicked();
-                });
-                if let Some(path) = self.catalog.user_lesson_path() {
-                    ui.label(localization::format(
-                        "chooser.user_folder",
-                        &FormatArgs::new().insert("path", path.display()),
-                    ));
-                }
-                if !self.catalog.lesson_diagnostics().is_empty() {
-                    ui.colored_label(egui::Color32::RED, self.catalog.lesson_diagnostics());
-                }
-            }
-            if self.selected_mode == TrainingMode::Phrases {
-                add_phrases = ui.button(localization::tr("add-phrases")).clicked();
-            }
-            ui.text_edit_singleline(&mut self.chooser_filter);
-            ui.label(localization::format(
-                "chooser.matches",
-                &FormatArgs::new().count(matches.len() as i64),
-            ));
-            ui.columns(2, |columns| {
-                egui::ScrollArea::vertical()
-                    .id_salt("chooser_list")
-                    .max_height(300.0)
-                    .show_rows(&mut columns[0], 24.0, matches.len(), |ui, range| {
-                        for (index, name) in &matches[range] {
-                            let response = ui.selectable_label(
-                                Some(*index) == current,
-                                localization::visual_text(&format!("{}. {}", index + 1, name)),
+            crate::ui_style::apply(ui);
+            egui::ScrollArea::vertical()
+                .id_salt("show_content_chooser_content")
+                .show(ui, |ui| {
+                    if self.selected_mode == TrainingMode::Lessons {
+                        if !self.lesson_transfer_error.is_empty() {
+                            ui.colored_label(
+                                ui.visuals().error_fg_color,
+                                &self.lesson_transfer_error,
                             );
-                            if response.double_clicked() {
-                                chosen = Some(*index);
-                            } else if response.clicked() {
-                                self.chooser_preview = Some(*index);
+                            clear_error = ui.button(localization::tr("clear-message")).clicked();
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            refresh = ui.button(localization::tr("refresh-lessons")).clicked();
+                            create = ui.button(localization::tr("create-lesson")).clicked();
+                            edit = ui
+                                .add_enabled(
+                                    current.is_some(),
+                                    egui::Button::new(localization::tr("edit-lesson")),
+                                )
+                                .clicked();
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            import_lesson = ui.button(localization::tr("lesson-import")).clicked();
+                            export_lesson = ui
+                                .add_enabled(
+                                    current.is_some(),
+                                    egui::Button::new(localization::tr("lesson-export")),
+                                )
+                                .clicked();
+                        });
+                        if let Some(path) = self.catalog.user_lesson_path() {
+                            ui.label(localization::format(
+                                "chooser.user_folder",
+                                &FormatArgs::new().insert("path", path.display()),
+                            ));
+                        }
+                        if !self.catalog.lesson_diagnostics().is_empty() {
+                            ui.colored_label(
+                                ui.visuals().error_fg_color,
+                                self.catalog.lesson_diagnostics(),
+                            );
+                        }
+                    }
+                    if self.selected_mode == TrainingMode::Phrases {
+                        add_phrases = ui.button(localization::tr("add-phrases")).clicked();
+                    }
+                    ui.text_edit_singleline(&mut self.chooser_filter);
+                    ui.label(localization::format(
+                        "chooser.matches",
+                        &FormatArgs::new().count(matches.len() as i64),
+                    ));
+                    let preview = current.and_then(|index| {
+                        self.items().get(index).map(|item| (index, item.clone()))
+                    });
+                    let description = current.and_then(|index| {
+                        (self.selected_mode == TrainingMode::Lessons)
+                            .then_some(index)
+                            .and_then(|index| self.catalog.lesson_id(self.language(), index))
+                            .and_then(|id| self.catalog.lesson_document(id))
+                            .and_then(|(lesson, _)| lesson.description.clone())
+                    });
+                    let mut preview_change = None;
+                    let mut list_choice = None;
+                    let mut detail_choice = None;
+                    let mut list = |ui: &mut egui::Ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("chooser_list")
+                            .max_height(300.0)
+                            .show(ui, |ui| {
+                                for (index, name) in &matches {
+                                    let response = ui.selectable_label(
+                                        Some(*index) == current,
+                                        localization::visual_text(&format!(
+                                            "{}. {}",
+                                            index + 1,
+                                            name
+                                        )),
+                                    );
+                                    if response.double_clicked() {
+                                        list_choice = Some(*index);
+                                    } else if response.clicked() {
+                                        preview_change = Some(*index);
+                                    }
+                                }
+                            });
+                    };
+                    let mut details = |ui: &mut egui::Ui| {
+                        if let Some((index, item)) = &preview {
+                            ui.heading(localization::visual_text(&item.name));
+                            if let Some(description) = &description {
+                                ui.label(localization::visual_text(description));
+                            }
+                            egui::ScrollArea::vertical()
+                                .id_salt("chooser_preview")
+                                .max_height(240.0)
+                                .show(ui, |ui| {
+                                    ui.label(localization::visual_text(&item.text));
+                                });
+                            if ui.button(localization::tr("choose")).clicked() {
+                                detail_choice = Some(*index);
                             }
                         }
-                    });
-                if let Some((current, item)) =
-                    current.and_then(|index| self.items().get(index).map(|item| (index, item)))
-                {
-                    columns[1].heading(localization::visual_text(&item.name));
-                    if self.selected_mode == TrainingMode::Lessons
-                        && let Some((lesson, _)) = self
-                            .catalog
-                            .lesson_id(self.language(), current)
-                            .and_then(|id| self.catalog.lesson_document(id))
-                        && let Some(description) = &lesson.description
-                    {
-                        columns[1].label(localization::visual_text(description));
-                    }
-                    egui::ScrollArea::vertical()
-                        .id_salt("chooser_preview")
-                        .max_height(240.0)
-                        .show(&mut columns[1], |ui| {
-                            ui.label(localization::visual_text(&item.text));
+                    };
+                    if ui.available_width() < 600.0 {
+                        list(ui);
+                        ui.separator();
+                        details(ui);
+                    } else {
+                        ui.columns(2, |columns| {
+                            list(&mut columns[0]);
+                            details(&mut columns[1]);
                         });
-                    if columns[1].button(localization::tr("choose")).clicked() {
-                        chosen = Some(current);
                     }
-                }
-            });
+                    if let Some(index) = preview_change {
+                        self.chooser_preview = Some(index);
+                    }
+                    chosen = list_choice.or(detail_choice);
+                });
         });
         self.chooser_open = open;
         if clear_error {
@@ -2369,58 +2421,71 @@ impl StaminatorApp {
             .open(&mut open)
             .default_width(420.0)
             .show(ctx, |ui| {
-                ui.heading(localization::tr("profiles"));
-                ui.label(localization::tr("profile.search"));
-                ui.text_edit_singleline(&mut self.profile_filter);
-                let profiles = filtered_profiles(self.users.profiles(), &self.profile_filter);
-                if profiles.is_empty() {
-                    ui.label(localization::tr("profile.no_matches"));
-                } else {
-                    egui::ScrollArea::vertical()
-                        .max_height(280.0)
-                        .show(ui, |ui| {
-                            for (id, name) in profiles {
-                                let current = self.users.active_profile_id() == id;
-                                let label = if current {
-                                    format!("{name}{}", localization::tr("profile.active_marker"))
-                                } else {
-                                    name
-                                };
-                                if ui.selectable_label(current, label).clicked() && !current {
-                                    if !self.save_before_switch() || !self.flush_window_placement()
-                                    {
-                                        return;
-                                    }
-                                    match self.users.select(&id) {
-                                        Ok(()) => {
-                                            self.session = None;
-                                            self.last_result = None;
-                                            self.result_open = false;
-                                            self.profile_error.clear();
-                                            self.sync_profile_language();
-                                            self.sync_profile_training();
-                                            self.restore_external_text();
-                                            switched = true;
+                crate::ui_style::apply(ui);
+                egui::ScrollArea::vertical()
+                    .id_salt("show_profiles_content")
+                    .show(ui, |ui| {
+                        ui.heading(localization::tr("profiles"));
+                        ui.label(localization::tr("profile.search"));
+                        ui.text_edit_singleline(&mut self.profile_filter);
+                        let profiles =
+                            filtered_profiles(self.users.profiles(), &self.profile_filter);
+                        if profiles.is_empty() {
+                            ui.label(localization::tr("profile.no_matches"));
+                        } else {
+                            egui::ScrollArea::vertical()
+                                .max_height(280.0)
+                                .show(ui, |ui| {
+                                    for (id, name) in profiles {
+                                        let current = self.users.active_profile_id() == id;
+                                        let label = if current {
+                                            format!(
+                                                "{name}{}",
+                                                localization::tr("profile.active_marker")
+                                            )
+                                        } else {
+                                            name
+                                        };
+                                        if ui.selectable_label(current, label).clicked() && !current
+                                        {
+                                            if !self.save_before_switch()
+                                                || !self.flush_window_placement()
+                                            {
+                                                return;
+                                            }
+                                            match self.users.select(&id) {
+                                                Ok(()) => {
+                                                    self.session = None;
+                                                    self.last_result = None;
+                                                    self.result_open = false;
+                                                    self.profile_error.clear();
+                                                    self.sync_profile_language();
+                                                    self.sync_profile_training();
+                                                    self.restore_external_text();
+                                                    switched = true;
+                                                }
+                                                Err(error) => {
+                                                    self.profile_error = error.to_string()
+                                                }
+                                            }
                                         }
-                                        Err(error) => self.profile_error = error.to_string(),
                                     }
-                                }
+                                });
+                        }
+                        ui.separator();
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button(localization::tr("profile.manage")).clicked() {
+                                management_requested = true;
                             }
+                            ui.label(localization::format(
+                                "profile.active",
+                                &FormatArgs::new().insert("name", self.users.active_name()),
+                            ));
                         });
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button(localization::tr("profile.manage")).clicked() {
-                        management_requested = true;
-                    }
-                    ui.label(localization::format(
-                        "profile.active",
-                        &FormatArgs::new().insert("name", self.users.active_name()),
-                    ));
-                });
-                if !self.profile_error.is_empty() {
-                    ui.colored_label(egui::Color32::RED, &self.profile_error);
-                }
+                        if !self.profile_error.is_empty() {
+                            ui.colored_label(ui.visuals().error_fg_color, &self.profile_error);
+                        }
+                    });
             });
         self.profiles_open = open;
         if management_requested {
@@ -2439,118 +2504,132 @@ impl StaminatorApp {
                 .open(&mut management_open)
                 .default_width(440.0)
                 .show(ctx, |ui| {
-                    let target_name = self
-                        .users
-                        .profiles()
-                        .iter()
-                        .find(|p| p.id == self.profile_management_target)
-                        .map_or("", |p| p.name.as_str());
-                    ui.label(localization::format(
-                        "profile.target",
-                        &FormatArgs::new().insert("name", target_name),
-                    ));
+                    crate::ui_style::apply(ui);
                     egui::ScrollArea::vertical()
-                        .max_height(180.0)
+                        .id_salt("profile_management_content")
                         .show(ui, |ui| {
-                            for profile in self.users.profiles() {
-                                let selected = profile.id == self.profile_management_target;
-                                let mut label = profile.name.clone();
-                                if profile.id == self.users.active_profile_id() {
-                                    label.push_str(&localization::tr("profile.active_marker"));
-                                }
-                                if selected {
-                                    label.push_str(&localization::tr("profile.selected_marker"));
-                                }
-                                if ui.selectable_label(selected, label).clicked() {
-                                    self.profile_management_target = profile.id.clone();
-                                    self.profile_name_input = profile.name.clone();
-                                    self.profile_error.clear();
-                                }
-                            }
-                        });
-                    ui.horizontal(|ui| {
-                        if ui.button(localization::tr("profile-import")).clicked()
-                            && let Some(path) = rfd::FileDialog::new()
-                                .add_filter("JSON", &["json"])
-                                .pick_file()
-                            && let Err(error) = self.import_profile_from(&path)
-                        {
-                            self.profile_error = localized_error("profile.import_error", error);
-                        }
-                        if ui.button(localization::tr("profile-export")).clicked()
-                            && let Some(path) = rfd::FileDialog::new()
-                                .add_filter("JSON", &["json"])
-                                .set_file_name("profile.json")
-                                .save_file()
-                            && let Err(error) =
-                                self.export_profile_id_to(&self.profile_management_target, &path)
-                        {
-                            self.profile_error = localized_error("profile.export_error", error);
-                        }
-                    });
-                    ui.separator();
-                    ui.label(localization::tr("profile-name"));
-                    ui.text_edit_singleline(&mut self.profile_name_input);
-                    ui.horizontal(|ui| {
-                        if ui.button(localization::tr("create")).clicked() {
-                            if !self.save_before_switch() || !self.flush_window_placement() {
-                                return;
-                            }
-                            match self.users.create(&self.profile_name_input) {
-                                Ok(_) => {
-                                    self.profile_name_input.clear();
-                                    self.profile_error.clear();
-                                    self.profile_management_target =
-                                        self.users.active_profile_id().to_owned();
-                                    self.session = None;
-                                    self.sync_profile_language();
-                                    self.sync_profile_training();
-                                    self.restore_external_text();
-                                }
-                                Err(error) => self.profile_error = error.to_string(),
-                            }
-                        }
-                        if ui.button(localization::tr("rename")).clicked() {
-                            let id = self.profile_management_target.clone();
-                            match self.users.rename(&id, &self.profile_name_input) {
-                                Ok(()) => {
-                                    self.profile_name_input.clear();
-                                    self.profile_error.clear();
-                                }
-                                Err(error) => self.profile_error = error.to_string(),
-                            }
-                        }
-                        if ui
-                            .add_enabled(
-                                self.users.profiles().len() > 1,
-                                egui::Button::new(localization::tr(
-                                    if self.profile_management_target
-                                        == self.users.active_profile_id()
-                                    {
-                                        "profile.delete_active"
-                                    } else {
-                                        "profile.delete_selected"
-                                    },
-                                )),
-                            )
-                            .clicked()
-                            && let Some(profile) = self
+                            let target_name = self
                                 .users
                                 .profiles()
                                 .iter()
                                 .find(|p| p.id == self.profile_management_target)
-                        {
-                            self.profile_error.clear();
-                            self.profile_delete_confirmation =
-                                Some((profile.id.clone(), profile.name.clone()));
-                        }
-                    });
-                    if ui.button(localization::tr("profile.back")).clicked() {
-                        return_to_chooser = true;
-                    }
-                    if !self.profile_error.is_empty() {
-                        ui.colored_label(egui::Color32::RED, &self.profile_error);
-                    }
+                                .map_or("", |p| p.name.as_str());
+                            ui.label(localization::format(
+                                "profile.target",
+                                &FormatArgs::new().insert("name", target_name),
+                            ));
+                            egui::ScrollArea::vertical()
+                                .max_height(180.0)
+                                .show(ui, |ui| {
+                                    for profile in self.users.profiles() {
+                                        let selected = profile.id == self.profile_management_target;
+                                        let mut label = profile.name.clone();
+                                        if profile.id == self.users.active_profile_id() {
+                                            label.push_str(&localization::tr(
+                                                "profile.active_marker",
+                                            ));
+                                        }
+                                        if selected {
+                                            label.push_str(&localization::tr(
+                                                "profile.selected_marker",
+                                            ));
+                                        }
+                                        if ui.selectable_label(selected, label).clicked() {
+                                            self.profile_management_target = profile.id.clone();
+                                            self.profile_name_input = profile.name.clone();
+                                            self.profile_error.clear();
+                                        }
+                                    }
+                                });
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button(localization::tr("profile-import")).clicked()
+                                    && let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("JSON", &["json"])
+                                        .pick_file()
+                                    && let Err(error) = self.import_profile_from(&path)
+                                {
+                                    self.profile_error =
+                                        localized_error("profile.import_error", error);
+                                }
+                                if ui.button(localization::tr("profile-export")).clicked()
+                                    && let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("JSON", &["json"])
+                                        .set_file_name("profile.json")
+                                        .save_file()
+                                    && let Err(error) = self.export_profile_id_to(
+                                        &self.profile_management_target,
+                                        &path,
+                                    )
+                                {
+                                    self.profile_error =
+                                        localized_error("profile.export_error", error);
+                                }
+                            });
+                            ui.separator();
+                            ui.label(localization::tr("profile-name"));
+                            ui.text_edit_singleline(&mut self.profile_name_input);
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button(localization::tr("create")).clicked() {
+                                    if !self.save_before_switch() || !self.flush_window_placement()
+                                    {
+                                        return;
+                                    }
+                                    match self.users.create(&self.profile_name_input) {
+                                        Ok(_) => {
+                                            self.profile_name_input.clear();
+                                            self.profile_error.clear();
+                                            self.profile_management_target =
+                                                self.users.active_profile_id().to_owned();
+                                            self.session = None;
+                                            self.sync_profile_language();
+                                            self.sync_profile_training();
+                                            self.restore_external_text();
+                                        }
+                                        Err(error) => self.profile_error = error.to_string(),
+                                    }
+                                }
+                                if ui.button(localization::tr("rename")).clicked() {
+                                    let id = self.profile_management_target.clone();
+                                    match self.users.rename(&id, &self.profile_name_input) {
+                                        Ok(()) => {
+                                            self.profile_name_input.clear();
+                                            self.profile_error.clear();
+                                        }
+                                        Err(error) => self.profile_error = error.to_string(),
+                                    }
+                                }
+                                if ui
+                                    .add_enabled(
+                                        self.users.profiles().len() > 1,
+                                        egui::Button::new(localization::tr(
+                                            if self.profile_management_target
+                                                == self.users.active_profile_id()
+                                            {
+                                                "profile.delete_active"
+                                            } else {
+                                                "profile.delete_selected"
+                                            },
+                                        )),
+                                    )
+                                    .clicked()
+                                    && let Some(profile) = self
+                                        .users
+                                        .profiles()
+                                        .iter()
+                                        .find(|p| p.id == self.profile_management_target)
+                                {
+                                    self.profile_error.clear();
+                                    self.profile_delete_confirmation =
+                                        Some((profile.id.clone(), profile.name.clone()));
+                                }
+                            });
+                            if ui.button(localization::tr("profile.back")).clicked() {
+                                return_to_chooser = true;
+                            }
+                            if !self.profile_error.is_empty() {
+                                ui.colored_label(ui.visuals().error_fg_color, &self.profile_error);
+                            }
+                        });
                 });
             self.profile_management_open = management_open && !return_to_chooser;
             if return_to_chooser || !management_open {
@@ -2561,6 +2640,7 @@ impl StaminatorApp {
             #[allow(deprecated)]
             let modal = egui::Modal::new(egui::Id::new("profile-delete-confirmation"));
             modal.show(ctx, |ui| {
+                crate::ui_style::apply(ui);
                 ui.heading(localization::tr("profile.delete_title"));
                 ui.label(localization::format(
                     "profile.delete_warning",
@@ -6193,6 +6273,50 @@ mod tests {
     }
 
     #[test]
+    fn narrow_lesson_chooser_keeps_selection_and_action_accessible() {
+        let mut app = test_app(test_path());
+        app.show_keyboard = false;
+        app.selected_mode = TrainingMode::Lessons;
+        app.content_language = ContentLanguage::English;
+        app.chooser_open = true;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let draw = |app: &mut StaminatorApp, events: Vec<egui::Event>| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(460.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            );
+            output.textures_delta.clear();
+            output.platform_output.accesskit_update.unwrap().nodes
+        };
+        draw(&mut app, vec![]);
+        let nodes = draw(&mut app, vec![]);
+        let lesson = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("2. EN words"))
+            .unwrap()
+            .0;
+        draw(&mut app, vec![accessible_click(lesson)]);
+        assert_eq!(app.chooser_preview, Some(1));
+        let nodes = draw(&mut app, vec![]);
+        let choose = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Выбрать…"))
+            .unwrap()
+            .0;
+        draw(&mut app, vec![accessible_click(choose)]);
+        assert_eq!(app.current_label(), "EN words");
+        assert!(!app.chooser_open);
+    }
+
+    #[test]
     fn double_click_selects_and_closes_chooser() {
         let mut app = test_app(test_path());
         app.show_keyboard = false;
@@ -7042,7 +7166,9 @@ mod tests {
         let nodes = draw_accessible(&mut app, &ctx, vec![]);
         let alternate = nodes
             .iter()
-            .find(|(_, n)| n.label() == Some("Альтернативная / Alternative"))
+            .find(|(_, n)| {
+                n.label() == Some(localization::tr("keyboard_manager.alternate").as_str())
+            })
             .unwrap()
             .0;
         draw_accessible(&mut app, &ctx, vec![accessible_click(alternate)]);

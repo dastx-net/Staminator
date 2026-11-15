@@ -1,4 +1,4 @@
-use egui::{Align, Context, Grid, RichText, Window};
+use egui::{Align, Context, Grid, RichText, ScrollArea, Window};
 use staminator_core::SessionStats;
 
 use crate::localization::tr;
@@ -25,58 +25,73 @@ pub fn show(
 
     Window::new(tr("result.title"))
         .collapsible(false)
-        .resizable(false)
+        .resizable(true)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            ui.set_min_width(300.0);
-            ui.label(RichText::new(title).strong());
-            ui.add_space(8.0);
-            ui.label(if completed {
-                tr("result.completed")
-            } else {
-                tr("result.stopped")
-            });
-            ui.add_space(8.0);
-
-            Grid::new("session_result_metrics")
-                .num_columns(2)
-                .spacing([24.0, 6.0])
+            crate::ui_style::apply(ui);
+            ui.set_min_width(260.0);
+            ui.set_max_width(520.0);
+            ScrollArea::vertical()
+                .max_height(ui.ctx().content_rect().height() * 0.8)
                 .show(ui, |ui| {
-                    metric(ui, &tr("result.time"), format_duration(stats.elapsed_ms));
-                    metric(ui, &tr("result.correct"), stats.correct.to_string());
-                    metric(ui, &tr("result.errors"), stats.errors.to_string());
-                    metric(
-                        ui,
-                        &tr("result.accuracy"),
-                        format!("{:.1}%", accuracy(stats)),
-                    );
-                    metric(
-                        ui,
-                        &tr("result.speed"),
-                        crate::localization::format(
-                            "unit.characters_per_minute",
-                            &staminator_core::FormatArgs::new().insert("value", stats.cpm),
-                        ),
-                    );
-                });
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(title).heading().strong());
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(if completed {
+                                tr("result.completed")
+                            } else {
+                                tr("result.stopped")
+                            })
+                            .weak(),
+                        );
 
-            ui.add_space(14.0);
-            ui.horizontal(|ui| {
-                if can_continue && ui.button(tr("result.continue")).clicked() {
-                    action = ResultAction::Continue;
-                }
-                if ui.button(tr("result.retry")).clicked() {
-                    action = ResultAction::Retry;
-                }
-                if has_next && ui.button(tr("result.next")).clicked() {
-                    action = ResultAction::Next;
-                }
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button(tr("common.close")).clicked() {
-                        action = ResultAction::Close;
-                    }
+                        ui.add_space(20.0);
+                        ui.separator();
+                        ui.add_space(12.0);
+                        Grid::new("session_result_metrics")
+                            .num_columns(2)
+                            .spacing([16.0, 10.0])
+                            .show(ui, |ui| {
+                                metric(ui, &tr("result.time"), format_duration(stats.elapsed_ms));
+                                metric(ui, &tr("result.correct"), stats.correct.to_string());
+                                metric(ui, &tr("result.errors"), stats.errors.to_string());
+                                metric(
+                                    ui,
+                                    &tr("result.accuracy"),
+                                    format!("{:.1}%", accuracy(stats)),
+                                );
+                                metric(
+                                    ui,
+                                    &tr("result.speed"),
+                                    crate::localization::format(
+                                        "unit.characters_per_minute",
+                                        &staminator_core::FormatArgs::new()
+                                            .insert("value", stats.cpm),
+                                    ),
+                                );
+                            });
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(12.0);
+                        ui.horizontal_wrapped(|ui| {
+                            if can_continue && ui.button(tr("result.continue")).clicked() {
+                                action = ResultAction::Continue;
+                            }
+                            if ui.button(tr("result.retry")).clicked() {
+                                action = ResultAction::Retry;
+                            }
+                            if has_next && ui.button(tr("result.next")).clicked() {
+                                action = ResultAction::Next;
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button(tr("common.close")).clicked() {
+                                    action = ResultAction::Close;
+                                }
+                            });
+                        });
+                    });
                 });
-            });
         });
 
     action
@@ -102,9 +117,19 @@ mod tests {
     use super::*;
     use egui::{RawInput, Rect, Vec2};
 
-    fn accessible_action(label: &str, has_next: bool) -> ResultAction {
+    fn accessible_action(
+        label: &str,
+        has_next: bool,
+        can_continue: bool,
+        dark_theme: bool,
+    ) -> Option<ResultAction> {
         let ctx = Context::default();
         ctx.enable_accesskit();
+        ctx.set_visuals(if dark_theme {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        });
         let stats = SessionStats {
             correct: 1,
             errors: 0,
@@ -112,7 +137,7 @@ mod tests {
             cpm: 60,
             error_percent: 0.0,
         };
-        let screen = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 700.0));
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(320.0, 600.0));
         let mut target = None;
         for _ in 0..2 {
             let mut output = ctx.run_pass(
@@ -122,7 +147,7 @@ mod tests {
                 },
                 |ctx| {
                     ctx.root_ui(|_| {
-                        show(ctx, "Доступность", &stats, true, has_next, false);
+                        show(ctx, "Доступность", &stats, true, has_next, can_continue);
                     })
                 },
             );
@@ -135,7 +160,9 @@ mod tests {
             }
             output.textures_delta.clear();
         }
-        let target = target.unwrap_or_else(|| panic!("AccessKit button not found: {label}"));
+        let Some(target) = target else {
+            return None;
+        };
         let request = egui::Event::AccessKitActionRequest(accesskit::ActionRequest {
             action: accesskit::Action::Click,
             target_tree: accesskit::TreeId::ROOT,
@@ -149,10 +176,14 @@ mod tests {
                 events: vec![request],
                 ..Default::default()
             },
-            |ctx| ctx.root_ui(|_| action = show(ctx, "Доступность", &stats, true, has_next, false)),
+            |ctx| {
+                ctx.root_ui(|_| {
+                    action = show(ctx, "Доступность", &stats, true, has_next, can_continue)
+                })
+            },
         );
         output.textures_delta.clear();
-        action
+        Some(action)
     }
 
     fn frame(ctx: &Context, mut f: impl FnMut(&Context)) -> String {
@@ -236,9 +267,31 @@ mod tests {
     }
 
     #[test]
-    fn accessible_button_actions_select_retry_next_and_close() {
-        assert_eq!(accessible_action("Повторить", false), ResultAction::Retry);
-        assert_eq!(accessible_action("Далее", true), ResultAction::Next);
-        assert_eq!(accessible_action("Закрыть", false), ResultAction::Close);
+    fn accessible_actions_work_in_both_themes_at_narrow_width_and_respect_availability() {
+        for dark_theme in [false, true] {
+            for (label, has_next, can_continue, expected) in [
+                ("Продолжить", true, true, ResultAction::Continue),
+                ("Повторить", true, true, ResultAction::Retry),
+                ("Далее", true, true, ResultAction::Next),
+                ("Закрыть", true, true, ResultAction::Close),
+            ] {
+                assert_eq!(
+                    accessible_action(label, has_next, can_continue, dark_theme),
+                    Some(expected),
+                    "action {label} failed in dark_theme={dark_theme}"
+                );
+            }
+
+            assert_eq!(
+                accessible_action("Продолжить", true, false, dark_theme),
+                None,
+                "Continue must be omitted when continuation is unavailable"
+            );
+            assert_eq!(
+                accessible_action("Далее", false, true, dark_theme),
+                None,
+                "Next must be omitted when there is no next exercise"
+            );
+        }
     }
 }

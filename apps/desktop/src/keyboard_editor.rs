@@ -4,6 +4,7 @@
 //! Call `show(ctx)` each frame. It returns a validated schema clone when the
 //! user chooses Save; the caller owns persistence and should use `save_new`.
 
+use crate::localization::tr;
 use egui::{Color32, Context, Pos2, Rect, Sense, Stroke, Vec2};
 use staminator_keyboard_schema::{
     Canvas, Finger, Geometry, Key, KeyboardSchema, Point, SCHEMA_VERSION,
@@ -106,105 +107,106 @@ impl KeyboardEditor {
         }
         let mut window_open = self.open;
         let mut close_clicked = false;
-        egui::Window::new("Keyboard layout editor / Редактор клавиатуры")
+        egui::Window::new(tr("keyboard_editor.window"))
             .open(&mut window_open)
             .default_size(Vec2::new(980.0, 680.0))
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Layout / Раскладка:");
-                    ui.text_edit_singleline(&mut self.schema.name);
-                    ui.separator();
-                    ui.label("Canvas:");
-                    ui.add(
-                        egui::DragValue::new(&mut self.schema.canvas.width)
-                            .prefix("W ")
-                            .range(1.0..=4096.0),
-                    );
-                    ui.add(
-                        egui::DragValue::new(&mut self.schema.canvas.height)
-                            .prefix("H ")
-                            .range(1.0..=4096.0),
-                    );
-                });
-                ui.checkbox(
-                    &mut self.schema.show_finger_colors,
-                    "Цвета пальцев / Finger colors",
-                );
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.set_min_width(180.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("+ Add key / Добавить").clicked() {
+                crate::ui_style::apply(ui);
+                let footer_height = ui.spacing().interact_size.y + 24.0;
+                egui::ScrollArea::vertical()
+                    .max_height((ui.available_height() - footer_height).max(0.0))
+                    .show(ui, |ui| {
+                        ui.heading(tr("keyboard_editor.heading"));
+                        ui.label(tr("keyboard_editor.intro"));
+                        ui.add_space(8.0);
+                        egui::Grid::new("keyboard_editor_metadata")
+                            .num_columns(2)
+                            .spacing([12.0, 8.0])
+                            .show(ui, |ui| {
+                                ui.label(tr("keyboard_editor.layout_name"));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.schema.name)
+                                        .desired_width(260.0),
+                                );
+                                ui.end_row();
+                                ui.label(tr("keyboard_editor.canvas_size"));
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.schema.canvas.width)
+                                            .prefix(format!(
+                                                "{} ",
+                                                tr("keyboard_editor.width_short")
+                                            ))
+                                            .range(1.0..=4096.0),
+                                    );
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.schema.canvas.height)
+                                            .prefix(format!(
+                                                "{} ",
+                                                tr("keyboard_editor.height_short")
+                                            ))
+                                            .range(1.0..=4096.0),
+                                    );
+                                });
+                                ui.end_row();
+                            });
+                        ui.checkbox(
+                            &mut self.schema.show_finger_colors,
+                            tr("keyboard_editor.finger_colors"),
+                        );
+                        ui.add_space(12.0);
+                        ui.heading(tr("keyboard_editor.keys"));
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .button(format!("＋ {}", tr("keyboard_editor.add_key")))
+                                .clicked()
+                            {
                                 self.add_key();
                             }
-                            if ui.button("Delete / Удалить").clicked() {
+                            let delete = ui.add_enabled(
+                                self.selected.is_some(),
+                                egui::Button::new(tr("keyboard_editor.delete_selected")),
+                            );
+                            if delete.clicked() {
                                 self.delete_selected();
                             }
                         });
-                        egui::ScrollArea::vertical()
-                            .max_height(470.0)
-                            .show(ui, |ui| {
-                                let titles: Vec<String> = self
-                                    .schema
-                                    .keys
-                                    .iter()
-                                    .map(|key| {
-                                        if key.physical_id.is_empty() {
-                                            "(new key)".into()
-                                        } else {
-                                            key.physical_id.clone()
-                                        }
-                                    })
-                                    .collect();
-                                let mut clicked = None;
-                                for (i, title) in titles.iter().enumerate() {
-                                    let title = format!(
-                                        "{}  {}",
-                                        if self.selected == Some(i) {
-                                            "●"
-                                        } else {
-                                            "○"
-                                        },
-                                        title
-                                    );
-                                    if ui
-                                        .selectable_label(self.selected == Some(i), title)
-                                        .clicked()
-                                    {
-                                        clicked = Some(i);
-                                    }
-                                }
-                                if let Some(i) = clicked {
-                                    self.select(i);
-                                }
+                        ui.add_space(4.0);
+                        let narrow = ui.available_width() < 680.0;
+                        if narrow {
+                            self.key_list_ui(ui, narrow);
+                            ui.add_space(8.0);
+                            ui.heading(tr("keyboard_editor.preview"));
+                            ui.label(tr("keyboard_editor.drag_help"));
+                            self.canvas_ui(ui);
+                        } else {
+                            ui.horizontal(|ui| {
+                                self.key_list_ui(ui, narrow);
+                                ui.separator();
+                                ui.vertical(|ui| {
+                                    ui.heading(tr("keyboard_editor.preview"));
+                                    ui.label(tr("keyboard_editor.drag_help"));
+                                    self.canvas_ui(ui);
+                                });
                             });
+                        }
+                        if let Some(i) = self.selected {
+                            ui.add_space(12.0);
+                            ui.heading(tr("keyboard_editor.selected_key"));
+                            self.properties_ui(ui, i);
+                        }
+                        if let Some(error) = &self.error {
+                            ui.colored_label(ui.visuals().error_fg_color, error);
+                        }
                     });
-                    ui.separator();
-                    ui.vertical(|ui| {
-                        ui.label("Drag a key to move it; drag its bottom-right handle to resize.");
-                        self.canvas_ui(ui);
-                    });
-                });
                 ui.separator();
-                if let Some(i) = self.selected {
-                    self.properties_ui(ui, i);
-                }
-                ui.horizontal(|ui| {
-                    if let Some(error) = &self.error {
-                        ui.colored_label(Color32::RED, error);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(tr("keyboard_editor.close")).clicked() {
+                        close_clicked = true;
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Close / Закрыть").clicked() {
-                            close_clicked = true;
-                        }
-                        if ui
-                            .button("Validate & save copy / Сохранить копию")
-                            .clicked()
-                        {
-                            result = self.validated_copy();
-                        }
-                    });
+                    if ui.button(tr("keyboard_editor.save_copy")).clicked() {
+                        result = self.validated_copy();
+                    }
                 });
             });
         self.open = window_open && !close_clicked;
@@ -226,7 +228,7 @@ impl KeyboardEditor {
 
     fn add_key(&mut self) {
         if self.schema.keys.len() >= 256 {
-            self.error = Some("Maximum 256 keys".into());
+            self.error = Some(tr("keyboard_editor.max_keys"));
             return;
         }
         // Key size follows the canvas proportions. The default 16 × 5 board
@@ -285,6 +287,44 @@ impl KeyboardEditor {
             .unwrap_or_default();
     }
 
+    fn key_list_ui(&mut self, ui: &mut egui::Ui, narrow: bool) {
+        ui.vertical(|ui| {
+            ui.set_min_width(if narrow { 0.0 } else { 180.0 });
+            egui::ScrollArea::vertical()
+                .max_height(220.0)
+                .show(ui, |ui| {
+                    let titles: Vec<String> = self
+                        .schema
+                        .keys
+                        .iter()
+                        .map(|key| {
+                            if key.physical_id.is_empty() {
+                                tr("keyboard_editor.new_key")
+                            } else {
+                                key.physical_id.clone()
+                            }
+                        })
+                        .collect();
+                    let mut clicked = None;
+                    for (i, title) in titles.iter().enumerate() {
+                        let label = if self.selected == Some(i) {
+                            format!("✓ {}  {title}", tr("keyboard_editor.selected"))
+                        } else {
+                            format!("○  {title}")
+                        };
+                        if ui
+                            .selectable_label(self.selected == Some(i), label)
+                            .clicked()
+                        {
+                            clicked = Some(i);
+                        }
+                    }
+                    if let Some(i) = clicked {
+                        self.select(i);
+                    }
+                });
+        });
+    }
     fn canvas_ui(&mut self, ui: &mut egui::Ui) {
         let canvas = self.schema.canvas;
         let avail = ui
@@ -525,33 +565,40 @@ impl KeyboardEditor {
 
     fn properties_ui(&mut self, ui: &mut egui::Ui, i: usize) {
         let canvas = self.schema.canvas;
-        let label = label_editor(ui, "Label", &mut self.label_states[0]);
-        let shifted_label = label_editor(ui, "Shift", &mut self.label_states[1]);
+        let label = label_editor(ui, "keyboard_editor.label", &mut self.label_states[0]);
+        let shifted_label = label_editor(ui, "keyboard_editor.shift", &mut self.label_states[1]);
         let key = &mut self.schema.keys[i];
         ui.horizontal(|ui| {
-            ui.label("Physical ID:");
+            ui.label(tr("keyboard_editor.physical_id"));
             ui.text_edit_singleline(&mut key.physical_id);
-            ui.label("Color (#RRGGBB):");
+            ui.label(tr("keyboard_editor.color"));
             optional_color(ui, &mut key.color);
         });
         key.label = label;
         key.shifted_label = shifted_label;
         ui.horizontal(|ui| {
-            ui.label("Finger:");
+            ui.label(tr("keyboard_editor.finger"));
             let mut finger = key.finger;
             egui::ComboBox::from_id_salt("finger_combo")
-                .selected_text(finger.map(finger_name).unwrap_or("None"))
+                .selected_text(
+                    finger
+                        .map(finger_name)
+                        .unwrap_or_else(|| tr("keyboard_editor.none")),
+                )
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut finger, None, "None");
+                    ui.selectable_value(&mut finger, None, tr("keyboard_editor.none"));
                     for f in fingers() {
                         ui.selectable_value(&mut finger, Some(f), finger_name(f));
                     }
                 });
             key.finger = finger;
-            ui.label("Geometry:");
+            ui.label(tr("keyboard_editor.geometry"));
             let poly = matches!(key.geometry, Geometry::Polygon { .. });
             let mut is_poly = poly;
-            if ui.checkbox(&mut is_poly, "Polygon").changed() {
+            if ui
+                .checkbox(&mut is_poly, tr("keyboard_editor.polygon"))
+                .changed()
+            {
                 key.geometry = toggle_geometry(&key.geometry, canvas, is_poly);
                 self.polygon_text = if let Geometry::Polygon { points } = &key.geometry {
                     points
@@ -570,22 +617,30 @@ impl KeyboardEditor {
                 height,
             } = &mut key.geometry
             {
-                ui.add(egui::DragValue::new(x).prefix("x ").range(0.0..=4096.0));
-                ui.add(egui::DragValue::new(y).prefix("y ").range(0.0..=4096.0));
+                ui.add(
+                    egui::DragValue::new(x)
+                        .prefix(format!("{} ", tr("keyboard_editor.x_short")))
+                        .range(0.0..=4096.0),
+                );
+                ui.add(
+                    egui::DragValue::new(y)
+                        .prefix(format!("{} ", tr("keyboard_editor.y_short")))
+                        .range(0.0..=4096.0),
+                );
                 ui.add(
                     egui::DragValue::new(width)
-                        .prefix("w ")
+                        .prefix(format!("{} ", tr("keyboard_editor.width_short")))
                         .range((canvas.width / 100.0).max(0.01)..=canvas.width),
                 );
                 ui.add(
                     egui::DragValue::new(height)
-                        .prefix("h ")
+                        .prefix(format!("{} ", tr("keyboard_editor.height_short")))
                         .range((canvas.height / 50.0).max(0.01)..=canvas.height),
                 );
             }
         });
         if let Geometry::Polygon { points } = &mut key.geometry {
-            ui.label("Polygon vertices, one x,y pair per line:");
+            ui.label(tr("keyboard_editor.polygon_vertices"));
             if ui
                 .add(
                     egui::TextEdit::multiline(&mut self.polygon_text)
@@ -694,19 +749,32 @@ fn apply_polygon_text(points: &mut Vec<Point>, text: &str) -> bool {
     }
 }
 
-fn label_editor(ui: &mut egui::Ui, title: &str, state: &mut LabelState) -> Option<String> {
+fn label_editor(ui: &mut egui::Ui, title_key: &str, state: &mut LabelState) -> Option<String> {
+    let title = tr(title_key);
     ui.horizontal(|ui| {
-        ui.label(title);
-        egui::ComboBox::from_id_salt(("label_mode", title))
+        ui.label(&title);
+        egui::ComboBox::from_id_salt(("label_mode", title_key))
             .selected_text(match state.mode {
-                LabelMode::Automatic => "Auto RU/EN",
-                LabelMode::Blank => "Blank",
-                LabelMode::Custom => "Custom",
+                LabelMode::Automatic => tr("keyboard_editor.label_auto"),
+                LabelMode::Blank => tr("keyboard_editor.label_blank"),
+                LabelMode::Custom => tr("keyboard_editor.label_custom"),
             })
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut state.mode, LabelMode::Automatic, "Auto RU/EN");
-                ui.selectable_value(&mut state.mode, LabelMode::Blank, "Blank");
-                ui.selectable_value(&mut state.mode, LabelMode::Custom, "Custom");
+                ui.selectable_value(
+                    &mut state.mode,
+                    LabelMode::Automatic,
+                    tr("keyboard_editor.label_auto"),
+                );
+                ui.selectable_value(
+                    &mut state.mode,
+                    LabelMode::Blank,
+                    tr("keyboard_editor.label_blank"),
+                );
+                ui.selectable_value(
+                    &mut state.mode,
+                    LabelMode::Custom,
+                    tr("keyboard_editor.label_custom"),
+                );
             });
         if state.mode == LabelMode::Custom {
             ui.add(egui::TextEdit::singleline(&mut state.draft).desired_width(120.0));
@@ -759,18 +827,18 @@ fn fingers() -> [Finger; 10] {
         Finger::RightLittle,
     ]
 }
-fn finger_name(f: Finger) -> &'static str {
+fn finger_name(f: Finger) -> String {
     match f {
-        Finger::LeftLittle => "Left little",
-        Finger::LeftRing => "Left ring",
-        Finger::LeftMiddle => "Left middle",
-        Finger::LeftIndex => "Left index",
-        Finger::LeftThumb => "Left thumb",
-        Finger::RightThumb => "Right thumb",
-        Finger::RightIndex => "Right index",
-        Finger::RightMiddle => "Right middle",
-        Finger::RightRing => "Right ring",
-        Finger::RightLittle => "Right little",
+        Finger::LeftLittle => tr("keyboard_manager.left_little"),
+        Finger::LeftRing => tr("keyboard_manager.left_ring"),
+        Finger::LeftMiddle => tr("keyboard_manager.left_middle"),
+        Finger::LeftIndex => tr("keyboard_manager.left_index"),
+        Finger::LeftThumb => tr("keyboard_manager.left_thumb"),
+        Finger::RightThumb => tr("keyboard_manager.right_thumb"),
+        Finger::RightIndex => tr("keyboard_manager.right_index"),
+        Finger::RightMiddle => tr("keyboard_manager.right_middle"),
+        Finger::RightRing => tr("keyboard_manager.right_ring"),
+        Finger::RightLittle => tr("keyboard_manager.right_little"),
     }
 }
 
@@ -807,6 +875,51 @@ mod tests {
         );
         output.textures_delta.clear();
         output
+    }
+
+    fn key_list_frame(
+        ctx: &Context,
+        editor: &mut KeyboardEditor,
+        narrow: bool,
+        width: f32,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 900.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                ui.set_width(width);
+                editor.key_list_ui(ui, narrow);
+            },
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    fn editor_window_frame(
+        ctx: &Context,
+        editor: &mut KeyboardEditor,
+        size: Vec2,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, Option<KeyboardSchema>) {
+        let mut result = None;
+        let mut output = ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|_| {
+                    result = editor.show(ctx);
+                });
+            },
+        );
+        output.textures_delta.clear();
+        (output, result)
     }
 
     fn properties_frame(ctx: &Context, editor: &mut KeyboardEditor, index: usize) {
@@ -861,6 +974,23 @@ mod tests {
     }
 
     #[test]
+    fn editor_labels_follow_interface_language() {
+        crate::localization::set_language("EN");
+        assert_eq!(tr("keyboard_editor.window"), "Keyboard layout editor");
+        assert_eq!(tr("keyboard_editor.polygon"), "Polygon");
+        assert_eq!(finger_name(Finger::LeftLittle), "Left little");
+
+        crate::localization::set_language("RU");
+        assert_eq!(tr("keyboard_editor.window"), "Редактор клавиатуры");
+        assert_eq!(tr("keyboard_editor.polygon"), "Многоугольник");
+        assert_eq!(finger_name(Finger::LeftLittle), "Левый мизинец");
+
+        crate::localization::set_language("DE");
+        assert_eq!(tr("keyboard_editor.window"), "Tastaturlayout-Editor");
+        crate::localization::set_language("RU");
+    }
+
+    #[test]
     fn added_key_fits_small_unit_canvas_and_layout_remains_valid() {
         let mut editor = KeyboardEditor::new(blank_schema("Compact", 16.0, 5.0));
         editor.add_key();
@@ -876,6 +1006,168 @@ mod tests {
         };
         assert_eq!((*x, *y, *width, *height), (0.0, 0.0, 1.0, 1.0));
         editor.schema.validate().unwrap();
+    }
+
+    #[test]
+    fn key_list_selects_the_clicked_key_in_narrow_and_wide_layouts() {
+        for (narrow, width) in [(true, 120.0), (false, 240.0)] {
+            let mut schema = blank_schema("Board", 16.0, 5.0);
+            schema.keys.push(test_key(
+                "KeyA",
+                Geometry::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+            ));
+            schema.keys.push(test_key(
+                "KeyB",
+                Geometry::Rect {
+                    x: 1.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+            ));
+            let mut editor = KeyboardEditor::new(schema);
+            editor.select(0);
+            let ctx = Context::default();
+            let frame = key_list_frame(&ctx, &mut editor, narrow, width, vec![]);
+            let target = frame
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == "○  KeyB" => {
+                        Some(Rect::from_min_size(text.pos, text.galley.size()).center())
+                    }
+                    _ => None,
+                })
+                .expect("second key should be visible in the key list");
+
+            key_list_frame(
+                &ctx,
+                &mut editor,
+                narrow,
+                width,
+                vec![
+                    egui::Event::PointerMoved(target),
+                    egui::Event::PointerButton {
+                        pos: target,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            key_list_frame(
+                &ctx,
+                &mut editor,
+                narrow,
+                width,
+                vec![egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            assert_eq!(
+                editor.selected,
+                Some(1),
+                "clicking the second key should select it (narrow={narrow})"
+            );
+        }
+    }
+
+    #[test]
+    fn save_action_stays_visible_and_works_in_short_window_with_selected_key() {
+        crate::localization::set_language("EN");
+        let mut schema = blank_schema("Board", 16.0, 5.0);
+        schema.keys.push(test_key(
+            "KeyA",
+            Geometry::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        ));
+        let mut editor = KeyboardEditor::new(schema);
+        editor.select(0);
+        let ctx = Context::default();
+        ctx.enable_accesskit();
+        let size = Vec2::new(600.0, 360.0);
+        let mut save_bounds = None;
+        for _ in 0..3 {
+            let (frame, result) = editor_window_frame(&ctx, &mut editor, size, vec![]);
+            assert!(result.is_none());
+            save_bounds = frame
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .and_then(|update| {
+                    update.nodes.iter().find_map(|(_, node)| {
+                        (node.role() == egui::accesskit::Role::Button
+                            && node.label() == Some("Validate & save copy"))
+                        .then(|| node.bounds())
+                        .flatten()
+                    })
+                })
+                .or(save_bounds);
+        }
+        let save_bounds = save_bounds.expect("save button should be accessible");
+        let save_rect = Rect::from_min_max(
+            Pos2::new(save_bounds.x0 as f32, save_bounds.y0 as f32),
+            Pos2::new(save_bounds.x1 as f32, save_bounds.y1 as f32),
+        );
+        let window_rect = ctx
+            .memory(|memory| {
+                memory
+                    .areas()
+                    .visible_layer_ids()
+                    .into_iter()
+                    .filter(|layer| layer.order == egui::Order::Middle)
+                    .find_map(|layer| memory.area_rect(layer.id))
+            })
+            .expect("editor window should have an area");
+        let client_rect = Rect::from_min_max(
+            Pos2::new(window_rect.left() + 8.0, window_rect.top() + 30.0),
+            Pos2::new(window_rect.right() - 8.0, window_rect.bottom() - 8.0),
+        );
+        let save_center = save_rect.center();
+        assert!(
+            client_rect.contains(save_rect.min) && client_rect.contains(save_rect.max),
+            "save button bounds {save_rect:?} should be inside the window client area {client_rect:?} (window {window_rect:?})"
+        );
+
+        editor_window_frame(
+            &ctx,
+            &mut editor,
+            size,
+            vec![
+                egui::Event::PointerMoved(save_center),
+                egui::Event::PointerButton {
+                    pos: save_center,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let (_, result) = editor_window_frame(
+            &ctx,
+            &mut editor,
+            size,
+            vec![egui::Event::PointerButton {
+                pos: save_center,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(result, Some(editor.schema.clone()));
+        crate::localization::set_language("RU");
     }
     #[test]
     fn color_parser_supports_rgb_and_rgba_and_rejects_bad_values() {
@@ -953,7 +1245,8 @@ mod tests {
         let checkbox = nodes
             .iter()
             .find(|(_, node)| {
-                node.role() == egui::accesskit::Role::CheckBox && node.label() == Some("Polygon")
+                node.role() == egui::accesskit::Role::CheckBox
+                    && node.label() == Some("Многоугольник")
             })
             .expect("polygon toggle should be accessible")
             .0;
@@ -964,12 +1257,372 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn accessible_delete_removes_selected_key_and_disables_delete_when_selection_is_empty() {
+        crate::localization::set_language("EN");
+        let mut schema = blank_schema("Board", 16.0, 5.0);
+        for (id, x) in [("KeyA", 0.0), ("KeyB", 1.0)] {
+            schema.keys.push(test_key(
+                id,
+                Geometry::Rect {
+                    x,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+            ));
+        }
+        let mut editor = KeyboardEditor::new(schema);
+        editor.select(1);
+        let ctx = Context::default();
+        ctx.enable_accesskit();
+        let size = Vec2::new(900.0, 600.0);
+        let mut delete_button = None;
+        for _ in 0..3 {
+            let (output, _) = editor_window_frame(&ctx, &mut editor, size, vec![]);
+            delete_button = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .and_then(|update| {
+                    update.nodes.iter().find_map(|(id, node)| {
+                        (node.role() == egui::accesskit::Role::Button
+                            && node.label() == Some("Delete selected"))
+                        .then_some(*id)
+                    })
+                })
+                .or(delete_button);
+        }
+        let delete_button = delete_button.expect("delete button should be accessible");
+        editor_window_frame(
+            &ctx,
+            &mut editor,
+            size,
+            vec![accesskit_click(delete_button)],
+        );
+
+        assert_eq!(editor.selected, None);
+        assert_eq!(editor.schema.keys.len(), 1);
+        assert_eq!(editor.schema.keys[0].physical_id, "KeyA");
+
+        let mut delete_disabled = false;
+        for _ in 0..3 {
+            let (output, _) = editor_window_frame(&ctx, &mut editor, size, vec![]);
+            if let Some(update) = &output.platform_output.accesskit_update {
+                delete_disabled |= update.nodes.iter().any(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Button
+                        && node.label() == Some("Delete selected")
+                        && node.is_disabled()
+                });
+            }
+        }
+        assert!(
+            delete_disabled,
+            "delete should be disabled without a selection"
+        );
+        assert_eq!(editor.schema.keys.len(), 1);
+        assert_eq!(editor.schema.keys[0].physical_id, "KeyA");
+        crate::localization::set_language("RU");
+    }
+
+    #[test]
+    fn invalid_save_shows_error_keeps_draft_and_corrected_save_returns_copy() {
+        crate::localization::set_language("EN");
+        let mut schema = blank_schema("Draft board", 16.0, 5.0);
+        schema.keys.push(test_key(
+            "KeyA",
+            Geometry::Rect {
+                x: 15.5,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        ));
+        let mut editor = KeyboardEditor::new(schema.clone());
+        editor.select(0);
+        let ctx = Context::default();
+        ctx.enable_accesskit();
+        let size = Vec2::new(1200.0, 900.0);
+        let mut save_button = None;
+        for _ in 0..3 {
+            let (output, _) = editor_window_frame(&ctx, &mut editor, size, vec![]);
+            save_button = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .and_then(|update| {
+                    update.nodes.iter().find_map(|(id, node)| {
+                        (node.role() == egui::accesskit::Role::Button
+                            && node.label() == Some("Validate & save copy"))
+                        .then_some(*id)
+                    })
+                })
+                .or(save_button);
+        }
+        let save_button = save_button.expect("save button should be accessible");
+        let (_, result) =
+            editor_window_frame(&ctx, &mut editor, size, vec![accesskit_click(save_button)]);
+        assert!(result.is_none(), "invalid schema must not be returned");
+        assert_eq!(editor.schema, schema, "validation must preserve the draft");
+        let error = editor
+            .error
+            .as_deref()
+            .expect("failed validation should set an error")
+            .to_owned();
+        assert!(error.contains("outside canvas"), "{error}");
+        let mut error_is_accessible = false;
+        for _ in 0..3 {
+            let (output, _) = editor_window_frame(&ctx, &mut editor, size, vec![]);
+            error_is_accessible |= output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .is_some_and(|update| {
+                    update.nodes.iter().any(|(_, node)| {
+                        node.label() == Some(error.as_str()) || node.value() == Some(error.as_str())
+                    })
+                });
+        }
+        assert!(
+            error_is_accessible,
+            "validation error should be shown accessibly"
+        );
+
+        let Geometry::Rect { x, .. } = &mut editor.schema.keys[0].geometry else {
+            unreachable!()
+        };
+        *x = 15.0;
+        let mut save_button = None;
+        for _ in 0..3 {
+            let (output, _) = editor_window_frame(&ctx, &mut editor, size, vec![]);
+            save_button = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .and_then(|update| {
+                    update.nodes.iter().find_map(|(id, node)| {
+                        (node.role() == egui::accesskit::Role::Button
+                            && node.label() == Some("Validate & save copy"))
+                        .then_some(*id)
+                    })
+                })
+                .or(save_button);
+        }
+        let save_button = save_button.expect("save button should remain accessible");
+        let expected = editor.schema.clone();
+        let (_, result) =
+            editor_window_frame(&ctx, &mut editor, size, vec![accesskit_click(save_button)]);
+        assert_eq!(result, Some(expected));
+        assert!(editor.error.is_none());
+        crate::localization::set_language("RU");
+    }
+
+    #[test]
+    fn polygon_editor_keeps_last_valid_shape_for_bad_points_then_restores_and_saves() {
+        crate::localization::set_language("EN");
+        let original_points = vec![
+            Point { x: 2.0, y: 1.0 },
+            Point { x: 4.0, y: 1.0 },
+            Point { x: 4.0, y: 2.0 },
+            Point { x: 2.0, y: 2.0 },
+        ];
+        let mut schema = blank_schema("Polygon draft", 16.0, 5.0);
+        schema.keys.push(test_key(
+            "Enter",
+            Geometry::Polygon {
+                points: original_points.clone(),
+            },
+        ));
+        let mut editor = KeyboardEditor::new(schema);
+        editor.select(0);
+        let original_text = editor.polygon_text.clone();
+        let ctx = Context::default();
+        ctx.enable_accesskit();
+        let size = Vec2::new(1200.0, 900.0);
+        let mut polygon_editor = None;
+        for _ in 0..3 {
+            let (output, _) = editor_window_frame(&ctx, &mut editor, size, vec![]);
+            polygon_editor = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .and_then(|update| {
+                    update.nodes.iter().find_map(|(id, node)| {
+                        (node.role() == egui::accesskit::Role::MultilineTextInput
+                            && node.value() == Some(original_text.as_str()))
+                        .then_some(*id)
+                    })
+                })
+                .or(polygon_editor);
+        }
+        let polygon_editor = polygon_editor.expect("polygon points editor should be accessible");
+
+        let invalid_draft = "2,1\nnot-a-point\n4,2\n2,2";
+        editor_window_frame(
+            &ctx,
+            &mut editor,
+            size,
+            vec![accesskit_set_value(polygon_editor, invalid_draft)],
+        );
+        assert_eq!(editor.polygon_text, invalid_draft);
+        assert_eq!(
+            editor.schema.keys[0].geometry,
+            Geometry::Polygon {
+                points: original_points.clone()
+            },
+            "invalid point drafts must preserve the last valid polygon"
+        );
+
+        let restored_points = vec![
+            Point { x: 3.0, y: 1.0 },
+            Point { x: 5.0, y: 1.0 },
+            Point { x: 5.0, y: 2.0 },
+            Point { x: 3.0, y: 2.0 },
+        ];
+        let restored_text = "3,1\n5,1\n5,2\n3,2";
+        editor_window_frame(
+            &ctx,
+            &mut editor,
+            size,
+            vec![accesskit_set_value(polygon_editor, restored_text)],
+        );
+        assert_eq!(editor.polygon_text, restored_text);
+        assert_eq!(
+            editor.schema.keys[0].geometry,
+            Geometry::Polygon {
+                points: restored_points
+            }
+        );
+
+        let mut save_button = None;
+        for _ in 0..3 {
+            let (output, _) = editor_window_frame(&ctx, &mut editor, size, vec![]);
+            save_button = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .and_then(|update| {
+                    update.nodes.iter().find_map(|(id, node)| {
+                        (node.role() == egui::accesskit::Role::Button
+                            && node.label() == Some("Validate & save copy"))
+                        .then_some(*id)
+                    })
+                })
+                .or(save_button);
+        }
+        let save_button = save_button.expect("save button should be accessible");
+        let expected = editor.schema.clone();
+        let (_, result) =
+            editor_window_frame(&ctx, &mut editor, size, vec![accesskit_click(save_button)]);
+        assert_eq!(result, Some(expected));
+        crate::localization::set_language("RU");
+    }
+
+    #[test]
+    fn accessible_finger_combobox_assignment_is_preserved_in_saved_copy() {
+        crate::localization::set_language("EN");
+        let mut schema = blank_schema("Finger draft", 16.0, 5.0);
+        schema.keys.push(test_key(
+            "KeyA",
+            Geometry::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        ));
+        let mut editor = KeyboardEditor::new(schema);
+        editor.select(0);
+        let ctx = Context::default();
+        ctx.enable_accesskit();
+        let size = Vec2::new(1200.0, 900.0);
+
+        let mut finger_combo = None;
+        for _ in 0..3 {
+            let (output, _) = editor_window_frame(&ctx, &mut editor, size, vec![]);
+            finger_combo = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .and_then(|update| {
+                    update.nodes.iter().find_map(|(id, node)| {
+                        (node.role() == egui::accesskit::Role::ComboBox
+                            && node.value() == Some("None"))
+                        .then_some(*id)
+                    })
+                })
+                .or(finger_combo);
+        }
+        let finger_combo = finger_combo.expect("finger selector should be accessible");
+        editor_window_frame(&ctx, &mut editor, size, vec![accesskit_click(finger_combo)]);
+
+        let mut left_index_option = None;
+        for _ in 0..3 {
+            let (output, _) = editor_window_frame(&ctx, &mut editor, size, vec![]);
+            left_index_option = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .and_then(|update| {
+                    update.nodes.iter().find_map(|(id, node)| {
+                        (node.role() == egui::accesskit::Role::Button
+                            && node.label() == Some("Left index"))
+                        .then_some(*id)
+                    })
+                })
+                .or(left_index_option);
+        }
+        let left_index_option =
+            left_index_option.expect("left index option should be accessible in the popup");
+        editor_window_frame(
+            &ctx,
+            &mut editor,
+            size,
+            vec![accesskit_click(left_index_option)],
+        );
+        assert_eq!(editor.schema.keys[0].finger, Some(Finger::LeftIndex));
+
+        let mut save_button = None;
+        for _ in 0..3 {
+            let (output, _) = editor_window_frame(&ctx, &mut editor, size, vec![]);
+            save_button = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .and_then(|update| {
+                    update.nodes.iter().find_map(|(id, node)| {
+                        (node.role() == egui::accesskit::Role::Button
+                            && node.label() == Some("Validate & save copy"))
+                        .then_some(*id)
+                    })
+                })
+                .or(save_button);
+        }
+        let save_button = save_button.expect("save button should be accessible");
+        let expected = editor.schema.clone();
+        let (_, result) =
+            editor_window_frame(&ctx, &mut editor, size, vec![accesskit_click(save_button)]);
+        let saved = result.expect("valid key finger assignment should save");
+        assert_eq!(saved.keys[0].finger, Some(Finger::LeftIndex));
+        assert_eq!(saved, expected);
+        crate::localization::set_language("RU");
+    }
+
     fn accesskit_click(target_node: egui::accesskit::NodeId) -> egui::Event {
         egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
             action: egui::accesskit::Action::Click,
             target_tree: egui::accesskit::TreeId::ROOT,
             target_node,
             data: None,
+        })
+    }
+
+    fn accesskit_set_value(target_node: egui::accesskit::NodeId, value: &str) -> egui::Event {
+        egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+            action: egui::accesskit::Action::SetValue,
+            target_tree: egui::accesskit::TreeId::ROOT,
+            target_node,
+            data: Some(egui::accesskit::ActionData::Value(value.into())),
         })
     }
 

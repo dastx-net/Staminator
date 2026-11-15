@@ -17,72 +17,114 @@ pub fn show(
         .default_height(540.0)
         .resizable(true)
         .show(ctx, |ui| {
-            ui.heading(crate::localization::format(
-                "progress.profile_results",
-                &staminator_core::FormatArgs::new().insert("profile", profile),
-            ));
-            ui.add_space(6.0);
+            crate::ui_style::apply(ui);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.heading(crate::localization::format(
+                    "progress.profile_results",
+                    &staminator_core::FormatArgs::new().insert("profile", profile),
+                ));
+                ui.add_space(12.0);
 
-            let recent: Vec<_> = records.iter().rev().take(100).collect();
-            if recent.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    ui.label(tr("progress.empty"));
-                });
-                return;
-            }
+                let recent: Vec<_> = records.iter().rev().take(100).collect();
+                if recent.is_empty() {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(tr("progress.empty"));
+                    });
+                    return;
+                }
 
-            let mut chronological = recent;
-            chronological.reverse();
-            ui.label(RichText::new(tr("progress.speed_chart_title")).strong());
-            draw_chart(
-                ui,
-                &chronological
-                    .iter()
-                    .map(|r| r.cpm as f32)
-                    .collect::<Vec<_>>(),
-            );
-            ui.add_space(8.0);
-            ui.label(RichText::new(tr("progress.recent_sessions")).strong());
-            ui.add_space(4.0);
-
-            egui::ScrollArea::vertical()
-                .max_height(230.0)
-                .show(ui, |ui| {
-                    Grid::new("progress_recent_records")
-                        .striped(true)
-                        .num_columns(6)
-                        .spacing([10.0, 5.0])
-                        .show(ui, |ui| {
-                            for title in [
-                                tr("progress.column.date"),
-                                tr("progress.column.mode"),
-                                tr("progress.column.layout"),
-                                tr("progress.column.exercise"),
-                                tr("progress.column.speed"),
-                                tr("progress.column.errors"),
-                            ] {
-                                ui.label(RichText::new(title).strong());
-                            }
-                            ui.end_row();
-                            for record in chronological.iter().rev() {
-                                let date = format_timestamp(record.timestamp);
-                                ui.label(date);
-                                ui.label(display_mode(&record.mode));
-                                ui.label(display_layout(&record.layout));
-                                ui.label(record.exercise.chars().take(42).collect::<String>());
-                                ui.label(crate::localization::format(
-                                    "unit.characters_per_minute",
-                                    &staminator_core::FormatArgs::new().insert("value", record.cpm),
-                                ));
-                                ui.label(format!(
-                                    "{} ({:.1}%)",
-                                    record.errors, record.error_percent
-                                ));
-                                ui.end_row();
-                            }
-                        });
-                });
+                let mut chronological = recent;
+                chronological.reverse();
+                ui.heading(tr("progress.speed_chart_title"));
+                draw_chart(
+                    ui,
+                    &chronological
+                        .iter()
+                        .map(|r| r.cpm as f32)
+                        .collect::<Vec<_>>(),
+                );
+                ui.add_space(8.0);
+                show_recent_history(ui, &chronological);
+            });
         });
+}
+
+fn show_recent_history(ui: &mut egui::Ui, chronological: &[&crate::user_store::ResultRecord]) {
+    ui.heading(tr("progress.recent_sessions"));
+    ui.add_space(4.0);
+    if ui.available_width() < 720.0 {
+        for record in chronological.iter().rev() {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(format_timestamp(record.timestamp)).strong());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!(
+                        "{}: {}",
+                        tr("progress.column.mode"),
+                        display_mode(&record.mode)
+                    ));
+                    ui.label(format!(
+                        "{}: {}",
+                        tr("progress.column.layout"),
+                        display_layout(&record.layout)
+                    ));
+                });
+                ui.label(format!(
+                    "{}: {}",
+                    tr("progress.column.exercise"),
+                    record.exercise
+                ));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!(
+                        "{}: {}",
+                        tr("progress.column.speed"),
+                        crate::localization::format(
+                            "unit.characters_per_minute",
+                            &staminator_core::FormatArgs::new().insert("value", record.cpm),
+                        )
+                    ));
+                    ui.label(format!(
+                        "{}: {} ({:.1}%)",
+                        tr("progress.column.errors"),
+                        record.errors,
+                        record.error_percent
+                    ));
+                });
+            });
+            ui.add_space(4.0);
+        }
+    } else {
+        Grid::new("progress_recent_records")
+            .striped(true)
+            .num_columns(6)
+            .spacing([10.0, 5.0])
+            .show(ui, |ui| {
+                for title in [
+                    tr("progress.column.date"),
+                    tr("progress.column.mode"),
+                    tr("progress.column.layout"),
+                    tr("progress.column.exercise"),
+                    tr("progress.column.speed"),
+                    tr("progress.column.errors"),
+                ] {
+                    ui.label(RichText::new(title).strong());
+                }
+                ui.end_row();
+                for record in chronological.iter().rev() {
+                    let date = format_timestamp(record.timestamp);
+                    ui.label(date);
+                    ui.label(display_mode(&record.mode));
+                    ui.label(display_layout(&record.layout));
+                    ui.label(record.exercise.chars().take(42).collect::<String>());
+                    ui.label(crate::localization::format(
+                        "unit.characters_per_minute",
+                        &staminator_core::FormatArgs::new().insert("value", record.cpm),
+                    ));
+                    ui.label(format!("{} ({:.1}%)", record.errors, record.error_percent));
+                    ui.end_row();
+                }
+            });
+    }
 }
 
 fn display_mode(value: &str) -> String {
@@ -172,7 +214,7 @@ fn localized_datetime(_date: &chrono::DateTime<chrono::Local>) -> Option<String>
 }
 
 fn draw_chart(ui: &mut egui::Ui, values: &[f32]) {
-    let desired = Vec2::new(ui.available_width().max(280.0), 180.0);
+    let desired = Vec2::new(ui.available_width().max(200.0), 96.0);
     let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
     let painter = ui.painter_at(rect);
     let plot = Rect::from_min_max(
@@ -258,18 +300,30 @@ mod tests {
     }
 
     fn render(records: &[crate::user_store::ResultRecord]) -> String {
+        render_at_size(records, Vec2::new(1000.0, 900.0))
+    }
+
+    fn render_at_size(records: &[crate::user_store::ResultRecord], size: Vec2) -> String {
+        render_at_size_for_profile(records, size, "Тестовый профиль")
+    }
+
+    fn render_at_size_for_profile(
+        records: &[crate::user_store::ResultRecord],
+        size: Vec2,
+        profile: &str,
+    ) -> String {
         let ctx = Context::default();
         let mut open = true;
         let input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 900.0))),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
             ..Default::default()
         };
         let mut output = ctx.run_pass(input.clone(), |ctx| {
-            ctx.root_ui(|_| show(ctx, "Тестовый профиль", records, &mut open))
+            ctx.root_ui(|_| show(ctx, profile, records, &mut open))
         });
         output.textures_delta.clear();
         let mut output = ctx.run_pass(input, |ctx| {
-            ctx.root_ui(|_| show(ctx, "Тестовый профиль", records, &mut open))
+            ctx.root_ui(|_| show(ctx, profile, records, &mut open))
         });
         assert!(open);
         let shapes = output
@@ -283,6 +337,69 @@ mod tests {
             .join("\n");
         output.textures_delta.clear();
         shapes
+    }
+
+    fn render_recent_history_at_width(
+        records: &[crate::user_store::ResultRecord],
+        width: f32,
+    ) -> String {
+        let ctx = Context::default();
+        let chronological: Vec<_> = records.iter().collect();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 800.0))),
+            ..Default::default()
+        };
+        let mut output = ctx.run_pass(input.clone(), |ctx| {
+            ctx.root_ui(|ui| show_recent_history(ui, &chronological));
+        });
+        output.textures_delta.clear();
+        let mut output = ctx.run_pass(input, |ctx| {
+            ctx.root_ui(|ui| show_recent_history(ui, &chronological));
+        });
+        let shapes = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        output.textures_delta.clear();
+        shapes
+    }
+
+    fn render_chart_zero_label_color(visuals: egui::Visuals) -> Color32 {
+        let expected = visuals.text_color();
+        let ctx = Context::default();
+        ctx.set_visuals(visuals);
+        let records = [record(1)];
+        let mut open = true;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 900.0))),
+            ..Default::default()
+        };
+        let mut output = ctx.run_pass(input.clone(), |ctx| {
+            ctx.root_ui(|_| show(ctx, "Theme profile", &records, &mut open));
+        });
+        output.textures_delta.clear();
+        let mut output = ctx.run_pass(input, |ctx| {
+            ctx.root_ui(|_| show(ctx, "Theme profile", &records, &mut open));
+        });
+        let color = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "0" => {
+                    Some(text.galley.job.sections[0].format.color)
+                }
+                _ => None,
+            })
+            .expect("chart should render its zero-axis label");
+        output.textures_delta.clear();
+        assert!(open);
+        assert_eq!(color, expected);
+        color
     }
 
     fn record(index: usize) -> crate::user_store::ResultRecord {
@@ -306,6 +423,8 @@ mod tests {
         assert!(shapes.contains("Результаты профиля: Тестовый профиль"));
         assert!(shapes.contains("Для этого профиля пока нет сохранённых занятий."));
         assert!(!shapes.contains("Скорость по занятиям"));
+        assert!(!shapes.contains("Последние занятия"));
+        assert!(!shapes.contains("Упражнение 0"));
     }
 
     #[test]
@@ -320,5 +439,67 @@ mod tests {
         assert!(!shapes.lines().any(|line| line == "Упражнение 0"));
         assert!(shapes.contains("Упражнение"));
         assert!(shapes.contains("Раскладка"));
+    }
+
+    #[test]
+    fn narrow_history_uses_compact_cards_with_labeled_session_details() {
+        crate::localization::set_language("RU");
+        let records = [record(7)];
+        let shapes = render_recent_history_at_width(&records, 680.0);
+
+        assert!(shapes.contains("Последние занятия"));
+        assert!(shapes.contains("Режим: Обычный"));
+        assert!(shapes.contains("Раскладка: Русская"), "{shapes}");
+        assert!(shapes.contains("Упражнение: Упражнение 7"));
+        assert!(shapes.contains("Скорость:"));
+        assert!(shapes.contains("Ошибки: 7 (2.5%)"));
+        assert!(!shapes.lines().any(|line| line == "Дата"));
+    }
+
+    #[test]
+    fn narrow_history_keeps_long_unicode_profile_and_exercise_names_available() {
+        crate::localization::set_language("RU");
+        let profile = "Zoë_日本語_用户_".repeat(4);
+        let exercise = "练习_日本語_áéí_".repeat(12);
+        let mut session = record(8);
+        session.exercise = exercise.clone();
+        let shapes = render_at_size_for_profile(&[session], Vec2::new(680.0, 900.0), &profile);
+
+        assert!(
+            shapes.contains(&profile),
+            "profile name was clipped: {shapes}"
+        );
+        assert!(
+            shapes.contains(&exercise),
+            "exercise text was clipped: {shapes}"
+        );
+        assert!(shapes.contains("Скорость:"));
+        assert!(shapes.contains("Ошибки: 8 (2.5%)"));
+    }
+
+    #[test]
+    fn chart_axis_labels_follow_light_and_dark_theme_text_colors() {
+        let light = egui::Visuals::light();
+        let dark = egui::Visuals::dark();
+        let light_axis = render_chart_zero_label_color(light.clone());
+        let dark_axis = render_chart_zero_label_color(dark.clone());
+
+        assert_eq!(light_axis, light.text_color());
+        assert_eq!(dark_axis, dark.text_color());
+        assert_ne!(light_axis, dark_axis);
+    }
+
+    #[test]
+    fn wide_history_uses_table_headers_and_session_values() {
+        crate::localization::set_language("RU");
+        let records = [record(7)];
+        let shapes = render_recent_history_at_width(&records, 1400.0);
+
+        assert!(shapes.contains("Последние занятия"));
+        assert!(shapes.contains("Дата"), "{shapes}");
+        assert!(shapes.lines().any(|line| line == "Режим"));
+        assert!(shapes.lines().any(|line| line == "Раскладка"));
+        assert!(shapes.contains("Упражнение 7"));
+        assert!(shapes.contains("Обычный"));
     }
 }
