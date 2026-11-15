@@ -4534,6 +4534,48 @@ mod tests {
     }
 
     #[test]
+    fn audio_refresh_reports_unusable_resource_folder() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        let resources = app.audio_resource_paths();
+        fs::create_dir_all(resources.music().parent().unwrap()).unwrap();
+        fs::write(resources.sounds(), b"blocks the Sound directory").unwrap();
+
+        app.refresh_audio_counts();
+
+        assert!(app.audio_counts.is_none());
+        assert!(app.audio_error.contains("Sound"), "{}", app.audio_error);
+        drop(app);
+        let _ = fs::remove_dir_all(resources.music().parent().unwrap());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sound_player_decode_errors_reach_the_audio_status() {
+        let path = test_path();
+        let mut app = test_app(path.clone());
+        let resources = app.audio_resource_paths();
+        resources.ensure_directories().unwrap();
+        fs::write(resources.sounds().join("broken.wav"), b"not a wave file").unwrap();
+
+        app.play_event(SoundEvent::Error);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while app.audio_error.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            app.play_event(SoundEvent::Error);
+        }
+
+        assert!(
+            app.audio_error.contains("broken.wav"),
+            "{}",
+            app.audio_error
+        );
+        drop(app);
+        let _ = fs::remove_dir_all(resources.sounds().parent().unwrap());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn sound_events_follow_profile_settings_and_refreshed_folder() {
         use std::sync::{Mutex, OnceLock, mpsc};
         static TONE_SENDER: OnceLock<Mutex<Option<mpsc::Sender<SoundEvent>>>> = OnceLock::new();
