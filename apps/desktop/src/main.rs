@@ -15,7 +15,6 @@ mod localization;
 mod progress_view;
 mod result_view;
 mod scaling;
-mod sound;
 mod storage_transfer;
 mod training_view;
 mod ui_style;
@@ -26,8 +25,9 @@ mod window_monitors;
 use content::{ContentCatalog, ContentLanguage, Exercise};
 use eframe::egui;
 use result_view::ResultAction;
-use sound::SoundEvent;
 use staminator_core::{FormatArgs, Keystroke, Session, SessionState, StopReason};
+use staminator_desktop::audio_resources::AudioResources;
+use staminator_desktop::sound::{self, SoundEvent};
 use std::{
     collections::VecDeque,
     fs,
@@ -892,6 +892,15 @@ impl StaminatorApp {
             }
             Ok(None) => {}
             Err(error) => profile_error = localized_error("database.open_error", error),
+        }
+        if let Some(root) = users.keyboard_directory().parent()
+            && let Err(error) = AudioResources::new(root).ensure_directories()
+        {
+            let message = error.to_string();
+            if !profile_error.is_empty() {
+                profile_error.push('\n');
+            }
+            profile_error.push_str(&message);
         }
         let mut app = Self::from_parts(
             catalog,

@@ -19,6 +19,7 @@ staminator-core = { path = "../../crates/core" }
 stamina-data = { path = "../../crates/stamina-data" }
 arabic_reshaper = "0.4.2"
 unicode-bidi = "0.3"
+rodio = { version = "0.21", default-features = false, features = ["playback", "mp3", "wav"] }
 
 [dev-dependencies]
 accesskit = "0.25.2"
