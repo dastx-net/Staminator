@@ -15,3 +15,5 @@
 | 0007 | [Формат переводов интерфейса](0007-localization.md) |
 | 0008 | [Автоматизация issue через Codex](0008-issue-automation.md) |
 | 0009 | [Недоверенные ветки в CI](0009-untrusted-ci-branches.md) |
+| 0010 | [Схемы клавиатур](0010-keyboard-schemas.md) |
+| 0011 | [Дизайн настольного интерфейса](0011-desktop-design.md) |

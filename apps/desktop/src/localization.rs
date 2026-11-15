@@ -348,7 +348,7 @@ mod tests {
             include_str!("content.rs"),
             include_str!("content_editor.rs"),
             include_str!("external_text.rs"),
-            include_str!("keyboard.rs"),
+            include_str!("custom_keyboard_view.rs"),
             include_str!("progress_view.rs"),
             include_str!("result_view.rs"),
             include_str!("storage_transfer.rs"),

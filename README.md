@@ -49,7 +49,7 @@ cargo run -p staminator-desktop
 
 Rustup will use the toolchain pinned in `rust-toolchain.toml` and install it if needed. An installer is planned for the future; for now, building from source is the way to start.
 
-Choose a mode and keyboard layout in the Mode menu. Press Space to start, Esc to pause, and Space to resume. Press Esc again or Ctrl+C to finish and see the result. The on-screen keyboard can be moved to another monitor or hidden in Options.
+Choose a mode and keyboard layout in the Mode menu. Press Space to start, Esc to pause, and Space to resume. Press Esc again or Ctrl+C to finish and see the result. The on-screen keyboard can be moved to another monitor or hidden in Options. Use Options → Keyboards to edit layouts, manage finger assignments, and import or export keyboard ZIP archives. See [keyboard formats and controls](docs/keyboard.md).
 
 The optional local `src/stamina_setup` directory can supply original data and resources; it is not included in the repository. Without it, the application uses built-in exercises and a neutral background. User data is stored separately in `%APPDATA%\Staminator\staminator.sqlite3`. External practice texts must use UTF-8.
 
