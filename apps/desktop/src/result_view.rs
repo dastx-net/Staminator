@@ -160,9 +160,7 @@ mod tests {
             }
             output.textures_delta.clear();
         }
-        let Some(target) = target else {
-            return None;
-        };
+        let target = target?;
         let request = egui::Event::AccessKitActionRequest(accesskit::ActionRequest {
             action: accesskit::Action::Click,
             target_tree: accesskit::TreeId::ROOT,
